@@ -17,7 +17,7 @@ use maki_agent::{
     DoneReason, ImageMediaType, McpConfigErrors, McpServerInfo, McpServerStatus, McpSnapshot,
     McpSnapshotReader, ToolDoneEvent, ToolOutput, ToolStartEvent, TurnCompleteEvent,
 };
-use maki_config::{Effect, PermissionRule, PermissionsConfig, ToolKey, UiConfig};
+use maki_config::{Effect, PermissionRule, PermissionsConfig, ProjectConfig, ToolKey, UiConfig};
 use maki_lua::test_support::{HintWriterHandle, hint_writer_pair};
 use maki_lua::{
     BuiltinAction, HintReader, KeymapReader, LuaCommandInfo, LuaCommandReader, PackCommand,
@@ -104,6 +104,7 @@ fn test_permissions(yolo: bool) -> Arc<PermissionManager> {
             ..Default::default()
         },
         PathBuf::from(PERMISSIONS_CWD),
+        ProjectConfig::for_project(Path::new(PERMISSIONS_CWD)),
         Arc::default(),
     ))
 }
@@ -4343,6 +4344,7 @@ fn a_pending_permission_prompt_answers_before_the_package_review() {
         maki_config::ToolKey::native("bash"),
         vec!["execute".into()],
         None,
+        true,
     );
 
     app.update(Msg::Key(KeyEvent::from(KeyCode::Char('y'))));
@@ -4663,6 +4665,7 @@ fn ctrl_c_denies_permission_prompt() {
         maki_config::ToolKey::native("bash"),
         vec!["execute".into()],
         None,
+        true,
     );
     assert!(app.permission_prompt.is_open());
 
@@ -4803,6 +4806,7 @@ fn permission_prompt_takes_bottom_precedence_over_below_split() {
         maki_config::ToolKey::native("bash"),
         vec!["ls".into()],
         None,
+        true,
     );
 
     let (_msg, _bottom, _status, _input, splits) = app.layout_geometry(TEST_AREA);
@@ -5013,6 +5017,7 @@ fn attention_prioritizes_permission_and_normalizes_tool() {
         maki_config::ToolKey::native("bash"),
         vec!["execute".into()],
         None,
+        true,
     );
     assert_eq!(
         app.attention(),
@@ -5021,8 +5026,13 @@ fn attention_prioritizes_permission_and_normalizes_tool() {
         })
     );
 
-    app.permission_prompt
-        .open("id".into(), maki_config::ToolKey::Wildcard, vec![], None);
+    app.permission_prompt.open(
+        "id".into(),
+        maki_config::ToolKey::Wildcard,
+        vec![],
+        None,
+        true,
+    );
     assert_eq!(
         app.attention(),
         Some(Notification::PermissionRequested { tool: None })
