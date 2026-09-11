@@ -2,6 +2,7 @@ use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::Instant;
 
+use arc_swap::ArcSwap;
 use serde_json::Value;
 use tracing::{error, info, warn};
 
@@ -60,6 +61,27 @@ pub fn resolve_compaction_model(
     }
     (Arc::clone(provider), model.clone())
 }
+
+/// The model and provider a frontend is running, shared so a picker can swap
+/// it while a run is in flight. [`Agent`] reads it once per turn, so a switch
+/// lands on the next request rather than the next run.
+pub struct ModelSlot {
+    pub model: Model,
+    pub provider: Arc<dyn Provider>,
+}
+
+/// The system prompt and base tools for one model. One builder returns both,
+/// so a model switched mid-run cannot refresh one without the other: the tools
+/// carry the model's capability gates and the prompt its model line.
+pub struct RunContext {
+    pub system: String,
+    pub tools: RequestTools,
+}
+
+/// Builds the run context for a model, mode and workflow. The frontend
+/// supplies it so a model picked mid-run rebuilds the prompt and tools the run
+/// is actually sending to.
+pub type RunContextBuilder = Arc<dyn Fn(&Model, &AgentMode, bool) -> RunContext + Send + Sync>;
 
 enum TurnOutcome {
     Continue,
@@ -132,6 +154,8 @@ pub struct Agent<'h> {
     workflow: bool,
     local_tools: LocalTools,
     model_policy: Arc<ModelPolicy>,
+    model_slot: Option<Arc<ArcSwap<ModelSlot>>>,
+    run_builder: Option<RunContextBuilder>,
 }
 
 impl<'h> Agent<'h> {
@@ -174,7 +198,23 @@ impl<'h> Agent<'h> {
             workflow: false,
             local_tools: LocalTools::default(),
             model_policy: params.model_policy,
+            model_slot: None,
+            run_builder: None,
         }
+    }
+
+    /// Wires the frontend's live model slot in. Without it the run keeps the
+    /// snapshot it was built from for its whole lifetime.
+    pub fn with_model_slot(mut self, slot: Arc<ArcSwap<ModelSlot>>) -> Self {
+        self.model_slot = Some(slot);
+        self
+    }
+
+    /// Wires in the builder that refreshes the prompt and tools when the model
+    /// changes mid-run.
+    pub fn with_run_builder(mut self, builder: RunContextBuilder) -> Self {
+        self.run_builder = Some(builder);
+        self
     }
 
     pub fn with_mcp(mut self, mcp: Option<McpSession>) -> Self {
@@ -306,6 +346,10 @@ impl<'h> Agent<'h> {
 
     async fn run_loop(&mut self) -> Result<DoneReason, AgentError> {
         loop {
+            // Before `try_auto_compact`: a switch that lands after the check
+            // would compact against the old window and then overflow the new
+            // one.
+            self.sync_model();
             if let Some(max) = self.config.max_turns
                 && self.num_turns >= max
             {
@@ -316,6 +360,34 @@ impl<'h> Agent<'h> {
                 TurnOutcome::Continue => {}
                 TurnOutcome::Done(reason) => return Ok(reason),
             }
+        }
+    }
+
+    /// A model picked while the run is working reaches the next turn here. The
+    /// prompt and tools are rebuilt together, so the request never carries one
+    /// model's prompt with another's capability gates.
+    ///
+    /// Only a switch inside one provider is adopted: providers shape history
+    /// differently (signed thinking blocks, reasoning fields), so a
+    /// cross-provider swap would replay the other provider's turns. That waits
+    /// for the next run, which a user message separates from this one.
+    fn sync_model(&mut self) {
+        let Some(slot) = &self.model_slot else {
+            return;
+        };
+        let current = slot.load();
+        if current.model.provider != self.model.provider
+            || current.model.spec() == self.model.spec()
+        {
+            return;
+        }
+        info!(model = %current.model.id, "adopted model switched mid-run");
+        self.provider = Arc::clone(&current.provider);
+        self.model = Arc::new(current.model.clone());
+        if let Some(builder) = self.run_builder.clone() {
+            let context = builder(&self.model, &self.mode, self.workflow);
+            self.system = context.system;
+            self.tools = context.tools;
         }
     }
 
@@ -944,11 +1016,19 @@ mod tests {
         provider: impl Provider + 'static,
         history: &mut History,
     ) -> (Agent<'_>, flume::Receiver<Envelope>) {
+        make_agent_with(Arc::new(provider), default_model(), history)
+    }
+
+    fn make_agent_with(
+        provider: Arc<dyn Provider>,
+        model: Model,
+        history: &mut History,
+    ) -> (Agent<'_>, flume::Receiver<Envelope>) {
         let (raw_tx, event_rx) = flume::unbounded();
         let agent = Agent::new(
             AgentParams {
-                provider: Arc::new(provider),
-                model: default_model(),
+                provider,
+                model,
                 config: AgentConfig::default(),
                 tool_output_lines: ToolOutputLines::default(),
                 permissions: Arc::new(PermissionManager::new(
@@ -1245,6 +1325,126 @@ mod tests {
             assert_eq!(
                 has_interrupt_in_history(history.as_slice()),
                 expect_injected
+            );
+        });
+    }
+
+    /// Records the model, system prompt and tools of every request.
+    struct ModelCapturingProvider {
+        calls: Arc<Mutex<Vec<(String, String, String)>>>,
+        responses: Mutex<Vec<StreamResponse>>,
+    }
+
+    impl Provider for ModelCapturingProvider {
+        fn stream_message<'a>(
+            &'a self,
+            model: &'a Model,
+            _: &'a [Message],
+            system: &'a str,
+            tools: &'a Value,
+            _: &'a flume::Sender<ProviderEvent>,
+            _: RequestOptions,
+            _: Option<&'a SessionRef>,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            Box::pin(async {
+                self.calls.lock().unwrap().push((
+                    model.id.clone(),
+                    system.to_owned(),
+                    tools.to_string(),
+                ));
+                let mut responses = self.responses.lock().unwrap();
+                assert!(!responses.is_empty(), "no more responses");
+                Ok(responses.remove(0))
+            })
+        }
+
+        fn list_models(&self) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, AgentError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    /// Stands in for the picker swapping the shared slot between turns.
+    struct SwapSlotOnce {
+        slot: Arc<ArcSwap<ModelSlot>>,
+        provider: Arc<dyn Provider>,
+        model: Model,
+        swapped: Mutex<bool>,
+    }
+
+    impl InterruptSource for SwapSlotOnce {
+        fn poll(&self) -> Option<ExtractedCommand> {
+            let mut swapped = self.swapped.lock().unwrap();
+            if !*swapped {
+                *swapped = true;
+                self.slot.store(Arc::new(ModelSlot {
+                    model: self.model.clone(),
+                    provider: Arc::clone(&self.provider),
+                }));
+            }
+            None
+        }
+    }
+
+    /// A picker can swap the model while a run sits between turns. The shared
+    /// slot is read at every turn boundary, so the next request goes to the new
+    /// model and carries a prompt and tools rebuilt for it in one hook.
+    #[test]
+    fn model_switched_between_turns_is_adopted_on_the_next_request() {
+        smol::block_on(async {
+            let calls: Arc<Mutex<Vec<(String, String, String)>>> = Arc::default();
+            let provider: Arc<dyn Provider> = Arc::new(ModelCapturingProvider {
+                calls: Arc::clone(&calls),
+                responses: Mutex::new(vec![
+                    tool_call_response("glob", "t1"),
+                    text_response(StopReason::EndTurn),
+                ]),
+            });
+            let start = default_model();
+            let switched = Model {
+                id: "claude-opus-4-1-20250805".into(),
+                ..start.clone()
+            };
+            let slot = Arc::new(ArcSwap::from_pointee(ModelSlot {
+                model: start.clone(),
+                provider: Arc::clone(&provider),
+            }));
+            let source = Arc::new(SwapSlotOnce {
+                slot: Arc::clone(&slot),
+                provider: Arc::clone(&provider),
+                model: switched.clone(),
+                swapped: Mutex::new(false),
+            });
+            let run_builder: RunContextBuilder = Arc::new(|model, _, _| RunContext {
+                system: format!("system for {}", model.spec()),
+                tools: RequestTools::assembled(
+                    serde_json::json!([{ "name": format!("tool_for_{}", model.id) }]),
+                    &AgentConfig::default(),
+                    model,
+                ),
+            });
+
+            let mut history = History::new(Vec::new());
+            let (agent, _event_rx) =
+                make_agent_with(Arc::clone(&provider), start.clone(), &mut history);
+            let mut agent = agent
+                .with_model_slot(slot)
+                .with_run_builder(run_builder)
+                .with_interrupt_source(source);
+            agent.run(default_input()).await.unwrap();
+            drop(agent);
+
+            let calls = calls.lock().unwrap();
+            let (first, second) = (&calls[0], &calls[1]);
+            assert_eq!(
+                first.0, start.id,
+                "the opening request keeps the run's model"
+            );
+            assert_eq!(first.1, "system", "the opening prompt is the run's own");
+            assert_eq!(second.0, switched.id);
+            assert_eq!(second.1, format!("system for {}", switched.spec()));
+            assert!(
+                second.2.contains(&format!("tool_for_{}", switched.id)),
+                "the next request must carry tools rebuilt for the new model",
             );
         });
     }
