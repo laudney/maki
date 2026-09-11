@@ -5,19 +5,26 @@ use color_eyre::Result;
 use color_eyre::eyre::Context;
 
 use maki_agent::tools::ToolRegistry;
-use maki_config::{load_env_files, project};
+use maki_config::load_env_files;
+use maki_config::project::{self, TrustMode};
 use maki_lua::PluginHost;
 use maki_storage::StateDir;
 
 use crate::project_trust;
 use crate::setup;
 
-pub fn run(model_arg: Option<String>, yolo: bool, no_plugins: bool, no_jit: bool) -> Result<()> {
+pub fn run(
+    model_arg: Option<String>,
+    yolo: bool,
+    no_plugins: bool,
+    no_jit: bool,
+    trust_mode: TrustMode,
+) -> Result<()> {
     let storage = StateDir::resolve().context("resolve data directory")?;
     maki_providers::model_registry::load_from_storage(&storage);
 
     let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
-    let trust = project::resolve(&storage, &cwd, false);
+    let trust = project::resolve(&storage, &cwd, trust_mode);
     load_env_files(&trust.project_config);
 
     let mut plugin_host = PluginHost::with_jit(Arc::clone(ToolRegistry::global_arc()), !no_jit)
@@ -72,6 +79,7 @@ pub fn run(model_arg: Option<String>, yolo: bool, no_plugins: bool, no_jit: bool
         defaults: config.session_defaults,
         model_policy: Arc::new(config.provider.model_policy.clone()),
         plugin_rules: plugin_host.plugin_rules(),
+        trust_mode,
         on_session_end: Some(Arc::new(move |id, reason| {
             let handle = event_handle.clone();
             Box::pin(async move { handle.end_session_async(id, reason).await })

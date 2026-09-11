@@ -45,6 +45,11 @@ The `model` value is a `provider/model-id` spec, same format as `maki --model`.
 
 Authentication, providers, and permissions come from your normal Maki config. Set up [providers](/docs/providers/) first and ACP sessions just work.
 
+The editor picks each session's working directory, and that folder's own
+[trust](/docs/folder-trust/) decides whether its `.maki` config loads. ACP never
+asks, so trust a project with `maki trust add` in it, or start the server with
+`maki --trust acp`.
+
 ```bash
 maki acp
 maki acp -m anthropic/claude-sonnet-4-6

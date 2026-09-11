@@ -198,7 +198,7 @@ fn write_overrides(out: &mut String) {
          Lua host and builtin plugins running, so tools still work. \
          Custom commands and skills still load, and the project \
          permission rules and env file follow \
-         [folder trust](/docs/permissions/#folder-trust).\n\n",
+         [folder trust](/docs/folder-trust/).\n\n",
     );
     out.push_str(
         "The default keymap lives in Rust, not Lua, so `--no-plugins` \

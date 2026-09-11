@@ -10,7 +10,7 @@ use color_eyre::eyre::Context;
 
 use maki_agent::command::{self, CustomCommand};
 use maki_agent::tools::ToolRegistry;
-use maki_config::project::{self, ProjectDecision};
+use maki_config::project::{self, ProjectDecision, TrustMode};
 use maki_config::{Config, ProjectConfig, load_env_files, load_permissions};
 use maki_lua::{InitFiles, Interaction, PluginHost};
 use maki_providers::model::Model;
@@ -249,6 +249,19 @@ fn read_initial_prompt(cli_prompt: Option<String>) -> Result<Option<String>> {
     }
 }
 
+/// `--trust` answers the question up front, so it holds wherever Maki runs.
+/// Without it only a mode that can both ask and be answered may prompt, and
+/// every other start skips what it cannot ask about.
+fn trust_mode(cli: &Cli, headless: bool) -> TrustMode {
+    if cli.trust {
+        TrustMode::Session
+    } else if !headless && io::stdin().is_terminal() && io::stderr().is_terminal() {
+        TrustMode::Ask
+    } else {
+        TrustMode::Skip
+    }
+}
+
 pub fn run(mut cli: Cli) -> Result<()> {
     let storage = StateDir::resolve().context("resolve data directory")?;
     maki_providers::model_registry::load_from_storage(&storage);
@@ -264,11 +277,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
     } else {
         Interaction::Tty
     };
-    let trust = project::resolve(
-        &storage,
-        &cwd,
-        !headless && io::stdin().is_terminal() && io::stderr().is_terminal(),
-    );
+    let trust = project::resolve(&storage, &cwd, trust_mode(&cli, headless));
     load_env_files(&trust.project_config);
     warn_stale_config_toml(&trust.project_config);
     let (mut stack, startup_warnings) =

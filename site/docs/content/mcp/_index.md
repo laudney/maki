@@ -17,8 +17,8 @@ Add servers under `[mcp.*]` in your MCP config:
 - **Project**: `.maki/mcp.toml` in the active Git checkout, or in the working
   directory outside Git (project config wins when both set a value)
 
-Maki starts the servers in the project file only after you trust that folder.
-See [Folder Trust](/docs/permissions/#folder-trust).
+Servers in the project file start only after you trust that folder, see
+[Folder Trust](/docs/folder-trust/).
 
 ### Stdio
 

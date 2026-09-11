@@ -23,6 +23,10 @@ const NO_SHARED_FILES_YET: &str =
     "This project ships no .maki files yet, but any added later would ask again.";
 const ADDED_SINCE_TRUSTED: &str = "since you trusted it";
 const DECLINED: &str = "Shared project config was skipped.";
+/// Every skip says how to undo itself. `--trust` is here because the runs that
+/// cannot answer a prompt are the ones that see these warnings.
+const HOW_TO_TRUST: &str =
+    "run `maki trust add --yes PATH` and restart Maki, or pass `--trust` to load it for one run";
 const REJECTION_NOT_SAVED: &str = "folder rejection was not saved";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -110,25 +114,56 @@ impl ProjectDecision {
     }
 }
 
-pub fn resolve(storage: &StateDir, cwd: &Path, interactive: bool) -> ProjectDecision {
+/// What a start does about a folder the store has no answer for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrustMode {
+    /// Ask on the terminal and record the answer.
+    Ask,
+    /// Skip the shared project config and say so.
+    Skip,
+    /// Trust for this process only. `--trust`.
+    Session,
+}
+
+pub fn resolve(storage: &StateDir, cwd: &Path, mode: TrustMode) -> ProjectDecision {
+    if mode == TrustMode::Session {
+        return session_grant(ProjectConfig::discover(cwd));
+    }
     resolve_with_prompt(
         storage,
         ProjectConfig::discover(cwd),
-        interactive.then_some(ask_on_terminal),
+        (mode == TrustMode::Ask).then_some(ask_on_terminal),
     )
 }
 
 /// For commands that never open the state directory for anything else: a state
 /// directory they cannot resolve costs them the shared project config, not the
 /// whole command.
-pub fn resolve_noninteractive(cwd: &Path) -> ProjectDecision {
+pub fn resolve_noninteractive(cwd: &Path, mode: TrustMode) -> ProjectDecision {
+    if mode == TrustMode::Session {
+        return session_grant(ProjectConfig::discover(cwd));
+    }
     match StateDir::resolve() {
-        Ok(storage) => resolve(&storage, cwd, false),
+        Ok(storage) => resolve(&storage, cwd, mode),
         Err(error) => ProjectDecision::skip(
             ProjectConfig::discover(cwd),
             format!("cannot resolve folder trust state: {error}; {SKIPPED}"),
         ),
     }
+}
+
+/// `--trust` is the same grant as `maki trust add --yes .` before the run, with
+/// the state directory taken out of it. Nothing is read, so a stored no does not
+/// override the flag the user just typed, and nothing is written, so a container
+/// that mounts a state directory keeps no record of a folder it trusted once.
+///
+/// The config carries no store, so a gated file Maki writes during the run
+/// records nothing either, and the next start without the flag asks about it.
+fn session_grant(project_config: ProjectConfig) -> ProjectDecision {
+    // `~/.maki` is the user's own global config, already loaded as global. No
+    // flag turns that into a project, or it would load twice.
+    let trusted = !project_config.at_home;
+    ProjectDecision::quiet(project_config.with_trust(trusted))
 }
 
 /// Takes stdin only here, where a question is really about to be asked. ACP
@@ -200,7 +235,7 @@ where
             return ProjectDecision::skip(
                 project_config,
                 format!(
-                    "skipped shared project config in {} because folder trust was rejected; run `maki trust add --yes PATH` to trust it or `maki trust remove PATH` to clear the decision",
+                    "skipped shared project config in {} because folder trust was rejected; {HOW_TO_TRUST}, or `maki trust remove PATH` to clear the decision",
                     folder.path().display()
                 ),
             );
@@ -244,10 +279,10 @@ fn not_trusted_warning(folder: &CanonicalFolder, added: &[String]) -> String {
     let folder = folder.path().display();
     match name_list(added) {
         Some(files) => format!(
-            "skipped shared project config in {folder} because the project added {files} {ADDED_SINCE_TRUSTED}; run `maki trust add --yes PATH` and restart Maki"
+            "skipped shared project config in {folder} because the project added {files} {ADDED_SINCE_TRUSTED}; {HOW_TO_TRUST}"
         ),
         None => format!(
-            "skipped shared project config in {folder} because the folder is not trusted; run `maki trust add --yes PATH` and restart Maki"
+            "skipped shared project config in {folder} because the folder is not trusted; {HOW_TO_TRUST}"
         ),
     }
 }
@@ -648,6 +683,50 @@ mod tests {
             TrustStatus::Unknown,
             "the home directory must not collect a stored decision either"
         );
+    }
+
+    /// `--trust` is the answer for a container that throws its state directory
+    /// away, so it cannot depend on one. It also has to beat a stored no, or a
+    /// mounted state directory would keep overriding the flag the user typed.
+    #[test_case(Prior::Nothing ; "with_no_stored_decision")]
+    #[test_case(Prior::Rejected ; "over_a_stored_rejection")]
+    fn a_session_grant_trusts_without_touching_the_store(prior: Prior) {
+        let state = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        fs::create_dir(project.path().join(GIT_DIR)).unwrap();
+        fs::create_dir(project.path().join(PROJECT_DIR)).unwrap();
+        fs::write(project.path().join(INIT_FILE), INIT_SOURCE).unwrap();
+        let storage = StateDir::from_path(state.path().to_path_buf());
+        let folder = CanonicalFolder::resolve(project.path()).unwrap();
+        record_prior(prior, &storage, state.path(), &folder);
+        let before = TrustedFolders::new(&storage).status(&folder).unwrap();
+
+        let decision = resolve(&storage, project.path(), TrustMode::Session);
+
+        assert!(decision.project_config.is_trusted());
+        assert_eq!(decision.warning, None);
+        assert_eq!(
+            TrustedFolders::new(&storage).status(&folder).unwrap(),
+            before,
+            "a grant for one process must record nothing"
+        );
+        // Without a store behind it there is no answer to widen, so a gated
+        // file written during the run cannot enrol the folder by the back door.
+        record_written_file(&decision.project_config, PERMISSIONS_NAME);
+        assert_eq!(
+            TrustedFolders::new(&storage).status(&folder).unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn a_session_grant_still_loads_no_project_in_the_home_directory() {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path().canonicalize().unwrap();
+
+        let decision = session_grant(ProjectConfig::rooted(&home, Some(&home)));
+
+        assert!(!decision.project_config.is_trusted());
     }
 
     #[test_case(Prior::Trusted, true, "", true, false, false ; "stored_trust_needs_no_question")]

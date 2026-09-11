@@ -25,7 +25,8 @@ use maki_agent::types::AgentEvent;
 use maki_agent::{
     AgentInput, AgentMode, Envelope, ImageMediaType, ImageSource, SessionEndReason, SessionEvents,
 };
-use maki_config::{MAX_SERVER_NAME_LEN, ModelPolicy, ProjectConfig, SessionDefaults, project};
+use maki_config::project::{self, TrustMode};
+use maki_config::{MAX_SERVER_NAME_LEN, ModelPolicy, ProjectConfig, SessionDefaults};
 use maki_providers::model::Model;
 use maki_providers::provider::{available_model_specs, fetch_all_models};
 use maki_providers::{Message, TokenUsage, add_cost, settle_session};
@@ -266,7 +267,7 @@ async fn new_session(
 ) -> Result<AgentResponse, AcpError> {
     let req: NewSessionRequest = parse_params(raw)?;
     close_session(srv, SessionEndReason::Replaced).await;
-    let project_config = trusted_project_config(&req.cwd, &params.storage);
+    let project_config = trusted_project_config(&req.cwd, &params.storage, params.trust_mode);
     let mcp = start_mcp(&req.cwd, &req.mcp_servers, project_config.clone()).await;
     let session_ref = start_session(
         srv,
@@ -298,7 +299,7 @@ async fn load_session(
         .map_err(|_| AcpError::resource_not_found(Some(req.session_id.0.to_string())))?;
     let mut restored = load_history(session_ref.id())?;
     close_session(srv, SessionEndReason::Replaced).await;
-    let project_config = trusted_project_config(&req.cwd, &params.storage);
+    let project_config = trusted_project_config(&req.cwd, &params.storage, params.trust_mode);
     let mcp = start_mcp(&req.cwd, &req.mcp_servers, project_config.clone()).await;
     let sid = SessionId::from(session_ref.to_string());
     let home = maki_storage::paths::home();
@@ -532,8 +533,8 @@ async fn start_mcp(
     handle
 }
 
-fn trusted_project_config(cwd: &Path, storage: &StateDir) -> ProjectConfig {
-    let decision = project::resolve(storage, cwd, false);
+fn trusted_project_config(cwd: &Path, storage: &StateDir, mode: TrustMode) -> ProjectConfig {
+    let decision = project::resolve(storage, cwd, mode);
     if let Some(warning) = decision.warning {
         warn!(%warning, "ACP project configuration trust warning");
     }
@@ -973,7 +974,7 @@ mod tests {
         .unwrap();
         let storage = StateDir::from_path(state.path().to_path_buf());
 
-        let untrusted = trusted_project_config(project.path(), &storage);
+        let untrusted = trusted_project_config(project.path(), &storage, TrustMode::Skip);
         assert!(!untrusted.is_trusted());
         let rules = maki_config::load_permissions(&untrusted).rules;
         assert!(
@@ -992,7 +993,7 @@ mod tests {
             .add(&folder, &maki_config::project::gated_files(project.path()))
             .unwrap();
 
-        let trusted = trusted_project_config(project.path(), &storage);
+        let trusted = trusted_project_config(project.path(), &storage, TrustMode::Skip);
         assert!(trusted.is_trusted());
         assert_eq!(
             trusted.config_root(),
@@ -1029,7 +1030,7 @@ mod tests {
         let held = std::io::stdin().lock();
         let (done_tx, done_rx) = flume::bounded(1);
         let worker = std::thread::spawn(move || {
-            let config = trusted_project_config(&cwd, &storage);
+            let config = trusted_project_config(&cwd, &storage, TrustMode::Skip);
             let _ = done_tx.send(config.is_trusted());
         });
 

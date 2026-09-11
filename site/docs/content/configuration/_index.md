@@ -17,7 +17,7 @@ Two places, both optional:
 
 When both exist, project settings override global ones. Neither file is required.
 A project `init.lua` runs only once you trust that folder, see
-[Folder Trust](/docs/permissions/#folder-trust).
+[Folder Trust](/docs/folder-trust/).
 
 ## Example
 

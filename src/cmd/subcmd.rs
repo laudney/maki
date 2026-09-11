@@ -8,7 +8,7 @@ use color_eyre::eyre::{Context, bail};
 
 use maki_agent::mcp::{config as mcp_config, oauth as mcp_oauth};
 use maki_agent::tools::ToolRegistry;
-use maki_config::project::{self, ProjectDecision};
+use maki_config::project::{self, ProjectDecision, TrustMode};
 use maki_config::providers::{
     ProviderDef, ProvidersConfig, all_builtins, builtin_provider, resolve_api_key_env,
     resolve_base_url, resolve_default_model, resolve_display_name, resolve_login_url, slugify,
@@ -540,9 +540,9 @@ pub fn auth_status(storage: &StateDir) -> Result<()> {
     Ok(())
 }
 
-pub fn models(no_plugins: bool, no_jit: bool, refresh: bool) -> Result<()> {
+pub fn models(no_plugins: bool, no_jit: bool, refresh: bool, trust_mode: TrustMode) -> Result<()> {
     let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
-    let trust = project::resolve_noninteractive(&cwd);
+    let trust = project::resolve_noninteractive(&cwd, trust_mode);
     load_env_files(&trust.project_config);
 
     let mut host = PluginHost::with_jit(Arc::clone(ToolRegistry::global_arc()), !no_jit)
@@ -604,9 +604,9 @@ fn load_effective_config(
         .context("invalid config")
 }
 
-pub fn index(path: &str, no_plugins: bool, no_jit: bool) -> Result<()> {
+pub fn index(path: &str, no_plugins: bool, no_jit: bool, trust_mode: TrustMode) -> Result<()> {
     let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
-    let trust = project::resolve_noninteractive(&cwd);
+    let trust = project::resolve_noninteractive(&cwd, trust_mode);
     load_env_files(&trust.project_config);
 
     let mut host = PluginHost::with_jit(Arc::clone(ToolRegistry::global_arc()), !no_jit)
@@ -646,10 +646,10 @@ pub fn index(path: &str, no_plugins: bool, no_jit: bool) -> Result<()> {
     Ok(())
 }
 
-pub fn mcp_auth(server: &str, storage: &StateDir) -> Result<()> {
+pub fn mcp_auth(server: &str, storage: &StateDir, trust_mode: TrustMode) -> Result<()> {
     smol::block_on(async {
         let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
-        let trust = project::resolve(storage, &cwd, false);
+        let trust = project::resolve(storage, &cwd, trust_mode);
         super::report_warnings(trust.warning.into_iter().collect());
         let (config, _) = mcp_config::load_config(&cwd, trust.project_config);
         let raw = config
@@ -692,6 +692,7 @@ pub fn prompt(
     names: bool,
     no_plugins: bool,
     no_jit: bool,
+    trust_mode: TrustMode,
 ) -> Result<()> {
     use crate::cli::PromptVariant;
     use maki_agent::agent::{build_system_prompt, load_instruction_text};
@@ -705,8 +706,7 @@ pub fn prompt(
     }
 
     let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
-    let trust = project::resolve_noninteractive(&cwd);
-    load_env_files(&trust.project_config);
+    let trust = project::resolve_noninteractive(&cwd, trust_mode);
 
     let vars = template::env_vars();
     let reg = ToolRegistry::global_arc();

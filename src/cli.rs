@@ -81,6 +81,12 @@ pub struct Cli {
     #[arg(long, alias = "dangerously-skip-permissions")]
     pub yolo: bool,
 
+    /// Load shared project `.maki` config for this run without asking and
+    /// without recording an answer. For containers and CI, where the state
+    /// directory is thrown away anyway. Only use it on a project you trust.
+    #[arg(long)]
+    pub trust: bool,
+
     /// Exit after the agent completes (for automation workflows)
     #[arg(long)]
     pub exit_on_done: bool,
