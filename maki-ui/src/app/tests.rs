@@ -72,6 +72,8 @@ const PERMISSIONS_CWD: &str = "/tmp";
 /// The rewind fixture holds a few dozen bytes of chat, far below this, so it
 /// doubles as the window the gauge is allowed to land in.
 const SMALL_HISTORY: u32 = 1_000;
+const AGENT_ERROR_MSG: &str = "boom";
+const MULTIBYTE_ERROR_CHAR: &str = "é";
 
 fn set_zone(app: &mut App, zone: SelectionZone, area: Rect) {
     app.zones.push(SelectableZone { area, zone });
@@ -590,6 +592,20 @@ fn queue_item_consumed_marks_agent_streaming() {
     assert_eq!(app.status, Status::Streaming);
 }
 
+#[test_case(AGENT_ERROR_MSG.into(), AGENT_ERROR_MSG.into() ; "kept_whole")]
+#[test_case(
+    MULTIBYTE_ERROR_CHAR.repeat(ERROR_BUBBLE_MAX_CHARS + 1),
+    format!("{}{TRUNCATION_PREFIX}", MULTIBYTE_ERROR_CHAR.repeat(ERROR_BUBBLE_MAX_CHARS))
+    ; "capped_on_char_boundary"
+)]
+fn agent_error_lands_in_chat(message: String, expected: String) {
+    let mut app = test_app();
+    app.run_id = 1;
+    app.update(agent_msg(AgentEvent::Error { message }));
+    assert_eq!(app.chats[0].last_message_role(), Some(&DisplayRole::Error));
+    assert_eq!(app.chats[0].last_message_text(), expected);
+}
+
 #[test_case(error_app as fn(&mut App) ; "error")]
 #[test_case(cancel_app as fn(&mut App) ; "cancel")]
 fn clears_queue(terminate: fn(&mut App)) {
@@ -676,7 +692,7 @@ pub(crate) fn cancel_app(app: &mut App) {
 
 pub(crate) fn error_app(app: &mut App) {
     app.update(agent_msg(AgentEvent::Error {
-        message: "boom".into(),
+        message: AGENT_ERROR_MSG.into(),
     }));
 }
 

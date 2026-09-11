@@ -51,6 +51,7 @@ use crate::components::{
     Action, DisplayMessage, DisplayRole, ExitRequest, Overlay, RetryInfo, Status, is_ctrl,
 };
 use crate::image;
+use crate::markdown::TRUNCATION_PREFIX;
 use crate::repaint::{Cadence, Dirty, Watch};
 use crate::selection::{SelectionState, SelectionZone, ZoneRegistry};
 use arc_swap::{ArcSwap, ArcSwapOption};
@@ -104,6 +105,10 @@ const IMPLEMENT_PARALLEL_HINT: &str = "Use batch+task to parallelize, assign eac
 
 const MISSING_TOOL_COMPLETION: &str = "Tool did not report completion before the turn ended";
 const NOTIFICATION_PREVIEW_CHARS: usize = 200;
+/// An API error carries the provider's raw response body, sometimes a whole
+/// HTML page from a broken proxy, and the bubble stays for the rest of the
+/// session. Well above any real error message, small enough to not drown chat.
+const ERROR_BUBBLE_MAX_CHARS: usize = 2_000;
 
 /// Depth budget for `maki.api.run_command` chains. Aliases nest a level or two
 /// in practice; the cap only exists so a command aliasing itself reports an
@@ -165,6 +170,13 @@ fn notification_preview<'a>(chunks: impl Iterator<Item = &'a str>) -> Option<Str
 
 fn normalize_preview(text: &str) -> Option<String> {
     notification_preview(std::iter::once(text))
+}
+
+fn cap_error_text(message: &str) -> String {
+    match message.char_indices().nth(ERROR_BUBBLE_MAX_CHARS) {
+        Some((end, _)) => format!("{}{TRUNCATION_PREFIX}", &message[..end]),
+        None => message.to_owned(),
+    }
 }
 
 pub(crate) fn turn_response(message: &Message) -> Option<String> {
@@ -1266,6 +1278,10 @@ impl App {
                 ChatEventResult::Error(message) => {
                     self.status = Status::error(message.clone());
                     self.status_bar.clear_flash();
+                    self.main_chat().push(DisplayMessage::new(
+                        DisplayRole::Error,
+                        cap_error_text(&message),
+                    ));
                     self.subagent_answers.clear();
                     self.terminalize_turn(&message);
                     self.recoverable_queue = self.queue.text_messages();
