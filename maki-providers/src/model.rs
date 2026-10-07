@@ -524,7 +524,7 @@ pub enum FastSupport {
     Unsupported,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Model {
     pub id: String,
     pub provider: Arc<str>,

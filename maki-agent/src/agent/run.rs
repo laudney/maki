@@ -463,8 +463,8 @@ impl<'h> Agent<'h> {
         Ok(())
     }
 
-    /// Picks up a model chosen while the run was working. The prompt stays,
-    /// and the next request tells the model about the switch.
+    /// Picks up a model selected or refreshed while the run was working. The
+    /// prompt stays, and the next request tells the model about the switch.
     ///
     /// Three kinds of switch wait for the next run. Another provider shapes
     /// history its own way (signed thinking blocks, reasoning fields). Turning
@@ -477,7 +477,7 @@ impl<'h> Agent<'h> {
             return;
         };
         let current = slot.load_full();
-        if current.model.spec() == self.model.spec()
+        if current.model == *self.model
             || current.model.provider != self.model.provider
             || current.model.supports_thinking() != self.model.supports_thinking()
         {
@@ -493,7 +493,7 @@ impl<'h> Agent<'h> {
             debug!(model = %current.model.id, "model switch waits for the next run, its frame differs");
             return;
         }
-        info!(model = %current.model.id, "adopted model switched mid-run");
+        info!(model = %current.model.id, "adopted model update mid-run");
         self.prompt_facts = candidate.facts;
         self.provider = Arc::clone(&current.provider);
         self.model = Arc::new(current.model.clone());
@@ -1732,6 +1732,74 @@ mod tests {
     const ADOPTED_MSG: &str =
         "the next request must go out on the new model, and the model told so";
     const HELD_MSG: &str = "this switch must wait for the next run, nothing may move";
+    const REFRESHED_WINDOW_MSG: &str =
+        "discovered limits must reach the running agent before its compaction check";
+    const REFRESHED_COMPACTION_MSG: &str = "auto-compaction must use the refreshed context window";
+
+    #[test_case(200_000, 262_144, 180_000, false ; "discovery_expands_protocol_default")]
+    #[test_case(1_000_000, 262_144, 220_000, true ; "discovery_shrinks_context_window")]
+    #[test_case(200_000, 1_000_000, 180_000, false ; "discovery_expands_context_window")]
+    fn same_model_refresh_updates_auto_compaction(
+        initial_window: u32,
+        discovered_window: u32,
+        context_size: u32,
+        expected_compaction: bool,
+    ) {
+        let mut h = Harness::new(Vec::new());
+        h.model = small_context_model(initial_window, 8_192);
+        let refreshed = Model {
+            context_window: discovered_window,
+            ..h.model.clone()
+        };
+        let first_turn = StreamResponse {
+            usage: TokenUsage {
+                input: context_size,
+                ..Default::default()
+            },
+            ..tool_call_response("glob", "t1")
+        };
+        let replies = vec![
+            first_turn,
+            text_response(StopReason::EndTurn),
+            text_response(StopReason::EndTurn),
+        ];
+        let start = h.model.clone();
+        let (_, events) = h.run(default_input(), replies, |agent| {
+            let provider = Arc::clone(&agent.provider);
+            let slot = Arc::new(ArcSwap::from_pointee(ModelSlot {
+                model: start,
+                provider: Arc::clone(&provider),
+            }));
+            agent.model_sync = Some(Arc::clone(&slot));
+            agent.interrupt_source = Some(Arc::new(ModelPicker {
+                slot,
+                provider,
+                model: refreshed,
+            }));
+            agent.auto_compact = true;
+        });
+
+        assert_eq!(
+            has_event(&events, |event| matches!(
+                event,
+                AgentEvent::AutoCompacting { .. }
+            )),
+            expected_compaction,
+            "{REFRESHED_COMPACTION_MSG}"
+        );
+        assert_eq!(
+            events.iter().rev().find_map(|event| match &event.event {
+                AgentEvent::TurnComplete(turn) => Some(turn.context_window),
+                _ => None,
+            }),
+            Some(discovered_window),
+            "{REFRESHED_WINDOW_MSG}"
+        );
+        if !expected_compaction {
+            h.assert_append_only();
+        }
+        assert!(updates(&h.history).is_empty());
+    }
 
     /// A picker can swap the model while a run sits between turns. The next
     /// request goes out on it under the same frame, and an update tells the
