@@ -26,7 +26,9 @@ use crate::cancel::{CancelMap, CancelToken};
 use crate::mcp::{McpSession, ToolDeferral};
 use crate::permissions::PermissionManager;
 use crate::tools::hook::Verdict;
-use crate::tools::{Deadline, FileAccess, LocalTools, ToolAudience, ToolContext, ToolFilter};
+use crate::tools::{
+    Deadline, FileAccess, LocalTools, ToolAudience, ToolContext, ToolFilter, ToolOutputMode,
+};
 use crate::{
     AgentConfig, AgentError, AgentEvent, AgentInput, AgentMode, DoneReason, EventSender,
     ExtractedCommand, InputSource, InterruptSource, RunLedger, SessionMailbox, SteerKind,
@@ -939,6 +941,7 @@ impl<'h> Agent<'h> {
             config: self.config.clone(),
             tool_filter,
             tool_output_lines: self.tool_output_lines,
+            output_mode: ToolOutputMode::Model,
             permissions: Arc::clone(&self.permissions),
             timeouts: self.timeouts,
             file_access: Arc::clone(&self.file_access),

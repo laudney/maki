@@ -10,8 +10,8 @@ local M = {}
 
 M.DEFAULT_MAX_LINE_BYTES = DEFAULT_MAX_LINE_BYTES
 M.specs = {
-  max_output_lines = { type = "integer", desc = "Override `agent.max_output_lines` for this tool." },
-  max_output_bytes = { type = "integer", desc = "Override `agent.max_output_bytes` for this tool." },
+  max_output_lines = { type = "integer", desc = "Override `agent.max_output_lines` for this tool's model output." },
+  max_output_bytes = { type = "integer", desc = "Override `agent.max_output_bytes` for this tool's model output." },
 }
 
 function M.extend(spec)
@@ -21,10 +21,18 @@ function M.extend(spec)
   return spec
 end
 
---- Returns max_lines, max_bytes: tool override when set, agent-wide otherwise.
+--- Model presentation limits, or nil, nil for programmatic results.
 function M.resolve(opts, ctx)
+  if ctx:output_mode() == "programmatic" then
+    return nil, nil
+  end
   return opts.max_output_lines or ctx:config("max_output_lines", DEFAULT_MAX_OUTPUT_LINES),
     opts.max_output_bytes or ctx:config("max_output_bytes", DEFAULT_MAX_OUTPUT_BYTES)
+end
+
+--- Zero disables the line-byte presentation limit for programmatic callers.
+function M.line_bytes(opts, ctx)
+  return ctx:output_mode() == "programmatic" and 0 or opts.max_line_bytes
 end
 
 --- Last {n} lines of {text}, or all of it when it has fewer. Newlines separate

@@ -111,6 +111,9 @@ local function run_rtk(cmd)
 end
 
 local function rtk_rewrite(command, ctx)
+  if ctx:output_mode() == "programmatic" then
+    return nil
+  end
   local config = ctx:config()
   if config and not config.rtk then
     return nil
@@ -258,7 +261,7 @@ Commands run in the session's working directory (see Environment) by default.
 - Do NOT use to communicate text to the user.
 - Chain dependent commands with `&&`. Use batch for independent ones.
 - Provide a short `description` (3-5 words).
-- Output truncated beyond 2000 lines or 50KB.
+- Output sent to the model is truncated beyond 2000 lines or 50KB.
 - Interactive commands (sudo, ssh prompts) fail immediately.
 - Use the `tail` param, not `| tail`: piping hides live output.]]
 
@@ -386,9 +389,8 @@ maki.api.register_tool({
     local has_output = false
     local finished = false
 
-    -- The cut happens on the accumulated text, after the view already streamed
-    -- every line, so the user still sees the whole run while the model gets
-    -- only the tail. Both the exit and the cancel path go through here.
+    -- Presentation limits apply after the view streams every line. Both the
+    -- exit and cancel path go through here.
     local function final_output()
       local output = table.concat(output_parts)
       if input.tail then

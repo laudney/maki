@@ -14,7 +14,7 @@ use maki_agent::tools::registry::ToolRegistry;
 use maki_agent::tools::schema::sanitize_tool_input_schema;
 use maki_agent::tools::{
     CallOrigin, Deadline, DescriptionContext, LocalTool, LocalTools, RequestTools, ToolAudience,
-    ToolContext, ToolFilter, ToolLive,
+    ToolContext, ToolFilter, ToolLive, ToolOutputMode,
 };
 use maki_agent::{
     Agent, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, DoneReason,
@@ -45,6 +45,7 @@ use crate::runtime::CANCELLED_MSG;
 const SESSION_CLOSED_ERR: &str = "session closed";
 const PROMPT_DROPPED_ERR: &str = "an `agent.user_message` layer dropped the prompt";
 const DEFAULT_SESSION_AUDIENCE: ToolAudience = ToolAudience::GENERAL_SUB;
+const OUTPUT_MODE_ERR: &str = "output_mode must be 'model' or 'programmatic'";
 
 fn resolve_model_from_ctx(ctx: &AgentContext, tier: Option<&str>) -> Result<Model, String> {
     let Some(tier_str) = tier else {
@@ -340,6 +341,9 @@ async fn callable_tools(lua: Lua, ctx: mlua::UserDataRef<LuaCtx>) -> LuaResult<P
 /// @param input table|any Tool input (JSON-serializable). Must match the tool's `input_schema`.
 /// @param opts table? Optional fields:
 ///   `timeout` (integer?) - deadline in seconds.
+///   `output_mode` (string?) - "model" or "programmatic". Defaults to the
+///     caller's mode. Programmatic calls receive complete text before model
+///     presentation limits, with the same permissions and hooks.
 ///   `on_live_buf` (function?) - called with a `BufHandle` for each live buffer
 ///     the tool publishes. Must not yield.
 ///   `on_annotation` (function?) - called with an annotation string for each
@@ -369,6 +373,12 @@ async fn call_tool(
     let mut tctx = agent.to_tool_context();
     let (mut on_buf, mut on_ann, mut on_usage, mut rx) = (None, None, None, None);
     if let Some(o) = opts {
+        if let Some(mode) = o.get::<Option<String>>("output_mode")? {
+            let Some(mode) = ToolOutputMode::parse(&mode) else {
+                return Ok(err_pair(OUTPUT_MODE_ERR));
+            };
+            tctx.output_mode = mode;
+        }
         if let Some(secs) = o.get::<Option<u64>>("timeout")? {
             tctx.deadline = Deadline::after(Duration::from_secs(secs));
         }

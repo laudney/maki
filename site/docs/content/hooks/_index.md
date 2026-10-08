@@ -62,6 +62,7 @@ already done, so `reason` only replaces the text the model reads.
 | `tool_id` | id of the call, empty for nested calls |
 | `tool_kind` | kind the tool declares, like `read`, `edit`, or `execute`. `nil` if it declares none. |
 | `origin` | `"model"`, or `"nested"` when `batch`, `code_execution`, or `maki.agent.call_tool` made the call |
+| `output_mode` | `"model"` for bounded model text, or `"programmatic"` for complete intermediate text |
 | `session_id` | session of the call. A subagent's calls arrive as `"model"` under its own session. |
 | `deadline_ms` | milliseconds left before the layer is dropped |
 | `input` | `output` only: the input the call ran with, after every input layer |
@@ -100,10 +101,17 @@ end)
 An output layer runs before the output becomes part of the conversation, so what
 it drops is never paid for again:
 
+Output layers also run for programmatic calls. Check `ctx.output_mode` before
+shortening text so Python can process complete results. Apply redaction in both
+modes.
+
 ```lua
 local MAX = 200
 
 maki.api.set_slot("tool.bash.output", function(prev, out, ctx)
+  if ctx.output_mode == "programmatic" then
+    return prev(out, ctx)
+  end
   local lines = {}
   for line in out.text:gmatch("[^\n]+") do
     if not line:match("^%s*Compiling ") then

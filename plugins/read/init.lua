@@ -10,7 +10,7 @@ local DESCRIPTION = [[Read a file. Returns contents with line numbers (1-indexed
 
 - Supports absolute, relative, and ~/ paths.
 - **offset** and **limit** are required. Use offset=1 to read from the first line.
-- Use limit=0 to read until the end of file (capped at 2000 lines).
+- Use limit=0 to read until the end of file. Model output limits still apply.
 - Use the **index** tool or **grep** tool first to find the offset and limit.
 - Only read the sections you actually need.
 - Use `wc -l` to check total number of lines before reading to decide a reasonable limit.
@@ -20,10 +20,8 @@ local DESCRIPTION = [[Read a file. Returns contents with line numbers (1-indexed
 - Call in parallel when reading multiple files.
 - Avoid tiny repeated slices - read a larger window if you need more context.]]
 
-local DEFAULT_MAX_OUTPUT_LINES = 2000
-
 local opts = maki.api.register_options({
-  max_line_bytes = { default = 500, min = 80, desc = "Truncate lines longer than this many bytes." },
+  max_line_bytes = { default = 500, min = 80, desc = "Truncate model output lines longer than this many bytes." },
   max_output_lines = output_limits.specs.max_output_lines,
 })
 
@@ -94,9 +92,12 @@ local function read_file(path, offset, limit, ctx)
   local total_lines = #all_lines
 
   local start = math.max(math.floor(offset), 1)
-  local default_max = opts.max_output_lines or ctx:config("max_output_lines", DEFAULT_MAX_OUTPUT_LINES)
-  local max_lines = limit == 0 and default_max or math.min(limit, default_max)
-  local max_line_bytes = opts.max_line_bytes
+  local max_output_lines = output_limits.resolve(opts, ctx)
+  local max_lines = limit == 0 and total_lines or limit
+  if max_output_lines then
+    max_lines = math.min(max_lines, max_output_lines)
+  end
+  local max_line_bytes = output_limits.line_bytes(opts, ctx)
 
   local lines = {}
   for i = start, math.min(start + max_lines - 1, total_lines) do
@@ -170,7 +171,7 @@ maki.api.register_tool({
       },
       limit = {
         type = "integer",
-        description = "Max number of lines to read. Use 0 to read until end of file (capped at 2000 lines).",
+        description = "Max number of lines to read. Use 0 to read until end of file. Model output limits still apply.",
         required = true,
       },
     },

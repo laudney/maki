@@ -322,6 +322,7 @@ impl<'a> Hook<'a> {
             input,
             session_id: self.ctx.session_id.as_ref().map(SessionRef::as_str),
             origin: self.origin,
+            output_mode: self.ctx.output_mode,
             authority: self.authority,
             cancel: &self.ctx.cancel,
             deadline: self.window(),
