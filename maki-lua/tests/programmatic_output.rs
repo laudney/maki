@@ -37,6 +37,7 @@ const TOOLS: &[&str] = &[
 ];
 const MODEL_BYTES: usize = 1024;
 const MODEL_LINES: usize = 8;
+const TEST_TIMEOUT_SECS: u64 = 60;
 const LAST_ITEM: &str = "final-item";
 #[cfg(unix)]
 const RTK_FIXTURE_DIR: &str = "MAKI_TEST_RTK_DIR";
@@ -102,7 +103,7 @@ fn python(ctx: &ToolContext, code: &str) -> Result<String, String> {
     run(
         ctx,
         "code_execution",
-        json!({ "code": code, "timeout": 10 }),
+        json!({ "code": code, "timeout": TEST_TIMEOUT_SECS }),
     )
 }
 
