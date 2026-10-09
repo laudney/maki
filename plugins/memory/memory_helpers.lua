@@ -398,7 +398,7 @@ function M.encode_frontmatter(tags)
 end
 
 function M.cap_read_output(s, hint, ctx)
-  if (ctx and ctx:output_mode() == "programmatic") or #s <= M.MAX_FILE_BYTES then
+  if (ctx and ctx:output_mode() == "full") or #s <= M.MAX_FILE_BYTES then
     return s
   end
   -- Back off UTF-8 continuation bytes so the cut never splits a codepoint.

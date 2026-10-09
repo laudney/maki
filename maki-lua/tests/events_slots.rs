@@ -384,7 +384,7 @@ fn call_of<'a>(
         input: None,
         session_id: None,
         origin,
-        output_mode: ToolOutputMode::Model,
+        output_mode: ToolOutputMode::Compact,
         authority,
         cancel,
         deadline: Instant::now() + DISPATCH_TIMEOUT,

@@ -72,26 +72,26 @@ impl CallOrigin {
     }
 }
 
-/// The result consumer, independent of tool visibility and history ownership.
+/// Result presentation, independent of tool visibility and history ownership.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ToolOutputMode {
     #[default]
-    Model,
-    Programmatic,
+    Full,
+    Compact,
 }
 
 impl ToolOutputMode {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Model => "model",
-            Self::Programmatic => "programmatic",
+            Self::Full => "full",
+            Self::Compact => "compact",
         }
     }
 
     pub fn parse(value: &str) -> Option<Self> {
         match value {
-            "model" => Some(Self::Model),
-            "programmatic" => Some(Self::Programmatic),
+            "full" => Some(Self::Full),
+            "compact" => Some(Self::Compact),
             _ => None,
         }
     }
@@ -616,7 +616,7 @@ pub fn interpreter_ctx(
         config: AgentConfig::default(),
         tool_filter: Arc::default(),
         tool_output_lines: ToolOutputLines::default(),
-        output_mode: ToolOutputMode::Model,
+        output_mode: ToolOutputMode::Full,
         permissions,
         timeouts: maki_providers::Timeouts::default(),
         file_access,
@@ -802,6 +802,7 @@ pub mod test_support {
             Arc::new(ToolRegistry::new()),
         );
         ctx.tool_use_id = tool_use_id.map(String::from);
+        ctx.output_mode = ToolOutputMode::Compact;
         ctx
     }
 
@@ -826,6 +827,7 @@ pub mod test_support {
             Arc::new(ToolRegistry::new()),
         );
         ctx.tool_use_id = None;
+        ctx.output_mode = ToolOutputMode::Compact;
         ctx
     }
 }

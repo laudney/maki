@@ -3,18 +3,14 @@ use serde_json::Value;
 use crate::ToolOutput;
 use crate::agent::tool_dispatch;
 
-use super::{CallOrigin, ToolContext, ToolOutputMode};
+use super::{CallOrigin, ToolContext};
 
 pub const IMAGE_NOT_VISIBLE_NOTE: &str =
     "image pixels are not visible from here; call the view_image tool directly";
 
 pub async fn dispatch(ctx: &ToolContext, name: &str, input: &Value) -> Result<String, String> {
     ctx.deadline.check()?;
-    let ctx = ToolContext {
-        output_mode: ToolOutputMode::Programmatic,
-        ..ctx.clone()
-    };
-    let done = tool_dispatch::run(String::new(), name, input, &ctx, CallOrigin::Nested).await;
+    let done = tool_dispatch::run(String::new(), name, input, ctx, CallOrigin::Nested).await;
     flatten(&done)
 }
 

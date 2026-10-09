@@ -111,7 +111,7 @@ local function run_rtk(cmd)
 end
 
 local function rtk_rewrite(command, ctx)
-  if ctx:output_mode() == "programmatic" then
+  if ctx:output_mode() == "full" then
     return nil
   end
   local config = ctx:config()

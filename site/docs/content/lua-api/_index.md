@@ -407,8 +407,8 @@ Your {spec} table must include a name, a description (the model reads it
 to decide when to use the tool), a JSON Schema for the input, and a handler
 function. The handler receives `(input, ctx)` and returns either a plain
 string or a table with richer output fields.
-`ctx:output_mode()` is "model" or "programmatic". Apply presentation limits
-only in model mode so Python and other programmatic callers get complete text.
+`ctx:output_mode()` is "full" or "compact". Apply presentation limits
+only in compact mode so Python and other code callers get complete text.
 
 **Parameters:**
 
@@ -1379,9 +1379,10 @@ through optional callbacks while the tool runs.
 - `{input}` (`table|any`) Tool input (JSON-serializable). Must match the tool's `input_schema`.
 - `{opts?}` (`table?`) Optional fields:
   - `timeout` (`integer?`) deadline in seconds.
-  - `output_mode` (`string?`) "model" or "programmatic". Defaults to the
-    caller's mode. Programmatic calls receive complete text before model
-    presentation limits, with the same permissions and hooks.
+  - `output_mode` (`string?`) "full" (default) returns complete text.
+    "compact" applies model output limits and automatic RTK rewriting.
+    Hooks receive the mode in both cases so presentation filters can skip
+    full results. Permissions and redaction still apply in both modes.
   - `on_live_buf` (`function?`) called with a `BufHandle` for each live buffer
     the tool publishes. Must not yield.
   - `on_annotation` (`function?`) called with an annotation string for each
@@ -7228,10 +7229,10 @@ ListPicker.range_spans = range_spans
 M.DEFAULT_MAX_LINE_BYTES = DEFAULT_MAX_LINE_BYTES
 function M.extend(spec)
 
---- Model presentation limits, or nil, nil for programmatic results.
+--- Model presentation limits, or nil, nil for full results.
 function M.resolve(opts, ctx)
 
---- Zero disables the line-byte presentation limit for programmatic callers.
+--- Zero disables the line-byte presentation limit for full results.
 function M.line_bytes(opts, ctx)
 
 --- Last {n} lines of {text}, or all of it when it has fewer. Newlines separate

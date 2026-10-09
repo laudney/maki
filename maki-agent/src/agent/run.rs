@@ -941,7 +941,7 @@ impl<'h> Agent<'h> {
             config: self.config.clone(),
             tool_filter,
             tool_output_lines: self.tool_output_lines,
-            output_mode: ToolOutputMode::Model,
+            output_mode: ToolOutputMode::Compact,
             permissions: Arc::clone(&self.permissions),
             timeouts: self.timeouts,
             file_access: Arc::clone(&self.file_access),

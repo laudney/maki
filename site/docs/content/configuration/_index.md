@@ -282,7 +282,7 @@ maki.setup({
 |-------|------|---------|-----|-------------|
 | `max_output_bytes` | integer | - | - | Override `agent.max_output_bytes` for this tool's model output. |
 | `max_output_lines` | integer | - | - | Override `agent.max_output_lines` for this tool's model output. |
-| `search_result_limit` | integer | `100` | 10 | Max files returned per search. |
+| `search_result_limit` | integer | `100` | 10 | Max files returned per search in compact mode. |
 
 ### `plugins.grep`
 

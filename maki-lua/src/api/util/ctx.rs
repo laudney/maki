@@ -213,7 +213,7 @@ impl LuaCtx {
         match &self.caps {
             Caps::Handler { agent } => agent.output_mode,
             Caps::Start { output_mode, .. } => *output_mode,
-            Caps::Restore { .. } => ToolOutputMode::Model,
+            Caps::Restore { .. } => ToolOutputMode::Compact,
         }
     }
 

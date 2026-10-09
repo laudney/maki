@@ -17,9 +17,9 @@ local validate_write_size = h.validate_write_size
 local validate_input = h.validate_input
 
 local NO_MATCH_MSG = "no memory files matched any of the given tags; use `list` to see available tags"
-local PROGRAMMATIC_CTX = {
+local FULL_CTX = {
   output_mode = function()
-    return "programmatic"
+    return "full"
   end,
 }
 
@@ -198,7 +198,7 @@ case_tmp("format_list_caps_oversized_output", function(dir)
   assert(result:find("truncated at", 1, true), "oversized list is capped")
   assert(result:find(h.CAP_HINT_FILTER, 1, true), "cap hint suggests tag filtering")
 
-  local complete = format_list(dir, nil, PROGRAMMATIC_CTX)
+  local complete = format_list(dir, nil, FULL_CTX)
   assert(#complete > h.MAX_FILE_BYTES, "programmatic list exceeds the presentation cap")
   assert(not complete:find("truncated at", 1, true), "programmatic list is complete")
   for i = 1, 130 do
@@ -476,7 +476,7 @@ case("cap_read_output_caps_and_picks_hint", function()
   eq(cap_read_output(small, h.CAP_HINT_REWRITE), small, "under the cap returned unchanged")
 
   local big = string.rep("x", max + 50)
-  eq(cap_read_output(big, h.CAP_HINT_REWRITE, PROGRAMMATIC_CTX), big, "programmatic output returned unchanged")
+  eq(cap_read_output(big, h.CAP_HINT_REWRITE, FULL_CTX), big, "programmatic output returned unchanged")
   local out = cap_read_output(big, h.CAP_HINT_REWRITE)
   assert(out:find("truncated at " .. max .. " bytes", 1, true), "marker renders the cap")
   assert(out:sub(1, max) == string.rep("x", max), "prefix preserved up to the cap")
@@ -575,9 +575,9 @@ case_tmp("format_read_oversized_picks_hint_by_match_count", function(dir)
     "many matches ask to narrow"
   )
 
-  local complete_single = format_read(one, { "bulk" }, PROGRAMMATIC_CTX)
+  local complete_single = format_read(one, { "bulk" }, FULL_CTX)
   assert(complete_single:find(string.rep("x", max + 50), 1, true), "programmatic read keeps the full body")
-  local complete_many = format_read(many, { "bulk" }, PROGRAMMATIC_CTX)
+  local complete_many = format_read(many, { "bulk" }, FULL_CTX)
   assert(complete_many:find(string.rep("a", half), 1, true), "programmatic read keeps the first full body")
   assert(complete_many:find(string.rep("b", half), 1, true), "programmatic read keeps the last full body")
   assert(not complete_many:find("truncated at", 1, true), "programmatic tagged read is complete")

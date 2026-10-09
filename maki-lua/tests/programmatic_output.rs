@@ -37,6 +37,7 @@ const TOOLS: &[&str] = &[
 ];
 const MODEL_BYTES: usize = 1024;
 const MODEL_LINES: usize = 8;
+const COMPACT_GLOB_LIMIT: usize = 100;
 const TEST_TIMEOUT_SECS: u64 = 60;
 const LAST_ITEM: &str = "final-item";
 #[cfg(unix)]
@@ -56,7 +57,7 @@ maki.api.register_tool({
     handler = function(input, ctx)
         local out, err = maki.agent.call_tool(ctx, "read", {
             path = input.path, offset = 1, limit = 0,
-        }, { output_mode = input.mode })
+        }, input.mode and { output_mode = input.mode } or nil)
         return { llm_output = out or err, is_error = err ~= nil }
     end,
 })
@@ -177,13 +178,6 @@ fn python_read_preserves_long_lines_and_requested_range(offset: usize, limit: us
     )
     .unwrap();
     assert!(!model_output.contains(expected_last));
-    let native = smol::block_on(interpreter_bridge::dispatch(
-        &ctx,
-        "read",
-        &json!({ "path": path, "offset": offset, "limit": limit }),
-    ))
-    .unwrap();
-    assert!(native.contains(expected_last));
 }
 
 #[test]
@@ -210,10 +204,10 @@ fn python_grep_preserves_match_and_context_text() {
 }
 
 #[test]
-fn python_glob_preserves_results_within_query_limit() {
-    let (_registry, _host, ctx) = setup();
+fn python_glob_preserves_all_results_beyond_compact_limit() {
+    let (_registry, _host, mut ctx) = setup();
     let dir = tempfile::tempdir().unwrap();
-    let count = MODEL_LINES * 3;
+    let count = COMPACT_GLOB_LIMIT + MODEL_LINES * 3;
     for i in 0..count {
         fs::write(dir.path().join(format!("record-{i}.txt")), "").unwrap();
     }
@@ -231,6 +225,15 @@ fn python_glob_preserves_results_within_query_limit() {
         .unwrap()
         .contains("[truncated")
     );
+    ctx.config.max_output_lines = count;
+    ctx.config.max_output_bytes = count * MODEL_BYTES;
+    let compact = run(
+        &ctx,
+        "glob",
+        json!({ "pattern": "*.txt", "path": dir.path() }),
+    )
+    .unwrap();
+    assert_eq!(compact.lines().count(), COMPACT_GLOB_LIMIT);
 }
 
 #[test]
@@ -265,7 +268,7 @@ fn python_bash_respects_tail_and_keeps_complete_error_output() {
 }
 
 #[test]
-fn nested_calls_inherit_mode_without_changing_siblings_or_model_calls() {
+fn lua_calls_default_to_full_with_isolated_compact_overrides() {
     let (_registry, host, ctx) = setup();
     host.load_source("relay", RELAY).unwrap();
     let dir = tempfile::tempdir().unwrap();
@@ -276,17 +279,31 @@ fn nested_calls_inherit_mode_without_changing_siblings_or_model_calls() {
         .collect::<Vec<_>>()
         .join("\n");
     fs::write(&path, &content).unwrap();
+    let full = run(&ctx, "relay_read", json!({ "path": path })).unwrap();
+    assert_eq!(
+        full.lines()
+            .filter(|line| line.contains(": record-"))
+            .count(),
+        count
+    );
     let code = format!(
-        "a, b = await gather(relay_read(path={0:?}), relay_read(path={0:?}, mode='model'))\nprint(len([line for line in a.splitlines() if ': record-' in line]), len([line for line in b.splitlines() if ': record-' in line]))",
+        "a, b = await gather(relay_read(path={0:?}), relay_read(path={0:?}, mode='compact'))\nprint(len([line for line in a.splitlines() if ': record-' in line]), len([line for line in b.splitlines() if ': record-' in line]))",
         path.to_str().unwrap()
     );
     assert_eq!(
         python(&ctx, &code).unwrap().trim(),
         format!("{count} {MODEL_LINES}")
     );
-    let model = run(&ctx, "relay_read", json!({ "path": path })).unwrap();
-    assert!(model.contains("Truncated lines"));
-    assert!(!model.contains(&format!("record-{}", count - 1)));
+    let batch = run(
+        &ctx,
+        "batch",
+        json!({ "tool_calls": [{ "tool": "read", "parameters": {
+            "path": path, "offset": 1, "limit": 0
+        }}] }),
+    )
+    .unwrap();
+    assert!(batch.contains("Truncated lines"));
+    assert!(!batch.contains(&format!("record-{}", count - 1)));
     let error = python(
         &ctx,
         &format!(
@@ -295,7 +312,7 @@ fn nested_calls_inherit_mode_without_changing_siblings_or_model_calls() {
         ),
     )
     .unwrap_err();
-    assert!(error.contains("output_mode must be 'model' or 'programmatic'"));
+    assert!(error.contains("output_mode must be 'full' or 'compact'"));
 }
 
 #[test]
@@ -308,7 +325,7 @@ fn programmatic_output_passes_through_output_hooks_once() {
 local calls = 0
 maki.api.set_slot("tool.read.output", function(_, output, ctx)
     calls = calls + 1
-    output.text = ctx.output_mode == "programmatic" and output.text:find("{LAST_ITEM}", 1, true)
+    output.text = ctx.output_mode == "full" and output.text:find("{LAST_ITEM}", 1, true)
         and "redacted:" .. calls or "incomplete"
     return output
 end)

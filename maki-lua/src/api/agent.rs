@@ -45,7 +45,7 @@ use crate::runtime::CANCELLED_MSG;
 const SESSION_CLOSED_ERR: &str = "session closed";
 const PROMPT_DROPPED_ERR: &str = "an `agent.user_message` layer dropped the prompt";
 const DEFAULT_SESSION_AUDIENCE: ToolAudience = ToolAudience::GENERAL_SUB;
-const OUTPUT_MODE_ERR: &str = "output_mode must be 'model' or 'programmatic'";
+const OUTPUT_MODE_ERR: &str = "output_mode must be 'full' or 'compact'";
 
 fn resolve_model_from_ctx(ctx: &AgentContext, tier: Option<&str>) -> Result<Model, String> {
     let Some(tier_str) = tier else {
@@ -341,9 +341,10 @@ async fn callable_tools(lua: Lua, ctx: mlua::UserDataRef<LuaCtx>) -> LuaResult<P
 /// @param input table|any Tool input (JSON-serializable). Must match the tool's `input_schema`.
 /// @param opts table? Optional fields:
 ///   `timeout` (integer?) - deadline in seconds.
-///   `output_mode` (string?) - "model" or "programmatic". Defaults to the
-///     caller's mode. Programmatic calls receive complete text before model
-///     presentation limits, with the same permissions and hooks.
+///   `output_mode` (string?) - "full" (default) returns complete text.
+///     "compact" applies model output limits and automatic RTK rewriting.
+///     Hooks receive the mode in both cases so presentation filters can skip
+///     full results. Permissions and redaction still apply in both modes.
 ///   `on_live_buf` (function?) - called with a `BufHandle` for each live buffer
 ///     the tool publishes. Must not yield.
 ///   `on_annotation` (function?) - called with an annotation string for each
@@ -371,6 +372,7 @@ async fn call_tool(
     let input_json = lua_to_json(&lua, &input)?;
     let agent = try_pair!(dispatch_ctx(&ctx, "call_tool"));
     let mut tctx = agent.to_tool_context();
+    tctx.output_mode = ToolOutputMode::Full;
     let (mut on_buf, mut on_ann, mut on_usage, mut rx) = (None, None, None, None);
     if let Some(o) = opts {
         if let Some(mode) = o.get::<Option<String>>("output_mode")? {

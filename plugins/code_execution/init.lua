@@ -128,7 +128,7 @@ local description = [[Execute Python in a sandbox where every tool is an async f
 Use for chained/dependent tool calls and filtering/processing results, e.g. filtering web tool output. **DRAMATICALLY** cheaper than sequential tool calls!
 
 - All tools are async and return strings: `result = await read(path='file.txt', offset=1, limit=0)`. Parse output yourself.
-- Tool results have no model presentation cap inside Python. Printed/returned output remains capped.
+- Tool results are complete. Only what you print/return is capped.
 - Concurrency: `a, b = await gather(read(path='a.py', offset=1, limit=0), grep(pattern='x'))`. Pass calls directly, never wrapped in `async def`.
 - Available libs: re, asyncio, sys, os, json. No other imports, no classes, no network access. `open()` works on text files.
 - Fresh sandbox each run: no state persists between executions.
@@ -360,13 +360,13 @@ local function handler(input, ctx)
       schemas[bind] = t.schema or {}
       tools[bind] = function(tool_input)
         if t.workflow_only then
-          return maki.agent.call_tool(ctx, name, tool_input, { output_mode = "programmatic" })
+          return maki.agent.call_tool(ctx, name, tool_input)
         end
         -- The script clock stops while a tool call is awaited, so an explicit
         -- longer timeout on the call has to win over the script budget.
         local explicit = type(tool_input) == "table" and tonumber(tool_input.timeout) or nil
         local deadline = math.max(timeout, explicit or 0)
-        return maki.agent.call_tool(ctx, name, tool_input, { timeout = deadline, output_mode = "programmatic" })
+        return maki.agent.call_tool(ctx, name, tool_input, { timeout = deadline })
       end
     end
   end
