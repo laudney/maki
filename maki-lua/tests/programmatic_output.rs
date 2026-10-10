@@ -61,6 +61,16 @@ maki.api.register_tool({
         return { llm_output = out or err, is_error = err ~= nil }
     end,
 })
+maki.api.register_tool({
+    name = "relay_batch",
+    description = "nested batch fixture",
+    schema = { type = "object", properties = { path = { type = "string" } } },
+    handler = function(input, ctx)
+        return maki.agent.call_tool(ctx, "batch", { tool_calls = {
+            { tool = "read", parameters = { path = input.path, offset = 1, limit = 0 } },
+        } })
+    end,
+})
 "#;
 
 fn setup() -> (Arc<ToolRegistry>, PluginHost, ToolContext) {
@@ -304,6 +314,14 @@ fn lua_calls_default_to_full_with_isolated_compact_overrides() {
     .unwrap();
     assert!(batch.contains("Truncated lines"));
     assert!(!batch.contains(&format!("record-{}", count - 1)));
+    let full_batch = run(&ctx, "relay_batch", json!({ "path": path })).unwrap();
+    assert_eq!(
+        full_batch
+            .lines()
+            .filter(|line| line.contains(": record-"))
+            .count(),
+        count
+    );
     let error = python(
         &ctx,
         &format!(

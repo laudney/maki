@@ -10,7 +10,7 @@ local DESCRIPTION = [[Read a file. Returns contents with line numbers (1-indexed
 
 - Supports absolute, relative, and ~/ paths.
 - **offset** and **limit** are required. Use offset=1 to read from the first line.
-- Use limit=0 to read until the end of file (capped at 2000 lines in compact mode).
+- Use limit=0 to read until the end of file (capped at 2000 lines).
 - Use the **index** tool or **grep** tool first to find the offset and limit.
 - Only read the sections you actually need.
 - Use `wc -l` to check total number of lines before reading to decide a reasonable limit.
@@ -171,7 +171,7 @@ maki.api.register_tool({
       },
       limit = {
         type = "integer",
-        description = "Max number of lines to read. Use 0 to read until end of file (capped at 2000 lines in compact mode).",
+        description = "Max number of lines to read. Use 0 to read until end of file (capped at 2000 lines).",
         required = true,
       },
     },
