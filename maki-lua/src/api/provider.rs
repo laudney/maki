@@ -423,9 +423,10 @@ fn hook_ctx(lua: &Lua, keys: &LuaHookKeys, terminal: bool) -> LuaResult<Table> {
     if terminal {
         add_stdio(lua, &ctx)?;
     }
-    let auth = plugin::hook_auth(&keys.slug, &keys.plugin);
-    let base_url = auth.as_ref().and_then(|auth| auth.base_url.clone());
-    let headers = auth.map(|auth| auth.headers).unwrap_or_default();
+    let base_url = plugin::effective_base_url(&keys.slug);
+    let headers = plugin::resolved_auth(&keys.slug)
+        .map(|auth| auth.headers)
+        .unwrap_or_default();
     ctx.set(SLUG, keys.slug.as_str())?;
     ctx.set(BASE_URL, base_url.as_deref())?;
     ctx.set(HEADERS, lua.create_table_from(headers.clone())?)?;
@@ -593,15 +594,7 @@ fn read_masked() -> Pair<String> {
     (Some(String::from_utf8_lossy(&answer).into_owned()), None)
 }
 
-fn owned(slugs: &OwnedSlugs, plugin: &str, slug: &str) -> LuaResult<()> {
-    let config = ProvidersConfig::load_or_default();
-    if let Some(selected) = config.get(slug).and_then(|def| def.plugin.as_deref())
-        && selected != plugin
-    {
-        return Err(mlua::Error::runtime(format!(
-            "maki.provider.auth: provider '{slug}' selects plugin '{selected}'"
-        )));
-    }
+fn owned(slugs: &OwnedSlugs, slug: &str) -> LuaResult<()> {
     if slugs
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -928,13 +921,8 @@ fn http_error(_lua: &Lua, res: Table) -> LuaResult<ProviderError> {
 /// local creds = maki.provider.auth.get("acme")
 /// if creds then print(creds.access_token) end
 #[lua_fn]
-fn get(
-    lua: &Lua,
-    #[ctx] slugs: OwnedSlugs,
-    #[ctx] plugin: Arc<str>,
-    slug: String,
-) -> LuaResult<Pair<Table>> {
-    owned(&slugs, &plugin, &slug)?;
+fn get(lua: &Lua, #[ctx] slugs: OwnedSlugs, slug: String) -> LuaResult<Pair<Table>> {
+    owned(&slugs, &slug)?;
     let dir = try_pair!(StateDir::resolve());
     let Some(data) = load_plugin_auth(&dir, &slug) else {
         return Ok((None, None));
@@ -979,11 +967,10 @@ async fn write_credentials(
 async fn set(
     lua: Lua,
     #[ctx] slugs: OwnedSlugs,
-    #[ctx] plugin: Arc<str>,
     slug: String,
     credentials: Table,
 ) -> LuaResult<Pair<bool>> {
-    owned(&slugs, &plugin, &slug)?;
+    owned(&slugs, &slug)?;
     let Value::Object(data) = lua_to_json(&lua, &LuaValue::Table(credentials))? else {
         return Err(mlua::Error::runtime(
             "maki.provider.auth.set: credentials must be a table with string keys",
@@ -1005,13 +992,8 @@ async fn set(
 /// @example
 /// maki.provider.auth.clear("acme")
 #[lua_fn]
-async fn clear(
-    _lua: Lua,
-    #[ctx] slugs: OwnedSlugs,
-    #[ctx] plugin: Arc<str>,
-    slug: String,
-) -> LuaResult<Pair<bool>> {
-    owned(&slugs, &plugin, &slug)?;
+async fn clear(_lua: Lua, #[ctx] slugs: OwnedSlugs, slug: String) -> LuaResult<Pair<bool>> {
+    owned(&slugs, &slug)?;
     try_pair!(
         write_credentials(slug, |dir, slug| {
             delete_plugin_auth(dir, slug)
@@ -1036,10 +1018,10 @@ lua_table! {
     /// local creds = maki.provider.auth.get("acme")
     /// maki.provider.auth.clear("acme")
     /// ```
-    "maki.provider.auth" => pub(crate) fn create_auth_table(slugs: OwnedSlugs, plugin: Arc<str>), AUTH_DOCS [
-        get(slugs, plugin),
-        set(slugs, plugin),
-        clear(slugs, plugin),
+    "maki.provider.auth" => pub(crate) fn create_auth_table(slugs: OwnedSlugs), AUTH_DOCS [
+        get(slugs),
+        set(slugs),
+        clear(slugs),
     ]
 }
 
@@ -1081,24 +1063,15 @@ pub(crate) fn create_provider_namespace(
 ) -> LuaResult<Table> {
     let owned = egress.owned();
     let reads_env = permissions.is_allowed(Permission::Env);
-    let provider = create_provider_table(
-        lua,
-        permissions,
-        plugin.clone(),
-        egress,
-        authority,
-        reads_env,
-    )?;
-    provider.set("auth", create_auth_table(lua, owned, plugin)?)?;
+    let provider = create_provider_table(lua, permissions, plugin, egress, authority, reads_env)?;
+    provider.set("auth", create_auth_table(lua, owned)?)?;
     Ok(provider)
 }
 
 #[cfg(test)]
 mod tests {
-    use maki_config::providers::{Protocol, ProviderDef};
     use maki_providers::ProviderUsage;
     use serde_json::json;
-    use tempfile::TempDir;
     use test_case::test_case;
 
     use mlua::AnyUserData;
@@ -1195,83 +1168,6 @@ mod tests {
         assert!(ctx.get::<Function>(GET_JSON).is_ok());
         for name in ["print", "prompt", "open_url"] {
             assert_eq!(ctx.get::<Function>(name).is_ok(), terminal, "ctx.{name}");
-        }
-    }
-
-    #[test]
-    fn a_retained_hook_cannot_read_another_owners_credentials() {
-        const NEXT_OWNER: &str = "next-owner";
-        const KEY_ENV: &str = "MAKI_TEST_HOOK_OWNER_KEY";
-        const TOKEN: &str = "sk-next-owner";
-        const BEARER: &str = "Bearer sk-next-owner";
-        const HOST: &str = "api.acme.example";
-        const ORIGIN: &str = "https://api.acme.example/v1";
-        const AUTHORIZATION: &str = "authorization";
-        let home = TempDir::new().unwrap();
-        for var in [
-            "HOME",
-            "XDG_CONFIG_HOME",
-            "XDG_STATE_HOME",
-            "XDG_CACHE_HOME",
-        ] {
-            unsafe { std::env::set_var(var, home.path()) };
-        }
-        unsafe { std::env::remove_var(KEY_ENV) };
-        let mut config = ProvidersConfig::default();
-        config.providers.insert(
-            SLUG_NAME.into(),
-            ProviderDef {
-                plugin: Some(NEXT_OWNER.into()),
-                api_key: Some(TOKEN.into()),
-                ..ProviderDef::default()
-            },
-        );
-        config.save().unwrap();
-        plugin::begin_load();
-        plugin::register_plugin(
-            Arc::from(NEXT_OWNER),
-            Registration {
-                decl: ProviderDecl {
-                    slug: SLUG_NAME.into(),
-                    display_name: SLUG_NAME.into(),
-                    codec: Some(Protocol::Openai),
-                    base_url: Some(ORIGIN.into()),
-                    api_key_env: Some(KEY_ENV.into()),
-                    net_hosts: vec![HOST.into()],
-                    ..ProviderDecl::default()
-                },
-                hooks: ProviderHooks::default(),
-            },
-            DeclAuthority::ThirdParty,
-        )
-        .unwrap();
-        plugin::commit_load();
-
-        let lua = Lua::new();
-        let mut keys = keys_from(&lua, []);
-        let stale = hook_ctx(&lua, &keys, false).unwrap();
-        assert!(stale.get::<Option<String>>(BASE_URL).unwrap().is_none());
-        assert!(stale.get::<Table>(HEADERS).unwrap().is_empty());
-        keys.plugin = Arc::from(NEXT_OWNER);
-        let current = hook_ctx(&lua, &keys, false).unwrap();
-        assert_eq!(current.get::<String>(BASE_URL).unwrap(), ORIGIN);
-        assert_eq!(
-            current
-                .get::<Table>(HEADERS)
-                .unwrap()
-                .get::<String>(AUTHORIZATION)
-                .unwrap(),
-            BEARER
-        );
-        lua.globals()
-            .set("auth", auth_table(&lua, &[SLUG_NAME]))
-            .unwrap();
-        for call in ["get", "set", "clear"] {
-            let error = lua
-                .load(format!(r#"auth.{call}({SLUG_NAME:?}, {{}})"#))
-                .exec()
-                .unwrap_err();
-            assert!(error.to_string().contains(NEXT_OWNER), "{error}");
         }
     }
 
@@ -1461,7 +1357,7 @@ mod tests {
         for slug in owns {
             egress.owns((*slug).to_owned());
         }
-        create_auth_table(lua, egress.owned(), Arc::from(PLUGIN)).unwrap()
+        create_auth_table(lua, egress.owned()).unwrap()
     }
 
     /// The scoping this namespace exists to enforce: the plugin's own slugs are

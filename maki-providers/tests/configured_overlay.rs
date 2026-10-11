@@ -8,12 +8,12 @@ use std::fs;
 use std::sync::Arc;
 
 use maki_config::providers::{Protocol, ProvidersConfig};
-use maki_providers::Timeouts;
 use maki_providers::plugin::{
     self, DeclAuthority, PlanDecl, ProviderDecl, RegisterError, Registration,
 };
 use maki_providers::provider::provider_for_slug;
 use maki_providers::spec::Owner;
+use maki_providers::{Timeouts, catalog_provider_if_available, warm_catalog};
 use maki_storage::StateDir;
 use maki_storage::auth::{ProviderCredentials, save_provider_credentials};
 use serde_json::json;
@@ -262,12 +262,12 @@ fn a_selected_catalog_name_refuses_other_owners(owner: Option<&str>) {
 }
 
 #[test]
-fn selected_catalog_owner_reuses_saved_key_and_tracks_selection_changes() {
+fn selection_changes_take_effect_only_after_reload() {
     let _home = selected_catalog();
     plugin::begin_load();
     register_selected();
     plugin::commit_load();
-    let provider = provider_for_slug(CATALOG_SLUG, Timeouts::default()).unwrap();
+    provider_for_slug(CATALOG_SLUG, Timeouts::default()).unwrap();
     assert!(matches!(Owner::of(CATALOG_SLUG), Owner::Plugin));
     assert_eq!(
         plugin::resolved_auth(CATALOG_SLUG).unwrap().headers,
@@ -275,14 +275,23 @@ fn selected_catalog_owner_reuses_saved_key_and_tracks_selection_changes() {
     );
 
     select_owner(Some(OTHER_OWNER));
-    assert!(plugin::spec(CATALOG_SLUG).is_none());
-    assert!(plugin::resolved_auth(CATALOG_SLUG).is_none());
-    assert!(provider_for_slug(CATALOG_SLUG, Timeouts::default()).is_err());
-    let error = smol::block_on(provider.list_models()).unwrap_err();
+    assert!(plugin::spec(CATALOG_SLUG).is_some());
+    assert!(plugin::resolved_auth(CATALOG_SLUG).is_some());
+    provider_for_slug(CATALOG_SLUG, Timeouts::default()).unwrap();
+    plugin::begin_load();
+    assert!(plugin::is_registered(CATALOG_SLUG));
+    plugin::commit_load();
+    assert!(!plugin::is_registered(CATALOG_SLUG));
+    let error = provider_for_slug(CATALOG_SLUG, Timeouts::default())
+        .err()
+        .unwrap();
     assert!(error.to_string().contains(OTHER_OWNER), "{error}");
 
     select_owner(None);
-    assert!(!plugin::is_registered(CATALOG_SLUG));
+    assert!(matches!(Owner::of(CATALOG_SLUG), Owner::Plugin));
+    assert!(provider_for_slug(CATALOG_SLUG, Timeouts::default()).is_err());
+    plugin::begin_load();
+    plugin::commit_load();
     assert!(!matches!(Owner::of(CATALOG_SLUG), Owner::Plugin));
     let fallback = provider_for_slug(CATALOG_SLUG, Timeouts::default()).unwrap();
     let models = smol::block_on(fallback.list_models()).unwrap();
@@ -295,9 +304,17 @@ fn selected_catalog_owner_reuses_saved_key_and_tracks_selection_changes() {
     );
 }
 
-#[test]
-fn a_missing_selected_owner_cannot_fall_back_to_catalog_requests() {
+#[test_case(false ; "missing")]
+#[test_case(true ; "failed_load")]
+fn an_unavailable_selected_owner_cannot_fall_back_to_catalog_requests(failed: bool) {
     let _home = selected_catalog();
+    plugin::begin_load();
+    if failed {
+        register_selected();
+        plugin::discard(SELECTED_OWNER);
+    }
+    plugin::commit_load();
+    assert!(!plugin::is_registered(CATALOG_SLUG));
     assert!(matches!(Owner::of(CATALOG_SLUG), Owner::Plugin));
     let error = provider_for_slug(CATALOG_SLUG, Timeouts::default())
         .err()
@@ -306,13 +323,26 @@ fn a_missing_selected_owner_cannot_fall_back_to_catalog_requests() {
 }
 
 #[test]
-fn an_owner_changed_before_commit_cannot_resolve_saved_keys() {
+fn an_owner_changed_during_load_takes_effect_on_the_next_load() {
     let _home = selected_catalog();
     plugin::begin_load();
-    register_selected();
     select_owner(Some(OTHER_OWNER));
+    register_selected();
     plugin::commit_load();
-    assert!(plugin::resolved_auth(CATALOG_SLUG).is_none());
+    assert!(plugin::resolved_auth(CATALOG_SLUG).is_some());
+    provider_for_slug(CATALOG_SLUG, Timeouts::default()).unwrap();
+    plugin::begin_load();
+    let error = plugin::register_plugin(
+        Arc::from(SELECTED_OWNER),
+        declaration(CATALOG_SLUG, DECLARED_DISPLAY_NAME, DECLARED_HOST),
+        DeclAuthority::ThirdParty,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(error, RegisterError::SelectedOwner { .. }),
+        "{error}"
+    );
+    plugin::commit_load();
     assert!(provider_for_slug(CATALOG_SLUG, Timeouts::default()).is_err());
 }
 
@@ -329,4 +359,33 @@ fn selecting_a_package_does_not_release_a_shipped_name(slug: &str) {
     .unwrap_err();
     plugin::commit_load();
     assert!(matches!(error, RegisterError::ReservedSlug(_)), "{error}");
+}
+
+#[test]
+fn warming_a_new_catalog_does_not_revoke_a_loaded_provider() {
+    let _home = selected_catalog();
+    select_owner(None);
+    let cache = maki_storage::paths::cache_dir().unwrap().join(CATALOG_FILE);
+    let catalog_json = fs::read_to_string(&cache).unwrap();
+    fs::write(&cache, "{}").unwrap();
+    plugin::begin_load();
+    register_selected();
+    plugin::commit_load();
+    fs::write(&cache, catalog_json).unwrap();
+    warm_catalog();
+    assert!(catalog_provider_if_available(CATALOG_SLUG).is_some());
+    provider_for_slug(CATALOG_SLUG, Timeouts::default()).unwrap();
+    assert!(plugin::spec(CATALOG_SLUG).is_some());
+    assert!(plugin::resolved_auth(CATALOG_SLUG).is_some());
+
+    plugin::begin_load();
+    let error = plugin::register_plugin(
+        Arc::from(SELECTED_OWNER),
+        declaration(CATALOG_SLUG, DECLARED_DISPLAY_NAME, DECLARED_HOST),
+        DeclAuthority::ThirdParty,
+    )
+    .unwrap_err();
+    assert!(matches!(error, RegisterError::ReservedSlug(_)), "{error}");
+    plugin::commit_load();
+    assert!(!plugin::is_registered(CATALOG_SLUG));
 }

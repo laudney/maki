@@ -427,16 +427,35 @@ struct PluginEntry {
     owner: Option<Arc<str>>,
     target: Target,
     hooks: ProviderHooks,
-    /// Shared with every entry this owner registered for this slug: an entry
-    /// is replaced on reload, its credentials are not. Held here rather than
+    /// Shared across reloads of the same owner for this slug. A different
+    /// owner starts with a new cell. Held here rather than
     /// looked up beside the entry, so "registered" and "has credentials"
     /// cannot come apart at a call site.
     auth: Arc<AuthState>,
 }
 
-/// Ordered by slug, so every listing comes out the same each run.
-type Registry = BTreeMap<Box<str>, Arc<PluginEntry>>;
-type AuthIdentity = (Box<str>, Option<Arc<str>>);
+#[derive(Default)]
+struct Registry {
+    entries: BTreeMap<Box<str>, Arc<PluginEntry>>,
+    selected: BTreeMap<Box<str>, String>,
+}
+
+impl Registry {
+    fn for_load() -> Self {
+        let selected = ProvidersConfig::load_or_default()
+            .providers
+            .into_iter()
+            .filter(|(slug, _)| !ProviderRegistry::is_shipped(slug))
+            .filter_map(|(slug, def)| def.plugin.map(|owner| (slug.into(), owner)))
+            .collect();
+        Registry {
+            selected,
+            ..Registry::default()
+        }
+    }
+}
+
+type AuthCell = (Option<Arc<str>>, Arc<AuthState>);
 
 /// What every read answers. Only ever replaced whole, by [`commit_load`], so
 /// there is no moment at which a reader can see a half-built registry: during
@@ -446,10 +465,9 @@ static PROVIDERS: LazyLock<RwLock<Arc<Registry>>> = LazyLock::new(RwLock::defaul
 /// and open at process start so a host that loads plugins without driving the
 /// phases (tests, embedders) still registers.
 static STAGING: LazyLock<Mutex<Option<Registry>>> =
-    LazyLock::new(|| Mutex::new(Some(Registry::new())));
-/// Append-only for the life of the process: see [`shared_auth`].
-static AUTH: LazyLock<RwLock<HashMap<AuthIdentity, Arc<AuthState>>>> =
-    LazyLock::new(RwLock::default);
+    LazyLock::new(|| Mutex::new(Some(Registry::for_load())));
+/// The current owner and auth state of each slug: see [`shared_auth`].
+static AUTH: LazyLock<RwLock<HashMap<Box<str>, AuthCell>>> = LazyLock::new(RwLock::default);
 
 /// Opens the registration window, at the top of every plugin load.
 ///
@@ -458,7 +476,7 @@ static AUTH: LazyLock<RwLock<HashMap<AuthIdentity, Arc<AuthState>>>> =
 /// long as the load takes, so [`commit_load`] swaps the whole map in one step
 /// instead.
 pub fn begin_load() {
-    *STAGING.lock().unwrap() = Some(Registry::new());
+    *STAGING.lock().unwrap() = Some(Registry::for_load());
 }
 
 /// Publishes what this load registered. A load that registered nothing
@@ -471,12 +489,8 @@ pub fn commit_load() {
     let Some(staged) = STAGING.lock().unwrap().take() else {
         return;
     };
-    for entry in staged.values() {
+    for entry in staged.entries.values() {
         let slug = &entry.decl.slug;
-        if !entry.eligible() {
-            warn!(slug, "provider owner changed before registration committed");
-            continue;
-        }
         let api_key_env = entry.decl.api_key_env.clone().filter(|var| !var.is_empty());
         if let Err(error) = entry.auth.redeclare(
             slug,
@@ -488,8 +502,8 @@ pub fn commit_load() {
         }
     }
     let logins = staged
+        .entries
         .values()
-        .filter(|entry| entry.eligible())
         .filter_map(|entry| entry.built.login)
         .collect();
     maki_config::providers::set_registered_providers(logins);
@@ -505,12 +519,13 @@ pub fn discard(plugin: &str) {
         return;
     };
     let dropped: Vec<Box<str>> = staged
+        .entries
         .iter()
         .filter(|(_, entry)| entry.owner.as_deref() == Some(plugin))
         .map(|(slug, _)| slug.clone())
         .collect();
     for slug in &dropped {
-        staged.remove(slug);
+        staged.entries.remove(slug);
     }
     if !dropped.is_empty() {
         debug!(plugin, slugs = ?dropped, "discarded the declarations of a failed plugin load");
@@ -576,7 +591,7 @@ fn register_owned(
     let Some(staged) = staging.as_mut() else {
         return Err(RegisterError::Closed(slug));
     };
-    let Entry::Vacant(vacant) = staged.entry(slug.as_str().into()) else {
+    let Entry::Vacant(vacant) = staged.entries.entry(slug.as_str().into()) else {
         return Err(RegisterError::DuplicateSlug(slug));
     };
     debug!(
@@ -617,11 +632,16 @@ fn check_owner(
     if authority == DeclAuthority::ThirdParty {
         let config = ProvidersConfig::load_or_default();
         let def = config.get(slug);
-        if let Some(selected) = def.and_then(|def| def.plugin.as_deref()) {
-            if owner != Some(selected) {
+        let selected = STAGING
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|registry| registry.selected.get(slug).cloned());
+        if let Some(selected) = selected {
+            if owner != Some(selected.as_str()) {
                 return Err(RegisterError::SelectedOwner {
                     slug: slug.into(),
-                    owner: selected.into(),
+                    owner: selected,
                 });
             }
         } else if catalog::serves_slug(slug) {
@@ -673,18 +693,18 @@ fn target_of(decl: &ProviderDecl, hooks: &ProviderHooks) -> Result<Target, Regis
     Ok(target)
 }
 
-/// One cell of credentials per slug and owner, for the life of the process.
-/// Reusing it carries a token across a reload, and stops a reload from
-/// minting a second [`RefreshGate`] for a slug whose token is in flight.
+/// Reloading the same owner keeps its token and single-flight gate. Changing
+/// owner replaces the cell, while an in-flight request keeps its old state.
 fn shared_auth(slug: &str, owner: Option<Arc<str>>) -> Arc<AuthState> {
-    let identity = (slug.into(), owner);
     let mut states = AUTH.write().unwrap();
-    if let Some(state) = states.get(&identity) {
-        return Arc::clone(state);
+    let (current_owner, state) = states
+        .entry(slug.into())
+        .or_insert_with(|| (owner.clone(), Arc::new(AuthState::new())));
+    if *current_owner != owner {
+        *current_owner = owner;
+        *state = Arc::new(AuthState::new());
     }
-    let state = Arc::new(AuthState::new());
-    states.insert(identity, Arc::clone(&state));
-    state
+    Arc::clone(state)
 }
 
 fn entries() -> Arc<Registry> {
@@ -692,16 +712,12 @@ fn entries() -> Arc<Registry> {
 }
 
 fn entry(slug: &str) -> Option<Arc<PluginEntry>> {
-    entries()
-        .get(slug)
-        .filter(|entry| entry.eligible())
-        .cloned()
+    entries().entries.get(slug).cloned()
 }
 
 fn unknown(slug: &str) -> AgentError {
-    let config = ProvidersConfig::load_or_default();
     AgentError::Config {
-        message: match config.get(slug).and_then(|def| def.plugin.as_deref()) {
+        message: match entries().selected.get(slug) {
             Some(owner) => format!("selected plugin '{owner}' for provider '{slug}' is not loaded"),
             None => format!("unknown plugin provider '{slug}'"),
         },
@@ -930,18 +946,9 @@ impl AuthState {
 }
 
 impl PluginEntry {
-    fn eligible(&self) -> bool {
-        check_owner(&self.decl.slug, self.authority, self.owner.as_deref()).is_ok()
-    }
-
     /// Resolve once, lazily, from async code. Every fallible provider method
     /// starts here, so no synchronous path ever has to reach a hook.
     async fn ensure_auth(&self) -> Result<(), AgentError> {
-        check_owner(&self.decl.slug, self.authority, self.owner.as_deref()).map_err(|error| {
-            AgentError::Config {
-                message: error.to_string(),
-            }
-        })?;
         if self.auth.gate.ran() {
             return Ok(());
         }
@@ -1311,19 +1318,6 @@ pub fn resolved_auth(slug: &str) -> Option<ResolvedAuth> {
     Some(entry(slug)?.auth.current.lock().unwrap().clone())
 }
 
-/// A retained hook must not read a new owner's credentials from this slug.
-pub fn hook_auth(slug: &str, owner: &str) -> Option<ResolvedAuth> {
-    let entry = entry(slug)?;
-    if entry.owner.as_deref() != Some(owner) {
-        return None;
-    }
-    let mut auth = entry.auth.current.lock().unwrap().clone();
-    if auth.base_url.is_none() {
-        auth.base_url = resolve_base_url(&entry).map(|(base_url, _)| base_url);
-    }
-    Some(auth)
-}
-
 /// The origin a request to `slug` would reach right now, resolved the way a
 /// codec resolves it per request: an auth-supplied origin, then the user's
 /// `<SLUG>_BASE_URL` or `providers.toml`, then the declared default.
@@ -1431,8 +1425,8 @@ pub fn build_with_auth(
 
 pub fn specs() -> Vec<&'static ProviderSpec> {
     entries()
+        .entries
         .values()
-        .filter(|entry| entry.eligible())
         .map(|entry| entry.built.spec)
         .collect()
 }
@@ -1440,10 +1434,18 @@ pub fn specs() -> Vec<&'static ProviderSpec> {
 /// The providers whose `maki auth login` runs a `login` hook.
 pub fn auth_providers() -> Vec<(String, String)> {
     entries()
+        .entries
         .values()
-        .filter(|entry| entry.eligible() && entry.hooks.login.is_some())
+        .filter(|entry| entry.hooks.login.is_some())
         .map(|entry| (entry.decl.slug.clone(), entry.decl.display_name.clone()))
         .collect()
+}
+
+/// Includes selected packages that failed to register, so they cannot fall
+/// back to a catalog client until a reload removes the selection.
+pub fn owns_slug(slug: &str) -> bool {
+    let registry = entries();
+    registry.entries.contains_key(slug) || registry.selected.contains_key(slug)
 }
 
 pub fn is_registered(slug: &str) -> bool {
@@ -1482,7 +1484,7 @@ mod tests {
 
     use futures_lite::future::zip;
     use maki_config::PROVIDER_BUILTINS;
-    use maki_config::providers::base_url_env_var;
+    use maki_config::providers::{ProviderDef, base_url_env_var};
     use tempfile::TempDir;
     use test_case::test_case;
 
@@ -1800,6 +1802,7 @@ mod tests {
             Canned::json(200, r#"{"data":[]}"#),
             Canned::json(200, r#"{"data":[]}"#),
             Canned::json(200, r#"{"data":[]}"#),
+            Canned::json(200, r#"{"data":[]}"#),
         ];
         let home = TempDir::new().unwrap();
         for var in [
@@ -1813,29 +1816,46 @@ mod tests {
         let (base, requests) = serve(MODELS);
         let first = Arc::new(CountingAuth::new(true));
         let next = Arc::new(CountingAuth::new(false));
+        let returned = Arc::new(CountingAuth::new(true));
         for (owner, hook) in [
             (FIRST_OWNER, &first),
             (FIRST_OWNER, &first),
             (NEXT_OWNER, &next),
+            (FIRST_OWNER, &returned),
         ] {
             let mut reg = registration(SLUG);
             reg.decl.base_url = Some(base.clone());
             reg.decl.net_hosts = vec![HOST.into()];
             reg.hooks.auth = Some(hook.clone());
+            let mut config = ProvidersConfig::default();
+            config.upsert(
+                SLUG.into(),
+                ProviderDef {
+                    plugin: Some(owner.into()),
+                    ..ProviderDef::default()
+                },
+            );
+            config.save().unwrap();
             begin_load();
             register_plugin(Arc::from(owner), reg, DeclAuthority::ThirdParty).unwrap();
             commit_load();
             let provider = create(SLUG, Timeouts::default()).unwrap();
+            config.providers.get_mut(SLUG).unwrap().plugin = Some(NEXT_OWNER.into());
+            config.save().unwrap();
             smol::block_on(provider.list_models()).unwrap();
         }
         assert_eq!(first.calls(), 1);
         assert_eq!(next.calls(), 1);
+        assert_eq!(returned.calls(), 1);
         let requests = requests.lock().unwrap();
         let tokens = requests
             .iter()
             .map(|request| request.headers[AUTH_HEADER].as_str())
             .collect::<Vec<_>>();
-        assert_eq!(tokens, [FIRST_TOKEN, FIRST_TOKEN, CONSTANT_TOKEN]);
+        assert_eq!(
+            tokens,
+            [FIRST_TOKEN, FIRST_TOKEN, CONSTANT_TOKEN, FIRST_TOKEN]
+        );
     }
 
     #[test]
@@ -1889,7 +1909,7 @@ mod tests {
 
         assert!(!is_registered(SLUG), "{RELOAD_DROPS_STALE}");
         assert!(
-            AUTH.read().unwrap().contains_key(&(SLUG.into(), None)),
+            AUTH.read().unwrap().contains_key(SLUG),
             "{CREDENTIALS_DROPPED}"
         );
     }
