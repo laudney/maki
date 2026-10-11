@@ -37,6 +37,69 @@ A resumed session keeps its prompt across Maki upgrades, as long as the upgrade 
 
 A request carries at most 100 images. Past that, Maki replaces the oldest 25 with a note at once, so the cache breaks once per 25 images rather than on every one.
 
+## Plugin prompt overrides
+
+Plugins can replace a named prompt section or a complete template with
+[`maki.api.set_prompt`](/docs/lua-api/#maki-api-set_prompt). Maki keeps its
+coding defaults when no plugin replaces them.
+
+```lua
+maki.api.set_prompt({
+    prompt = "system",
+    slot = "conventions",
+    content = "State uncertainty and cite the evidence you used.",
+})
+
+maki.api.set_prompt({
+    prompt = "system",
+    content = "You help analyse information.\n{{tool_usage}}\n{{instructions}}",
+})
+```
+
+The first call replaces the default conventions and keeps other sections. The
+second supplies the whole template. Sections, tool hints, and project
+instructions appear only at explicit markers. No environment or coding
+instructions are appended to a complete replacement.
+
+| Prompt ID | Consumer |
+| --- | --- |
+| `system` | Main agent in the TUI, print, SDK, and ACP |
+| `research`, `general` | Built-in task agents |
+| `plan`, `plan_end` | Plan entry and exit updates |
+| `compaction_system`, `compaction_user` | Conversation summary request |
+| `continuation` | Continuation after automatic compaction |
+| `btw_fallback` | Side question before the session has a request frame |
+
+Sections are `identity`, `tone`, `objectivity`, `tool_usage`, `efficient_tools`,
+`conventions`, `completion`, and `after_instructions`. A section must occur in
+the selected template. A known section absent from an explicit target is
+ignored with a warning. Research and general prompts also have identity and
+tone sections. Omitting `prompt` targets the conversational prompts containing
+that section.
+
+Use `content = ""` to remove default section text or supply an empty template.
+Use [`register_prompt_hint`](/docs/lua-api/#maki-api-register_prompt_hint) to add
+text to a section without replacing its default. Additive hints remain in an
+included section after its default is replaced.
+
+The alphabetically last plugin wins a replacement. Within that plugin, the
+last registration wins. Unloading it restores the previous owner's value or
+the built-in default. Complete templates and section overrides compose after
+all registrations are resolved.
+
+Whole templates and default section replacements take static strings.
+Identity and tone also accept functions. Under the built-in main template,
+changed values arrive through context updates, including fallback values after
+plugin unload. A complete main template starts a new frame when its rendered
+text changes. Changing static replacement policy starts an announced new
+request frame. A stored frame takes precedence over `btw_fallback` for side questions.
+An explicit SDK system-prompt override takes precedence over a plugin's main
+template.
+
+Prompt text does not change tool permissions, plan-mode restrictions, or
+instruction-file discovery. Select tools through plugin configuration and
+keep permission rules in their existing configuration.
+
 ## Instruction files
 
 At session start Maki walks from the project git root down to the working directory (no `.git` root, only the cwd). In each directory it loads **one** project instruction file, first match wins:
