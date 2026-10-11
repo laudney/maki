@@ -589,7 +589,7 @@ until the next compaction.
 **Parameters:**
 
 - `{spec}` (`table`) Hint specification:
-  - `slot` (`string`) Required. Aggregate slot name (e.g. "tool_usage", "general").
+  - `slot` (`string`) Required. Aggregate slot name (e.g. "tool_usage", "conventions").
   - `content` (`string|function`) Required. Static text, or a `function()` that returns a string. Max 1 MiB.
   - `prompt` (`string|string[]`) Optional. Restrict to specific prompt ids (e.g. "system").
 
@@ -645,29 +645,48 @@ local opts = maki.api.register_options({
 maki.api.set_prompt({spec})
 ```
 
-Set a singleton prompt slot. Only one plugin owns each singleton slot at a
-time, so calling this replaces any previous value from your plugin.
+Replace a complete prompt or one named section. Section replacements
+preserve additive hints registered through `register_prompt_hint`.
 
-Use this for slots like "identity" or "tone" where a single coherent value
-makes more sense than combining fragments. For aggregate slots like
-"tool_usage", use `register_prompt_hint` instead.
+Omit `slot` to replace a whole template; this requires one explicit prompt
+ID. A replacement inserts section defaults, hints, and instructions only
+through explicit `{{section}}` and `{{instructions}}` markers. An empty
+string clears a template or section. The alphabetically last plugin wins,
+and its last registration wins within that plugin. Unload removes its values.
 
-Throws if you pass an aggregate slot name. A function `content` behaves
-as in `register_prompt_hint`.
+Prompt IDs: `system`, `research`, `general`, `plan`, `plan_end`,
+`compaction_system`, `compaction_user`, `continuation`, and `btw_fallback`.
+Sections: `identity`, `tone`, `tool_usage`, `efficient_tools`, `conventions`,
+`after_instructions`, `objectivity`, and `completion`.
+
+Identity and tone are available in system, research, and general prompts.
+Specify `prompt = "system"` to limit a replacement to the main agent.
+Identity and tone also accept a function called before every run. Its first
+value goes in the system prompt. Under the built-in main template, later
+changes reach the model as a context update. Under a complete main template,
+changed rendered text starts a new frame. Other replacements require static
+strings.
+A known section missing from the resolved template is ignored, with a warning
+for explicit prompt targets.
 
 **Parameters:**
 
-- `{spec}` (`table`) Spec fields mirror `register_prompt_hint`:
-  - `slot` (`string`) Required. Singleton slot name (e.g. "identity", "tone").
-  - `content` (`string|function`) Required. Static text or a `function()` returning a string. Max 1 MiB.
-  - `prompt` (`string|string[]`) Optional. Restrict to specific prompt ids.
+- `{spec}` (`table`) Prompt replacement:
+  - `slot` (`string`) Optional. Named section, e.g. "identity", "tone", "conventions".
+  - `content` (`string|function`) Required. Replacement text, including empty text. Max 1 MiB. Only identity and tone accept functions.
+  - `prompt` (`string|string[]`) Optional for sections; defaults to conversational prompts containing the section. A whole replacement requires one explicit prompt ID.
 
 **Example:**
 
 ```lua
 maki.api.set_prompt({
-  slot = "tone",
-  content = "Be concise. No filler words.",
+  prompt = "system",
+  slot = "conventions",
+  content = "State uncertainty and cite your evidence.",
+})
+maki.api.set_prompt({
+  prompt = "system",
+  content = "You help analyse information.\n{{tool_usage}}",
 })
 ```
 

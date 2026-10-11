@@ -178,9 +178,17 @@ pub(crate) enum HintContent {
     Callback(RegistryKey),
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PromptTarget {
+    Slot(Slot),
+    Section(Slot),
+    Template,
+}
+
 pub(crate) struct PromptHintRegistration {
-    pub(crate) prompts: Option<Vec<PromptId>>,
-    pub(crate) slot: Slot,
+    pub(crate) prompts: Vec<PromptId>,
+    pub(crate) explicit: bool,
+    pub(crate) target: PromptTarget,
     pub(crate) content: HintContent,
 }
 
@@ -2820,8 +2828,9 @@ impl LuaRuntime {
     async fn collect_prompt_slots(&self) -> ResolvedPrompts {
         struct Pending {
             plugin: Arc<str>,
-            prompts: Option<Vec<PromptId>>,
-            slot: Slot,
+            prompts: Vec<PromptId>,
+            explicit: bool,
+            target: PromptTarget,
             content: PendingContent,
         }
         enum PendingContent {
@@ -2849,7 +2858,8 @@ impl LuaRuntime {
                         Some(Pending {
                             plugin: Arc::clone(plugin),
                             prompts: r.prompts.clone(),
-                            slot: r.slot,
+                            explicit: r.explicit,
+                            target: r.target,
                             content,
                         })
                     })
@@ -2858,33 +2868,49 @@ impl LuaRuntime {
         };
 
         let mut slots = ResolvedPrompts::default();
+        for item in &pending {
+            if item.target == PromptTarget::Template
+                && let PendingContent::Static(content) = &item.content
+            {
+                for &pid in &item.prompts {
+                    slots.set_template(pid, content.clone());
+                }
+            }
+        }
         for item in pending {
+            let slot = match item.target {
+                PromptTarget::Slot(slot) | PromptTarget::Section(slot) => slot,
+                PromptTarget::Template => continue,
+            };
             let content = match item.content {
                 PendingContent::Static(s) => Some(s),
                 PendingContent::Callback(func) => self.run_hint_callback(&item.plugin, func).await,
             };
             let Some(content) = content else { continue };
-            let explicit = item.prompts.is_some();
-            for &pid in item.prompts.as_deref().unwrap_or(PromptId::ALL) {
-                if !pid.has_slot(item.slot) {
-                    if explicit {
+            for pid in item.prompts {
+                if !slots.has_slot(pid, slot) {
+                    if item.explicit {
                         tracing::warn!(
                             plugin = %item.plugin,
-                            slot = ?item.slot,
+                            slot = ?slot,
                             prompt = ?pid,
                             "prompt hint targets a prompt that has no such slot; ignoring"
                         );
                     }
                     continue;
                 }
-                slots.insert(
-                    pid,
-                    item.slot,
-                    SlotEntry {
-                        plugin: Arc::clone(&item.plugin),
-                        content: content.clone(),
-                    },
-                );
+                if matches!(item.target, PromptTarget::Section(_)) {
+                    slots.set_section(pid, slot, content.clone());
+                } else {
+                    slots.insert(
+                        pid,
+                        slot,
+                        SlotEntry {
+                            plugin: Arc::clone(&item.plugin),
+                            content: content.clone(),
+                        },
+                    );
+                }
             }
         }
         slots

@@ -1327,7 +1327,7 @@ mod tests {
     use crate::api::keymap::TAKEN_ERR;
     use crate::api::util::command::{LuaCommandInfo, LuaCommandWriter};
     use crossterm::event::KeyCode;
-    use maki_agent::prompt::{PromptId, ResolvedPrompts, Slot};
+    use maki_agent::prompt::{PromptId, ResolvedPrompts, Slot, assemble};
     use maki_agent::tools::ToolRegistry;
     use std::time::Instant;
     use test_case::test_case;
@@ -1908,9 +1908,8 @@ mod tests {
 
     /// Targeting a prompt that does not have the slot quietly drops the hint.
     #[test]
-    fn register_prompt_hint_rejects_incompatible_slot_prompt() {
-        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
-        let r = host.load_source(
+    fn register_prompt_hint_ignores_missing_slot() {
+        let (_host, slots) = slots_from(
             "drop",
             r#"
             maki.api.register_prompt_hint({
@@ -1920,8 +1919,8 @@ mod tests {
             })
             "#,
         );
-        assert!(r.is_err());
-        assert!(r.unwrap_err().to_string().contains("not available"));
+        assert!(contents(&slots, PromptId::Research, Slot::AfterInstructions).is_empty());
+        assert!(!assemble(PromptId::Research, &slots, "").contains("never lands"));
     }
 
     #[test]
@@ -2160,24 +2159,31 @@ mod tests {
     }
 
     #[test]
-    fn set_prompt_rejects_aggregate_slot() {
-        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
-        let r = host.load_source(
-            "bad",
-            r#"maki.api.set_prompt({ slot = "tool_usage", content = "nope" })"#,
+    fn set_prompt_replaces_aggregate_default_and_preserves_hints() {
+        const REPLACEMENT: &str = "Analyse information without coding guidance.";
+        const HINT: &str = "Use the library catalogue.";
+        let (_host, slots) = slots_from(
+            "sections",
+            r#"
+            maki.api.set_prompt({ slot = "conventions", prompt = "system", content = "Analyse information without coding guidance." })
+            maki.api.register_prompt_hint({ slot = "conventions", prompt = "system", content = "Use the library catalogue." })
+            "#,
         );
-        assert!(r.is_err());
+        let rendered = assemble(PromptId::System, &slots, "");
+        assert!(rendered.contains(&format!("{REPLACEMENT}\n{HINT}")));
+        assert!(!rendered.contains("Never assume a library is available."));
+        assert!(slots.has_replacements());
+        assert!(!slots.policy_key().is_empty());
     }
 
     #[test]
-    fn set_prompt_rejects_incompatible_slot_prompt() {
-        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
-        let r = host.load_source(
-            "bad",
-            r#"maki.api.set_prompt({ slot = "identity", prompt = "plan", content = "x" })"#,
+    fn set_prompt_ignores_known_section_missing_from_template() {
+        let (_host, slots) = slots_from(
+            "absent",
+            r#"maki.api.set_prompt({ slot = "identity", prompt = "plan", content = "never lands" })"#,
         );
-        assert!(r.is_err());
-        assert!(r.unwrap_err().to_string().contains("not available"));
+        assert!(contents(&slots, PromptId::Plan, Slot::Identity).is_empty());
+        assert!(!assemble(PromptId::Plan, &slots, "").contains("never lands"));
     }
 
     #[test]
@@ -2196,7 +2202,7 @@ mod tests {
         let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
         let r = host.load_source(
             "bad",
-            r#"maki.api.set_prompt({ slot = "identity", content = "" })"#,
+            r#"maki.api.register_prompt_hint({ slot = "tool_usage", content = "" })"#,
         );
         assert!(r.is_err());
         assert!(r.unwrap_err().to_string().contains("empty"));
@@ -2216,6 +2222,236 @@ mod tests {
         assert_eq!(
             contents(&slots, PromptId::System, Slot::Identity),
             ["Dyn identity"]
+        );
+    }
+
+    #[test]
+    fn singleton_callback_is_collected_once_per_snapshot() {
+        let (host, first) = slots_from(
+            "live",
+            r#"
+            local count = 0
+            maki.api.set_prompt({ slot = "identity", content = function()
+                count += 1
+                return tostring(count)
+            end })
+            "#,
+        );
+        let second = host.event_handle().collect_prompt_slots();
+        for &pid in PromptId::ALL {
+            assert_eq!(contents(&first, pid, Slot::Identity), ["1"]);
+            assert_eq!(contents(&second, pid, Slot::Identity), ["2"]);
+        }
+        assert!(!first.has_replacements());
+        assert!(!second.has_replacements());
+    }
+
+    #[test]
+    fn init_lua_replaces_template_and_section() {
+        const TEMPLATE: &str = "Analysis policy.\n{{conventions}}\n{{instructions}}";
+        const SECTION: &str = "Follow primary sources.";
+        const INSTRUCTIONS: &str = "Keep {{identity}} literal.";
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.send_global_init_lua(
+            format!(
+                "maki.api.set_prompt({{prompt = \"system\", slot = \"conventions\", content = {SECTION:?}}})\n\
+                 maki.api.set_prompt({{prompt = \"system\", content = {TEMPLATE:?}}})\n\
+                 maki.setup({{}})"
+            ),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            assemble(
+                PromptId::System,
+                &host.event_handle().collect_prompt_slots(),
+                INSTRUCTIONS,
+            ),
+            format!("Analysis policy.\n{SECTION}\n{INSTRUCTIONS}")
+        );
+    }
+
+    #[test]
+    fn empty_replacements_clear_default_content() {
+        let (_host, slots) = slots_from(
+            "clear",
+            r#"
+            maki.api.set_prompt({ prompt = "system", slot = "identity", content = "" })
+            maki.api.set_prompt({ prompt = "system", slot = "conventions", content = "" })
+            maki.api.set_prompt({ prompt = "plan", content = "" })
+            "#,
+        );
+        const CODING_CONVENTION: &str = "Never assume a library is available.";
+        let defaults = assemble(PromptId::System, &ResolvedPrompts::default(), "");
+        assert!(defaults.contains(CODING_CONVENTION));
+        let rendered = assemble(PromptId::System, &slots, "");
+        assert!(!rendered.contains("You are Maki"));
+        assert!(!rendered.contains(CODING_CONVENTION));
+        assert_eq!(assemble(PromptId::Plan, &slots, ""), "");
+        assert!(slots.has_template(PromptId::Plan));
+    }
+
+    #[test_case("system", PromptId::System ; "system")]
+    #[test_case("research", PromptId::Research ; "research")]
+    #[test_case("general", PromptId::General ; "general")]
+    #[test_case("plan", PromptId::Plan ; "plan")]
+    #[test_case("plan_end", PromptId::PlanEnd ; "plan_end")]
+    #[test_case("compaction_system", PromptId::CompactionSystem ; "compaction_system")]
+    #[test_case("compaction_user", PromptId::CompactionUser ; "compaction_user")]
+    #[test_case("continuation", PromptId::Continuation ; "continuation")]
+    #[test_case("btw_fallback", PromptId::BtwFallback ; "btw_fallback")]
+    fn complete_replacement_has_no_implicit_sections(name: &str, id: PromptId) {
+        const TEMPLATE: &str = "You help analyse information.";
+        let (_host, slots) = slots_from(
+            "author",
+            &format!("maki.api.set_prompt({{ prompt = {name:?}, content = {TEMPLATE:?} }})"),
+        );
+        assert_eq!(assemble(id, &slots, "coding instructions"), TEMPLATE);
+    }
+
+    #[test]
+    fn template_and_section_compose_independent_of_owner_order() {
+        const CONTENT: &str = "Follow the evidence.\nUse the library catalogue.";
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source(
+            "aaa_section",
+            r#"
+            maki.api.set_prompt({ prompt = "plan", slot = "conventions", content = "Follow the evidence." })
+            maki.api.register_prompt_hint({ prompt = "plan", slot = "conventions", content = "Use the library catalogue." })
+            "#,
+        ).unwrap();
+        host.load_source(
+            "zzz_template",
+            r#"maki.api.set_prompt({ prompt = "plan", content = "{{conventions}}" })"#,
+        )
+        .unwrap();
+        let slots = host.event_handle().collect_prompt_slots();
+        assert_eq!(assemble(PromptId::Plan, &slots, ""), CONTENT);
+    }
+
+    #[test]
+    fn replacements_use_alphabetical_owner_and_last_registration() {
+        const CONTENT: &str = "last template: last section";
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source(
+            "zzz",
+            r#"
+            maki.api.set_prompt({ prompt = "system", content = "old template: {{conventions}}" })
+            maki.api.set_prompt({ prompt = "system", slot = "conventions", content = "old section" })
+            maki.api.set_prompt({ prompt = "system", content = "last template: {{conventions}}" })
+            maki.api.set_prompt({ prompt = "system", slot = "conventions", content = "last section" })
+            "#,
+        ).unwrap();
+        host.load_source(
+            "aaa",
+            r#"
+            maki.api.set_prompt({ prompt = "system", content = "first template: {{conventions}}" })
+            maki.api.set_prompt({ prompt = "system", slot = "conventions", content = "first section" })
+            "#,
+        ).unwrap();
+        let slots = host.event_handle().collect_prompt_slots();
+        assert_eq!(assemble(PromptId::System, &slots, ""), CONTENT);
+        host.unload("zzz").unwrap();
+        assert_eq!(
+            assemble(
+                PromptId::System,
+                &host.event_handle().collect_prompt_slots(),
+                ""
+            ),
+            "first template: first section"
+        );
+    }
+
+    #[test]
+    fn repeated_singleton_discards_callback_and_replaces_only_its_targets() {
+        let (_host, slots) = slots_from(
+            "singleton",
+            r#"
+            maki.api.set_prompt({ prompt = { "system", "general" }, slot = "identity", content = function() return "first" end })
+            maki.api.set_prompt({ prompt = "system", slot = "identity", content = function() return "last" end })
+            "#,
+        );
+        assert_eq!(contents(&slots, PromptId::System, Slot::Identity), ["last"]);
+        assert_eq!(
+            contents(&slots, PromptId::General, Slot::Identity),
+            ["first"]
+        );
+    }
+
+    #[test]
+    fn replaced_singleton_callback_is_not_invoked() {
+        let (_host, slots) = slots_from(
+            "singleton",
+            r#"
+            local calls = 0
+            maki.api.set_prompt({ slot = "identity", content = function() calls += 1; return "old" end })
+            maki.api.set_prompt({ slot = "identity", content = function() return tostring(calls) end })
+            "#,
+        );
+        assert_eq!(contents(&slots, PromptId::System, Slot::Identity), ["0"]);
+    }
+
+    #[test]
+    fn unload_reload_and_failed_load_remove_all_replacements() {
+        const TEMPLATE: &str = "replacement: selected";
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let source = r#"
+            maki.api.set_prompt({ prompt = "system", content = "replacement: {{conventions}}" })
+            maki.api.set_prompt({ prompt = "system", slot = "conventions", content = "selected" })
+            maki.api.set_prompt({ prompt = "system", slot = "identity", content = function() return "unused identity" end })
+        "#;
+        host.load_source("owned", source).unwrap();
+        let handle = host.event_handle();
+        assert_eq!(
+            assemble(PromptId::System, &handle.collect_prompt_slots(), ""),
+            TEMPLATE
+        );
+        host.unload("owned").unwrap();
+        assert!(!handle.collect_prompt_slots().has_replacements());
+        host.load_source("owned", source).unwrap();
+        host.load_source(
+            "owned",
+            r#"maki.api.set_prompt({ prompt = "system", content = "new" })"#,
+        )
+        .unwrap();
+        let reloaded = handle.collect_prompt_slots();
+        assert_eq!(assemble(PromptId::System, &reloaded, ""), "new");
+        assert!(contents(&reloaded, PromptId::System, Slot::Identity).is_empty());
+        assert!(
+            host.load_source("owned", &format!("{source}\nerror('failed load')"))
+                .is_err()
+        );
+        let failed = handle.collect_prompt_slots();
+        assert!(!failed.has_replacements());
+        assert!(contents(&failed, PromptId::System, Slot::Identity).is_empty());
+        assert_eq!(
+            assemble(PromptId::System, &failed, ""),
+            assemble(PromptId::System, &ResolvedPrompts::default(), "")
+        );
+    }
+
+    #[test_case(r#"{ content = "x" }"# ; "whole_requires_prompt")]
+    #[test_case(r#"{ prompt = { "system", "general" }, content = "x" }"# ; "whole_requires_one_prompt")]
+    #[test_case(r#"{ prompt = "nope", content = "x" }"# ; "unknown_prompt")]
+    #[test_case(r#"{ prompt = "system" }"# ; "missing_whole_content")]
+    #[test_case(r#"{ prompt = "system", content = function() return "x" end }"# ; "whole_callback")]
+    #[test_case(r#"{ slot = "conventions", content = function() return "x" end }"# ; "section_callback")]
+    #[test_case(r#"{ slot = "conventions", content = 42 }"# ; "section_wrong_type")]
+    #[test_case(r#"{ slot = "unknown", content = "x" }"# ; "unknown_section")]
+    #[test_case(r#"{ slot = "conventions" }"# ; "missing_section_content")]
+    #[test_case(r#"{ prompt = "system", content = string.rep("x", 1024 * 1024 + 1) }"# ; "oversized_whole")]
+    #[test_case(r#"{ slot = "conventions", content = string.rep("x", 1024 * 1024 + 1) }"# ; "oversized_section")]
+    fn invalid_replacement_is_rejected(spec: &str) {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        assert!(
+            host.load_source("invalid", &format!("maki.api.set_prompt({spec})"))
+                .is_err()
+        );
+        assert!(
+            !host
+                .event_handle()
+                .collect_prompt_slots()
+                .has_replacements()
         );
     }
 }

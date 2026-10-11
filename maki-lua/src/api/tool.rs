@@ -39,7 +39,8 @@ use crate::api::util::ctx::{LuaCtx, RestoreCtx};
 use crate::api::util::pair::{Pair, try_pair};
 use crate::plugin_permissions::{MANIFEST_FILE, Permission, PluginPermissions};
 use crate::runtime::{
-    HintContent, LiveCtx, PromptHintCallbacks, PromptHintRegistration, Request, command_depth,
+    HintContent, LiveCtx, PromptHintCallbacks, PromptHintRegistration, PromptTarget, Request,
+    command_depth,
 };
 
 const TOOL_NAME_MAX: usize = 64;
@@ -599,33 +600,16 @@ fn parse_prompt_field(spec: &Table) -> LuaResult<Option<Vec<PromptId>>> {
     }
 }
 
-fn validate_slot_prompt_compatibility(
-    slot: Slot,
-    prompts: &Option<Vec<PromptId>>,
-) -> LuaResult<()> {
-    if let Some(prompts) = prompts {
-        for &pid in prompts {
-            if !pid.has_slot(slot) {
-                return Err(mlua::Error::runtime(format!(
-                    "slot '{}' is not available for prompt '{}'",
-                    slot, pid
-                )));
-            }
-        }
-    }
-    Ok(())
-}
-
-fn parse_hint_content(lua: &Lua, spec: &Table) -> LuaResult<HintContent> {
-    let has_content = spec.contains_key("content")?;
-    if !has_content {
+fn parse_hint_content(lua: &Lua, spec: &Table, target: PromptTarget) -> LuaResult<HintContent> {
+    if !spec.contains_key("content")? {
         return Err(mlua::Error::runtime("'content' is required"));
     }
-
     match spec.get("content")? {
         LuaValue::String(s) => {
             let text = s.to_string_lossy();
-            if text.is_empty() {
+            if text.is_empty()
+                && matches!(target, PromptTarget::Slot(slot) if slot.kind() == SlotKind::Aggregate)
+            {
                 return Err(mlua::Error::runtime("'content' must not be empty"));
             }
             if text.len() > MAX_HINT_CONTENT_SIZE {
@@ -636,11 +620,59 @@ fn parse_hint_content(lua: &Lua, spec: &Table) -> LuaResult<HintContent> {
             }
             Ok(HintContent::Static(text))
         }
-        LuaValue::Function(f) => Ok(HintContent::Callback(lua.create_registry_value(f)?)),
-        _ => Err(mlua::Error::runtime(
+        LuaValue::Function(f) if matches!(target, PromptTarget::Slot(_)) => {
+            Ok(HintContent::Callback(lua.create_registry_value(f)?))
+        }
+        _ if matches!(target, PromptTarget::Slot(_)) => Err(mlua::Error::runtime(
             "'content' must be a string or function",
         )),
+        _ => Err(mlua::Error::runtime("'content' must be a string")),
     }
+}
+
+fn register_prompt(
+    lua: &Lua,
+    plugin: Arc<str>,
+    prompts: Option<Vec<PromptId>>,
+    target: PromptTarget,
+    content: HintContent,
+) -> LuaResult<()> {
+    let explicit = prompts.is_some();
+    let prompts = prompts.unwrap_or_else(|| PromptId::ALL.to_vec());
+    let replacing = match target {
+        PromptTarget::Slot(slot) => slot.kind() == SlotKind::Singleton,
+        PromptTarget::Section(_) | PromptTarget::Template => true,
+    };
+    let mut map = lua
+        .app_data_mut::<PromptHintCallbacks>()
+        .ok_or_else(|| mlua::Error::runtime("not initialized"))?;
+    let registrations = map.entry(plugin).or_default();
+    let discarded = if replacing {
+        registrations
+            .extract_if(.., |registration| {
+                if registration.target != target {
+                    return false;
+                }
+                registration.prompts.retain(|pid| !prompts.contains(pid));
+                registration.prompts.is_empty()
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    registrations.push(PromptHintRegistration {
+        prompts,
+        explicit,
+        target,
+        content,
+    });
+    drop(map);
+    for registration in discarded {
+        if let HintContent::Callback(key) = registration.content {
+            lua.remove_registry_value(key)?;
+        }
+    }
+    Ok(())
 }
 
 /// Register a new tool the agent can call. This is the main way plugins add
@@ -982,7 +1014,7 @@ async fn run_command(
 /// until the next compaction.
 ///
 /// @param spec table Hint specification:
-///   slot    (string)         Required. Aggregate slot name (e.g. "tool_usage", "general").
+///   slot    (string)         Required. Aggregate slot name (e.g. "tool_usage", "conventions").
 ///   content (string|function) Required. Static text, or a `function()` that returns a string. Max 1 MiB.
 ///   prompt  (string|string[]) Optional. Restrict to specific prompt ids (e.g. "system").
 /// @return
@@ -1003,64 +1035,69 @@ fn register_prompt_hint(lua: &Lua, #[ctx] plugin: Arc<str>, spec: Table) -> LuaR
         )));
     }
     let prompts = parse_prompt_field(&spec)?;
-    validate_slot_prompt_compatibility(slot, &prompts)?;
-    let content = parse_hint_content(lua, &spec)?;
-    let reg = PromptHintRegistration {
-        prompts,
-        slot,
-        content,
-    };
-    let mut map = lua
-        .app_data_mut::<PromptHintCallbacks>()
-        .ok_or_else(|| mlua::Error::runtime("not initialized"))?;
-    map.entry(Arc::clone(&plugin)).or_default().push(reg);
-    Ok(())
+    let target = PromptTarget::Slot(slot);
+    let content = parse_hint_content(lua, &spec, target)?;
+    register_prompt(lua, plugin, prompts, target, content)
 }
 
-/// Set a singleton prompt slot. Only one plugin owns each singleton slot at a
-/// time, so calling this replaces any previous value from your plugin.
+/// Replace a complete prompt or one named section. Section replacements
+/// preserve additive hints registered through `register_prompt_hint`.
 ///
-/// Use this for slots like "identity" or "tone" where a single coherent value
-/// makes more sense than combining fragments. For aggregate slots like
-/// "tool_usage", use `register_prompt_hint` instead.
+/// Omit `slot` to replace a whole template; this requires one explicit prompt
+/// ID. A replacement inserts section defaults, hints, and instructions only
+/// through explicit `{{section}}` and `{{instructions}}` markers. An empty
+/// string clears a template or section. The alphabetically last plugin wins,
+/// and its last registration wins within that plugin. Unload removes its values.
 ///
-/// Throws if you pass an aggregate slot name. A function `content` behaves
-/// as in `register_prompt_hint`.
+/// Prompt IDs: `system`, `research`, `general`, `plan`, `plan_end`,
+/// `compaction_system`, `compaction_user`, `continuation`, and `btw_fallback`.
+/// Sections: `identity`, `tone`, `tool_usage`, `efficient_tools`, `conventions`,
+/// `after_instructions`, `objectivity`, and `completion`.
 ///
-/// @param spec table Spec fields mirror `register_prompt_hint`:
-///   slot    (string)         Required. Singleton slot name (e.g. "identity", "tone").
-///   content (string|function) Required. Static text or a `function()` returning a string. Max 1 MiB.
-///   prompt  (string|string[]) Optional. Restrict to specific prompt ids.
+/// Identity and tone are available in system, research, and general prompts.
+/// Specify `prompt = "system"` to limit a replacement to the main agent.
+/// Identity and tone also accept a function called before every run. Its first
+/// value goes in the system prompt. Under the built-in main template, later
+/// changes reach the model as a context update. Under a complete main template,
+/// changed rendered text starts a new frame. Other replacements require static
+/// strings.
+/// A known section missing from the resolved template is ignored, with a warning
+/// for explicit prompt targets.
+///
+/// @param spec table Prompt replacement:
+///   slot    (string)         Optional. Named section, e.g. "identity", "tone", "conventions".
+///   content (string|function) Required. Replacement text, including empty text. Max 1 MiB. Only identity and tone accept functions.
+///   prompt  (string|string[]) Optional for sections; defaults to conversational prompts containing the section. A whole replacement requires one explicit prompt ID.
 /// @return
 /// @example
 /// maki.api.set_prompt({
-///   slot = "tone",
-///   content = "Be concise. No filler words.",
+///   prompt = "system",
+///   slot = "conventions",
+///   content = "State uncertainty and cite your evidence.",
+/// })
+/// maki.api.set_prompt({
+///   prompt = "system",
+///   content = "You help analyse information.\n{{tool_usage}}",
 /// })
 #[lua_fn]
 fn set_prompt(lua: &Lua, #[ctx] plugin: Arc<str>, spec: Table) -> LuaResult<()> {
-    let slot: Slot = parse_slot(&spec)?;
-    if slot.kind() == SlotKind::Aggregate {
-        return Err(mlua::Error::runtime(format!(
-            "set_prompt is for singleton slots ({}); \
-             use register_prompt_hint for aggregate slots ({})",
-            Slot::names_for_kind(SlotKind::Singleton),
-            Slot::names_for_kind(SlotKind::Aggregate),
-        )));
-    }
     let prompts = parse_prompt_field(&spec)?;
-    validate_slot_prompt_compatibility(slot, &prompts)?;
-    let content = parse_hint_content(lua, &spec)?;
-    let reg = PromptHintRegistration {
-        prompts,
-        slot,
-        content,
+    let target = if spec.get::<LuaValue>("slot")?.is_nil() {
+        if prompts.as_ref().is_none_or(|ids| ids.len() != 1) {
+            return Err(mlua::Error::runtime(
+                "a complete prompt replacement requires one explicit 'prompt' ID",
+            ));
+        }
+        PromptTarget::Template
+    } else {
+        let slot = parse_slot(&spec)?;
+        match slot.kind() {
+            SlotKind::Singleton => PromptTarget::Slot(slot),
+            SlotKind::Aggregate => PromptTarget::Section(slot),
+        }
     };
-    let mut map = lua
-        .app_data_mut::<PromptHintCallbacks>()
-        .ok_or_else(|| mlua::Error::runtime("not initialized"))?;
-    map.entry(Arc::clone(&plugin)).or_default().push(reg);
-    Ok(())
+    let content = parse_hint_content(lua, &spec, target)?;
+    register_prompt(lua, plugin, prompts, target, content)
 }
 
 /// Return a list of all registered tools. Useful for building UI that shows
