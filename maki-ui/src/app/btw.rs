@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use flume::Sender;
 use futures_lite::future;
+use maki_agent::prompt::BTW_FALLBACK;
 use maki_providers::provider::Provider;
 use maki_providers::{Message, Model, ProviderEvent, RequestOptions};
 use maki_storage::id::SessionRef;
@@ -16,9 +17,6 @@ single response.\n- You have NO tools: you cannot read files, run commands, or t
 - One-off response: there are no follow-up turns.\n- Answer ONLY from the existing conversation \
 context.\n- Never say \"Let me...\", \"I'll now...\", or promise any action.\n- If you don't know, \
 say so; do not offer to look it up.\n</system-reminder>";
-
-const BTW_FALLBACK_SYSTEM: &str = "You are a helpful coding assistant. Answer concisely \
-from the conversation context.";
 
 /// The reminder leads so the model treats the question as a quick aside, not a task to act on.
 pub(crate) fn btw_question(question: &str) -> Message {
@@ -45,7 +43,7 @@ impl App {
         let system = snapshot
             .as_ref()
             .and_then(|s| s.frame.as_ref())
-            .map_or_else(|| BTW_FALLBACK_SYSTEM.to_string(), |f| f.system.clone());
+            .map_or_else(|| BTW_FALLBACK.to_string(), |f| f.system.clone());
         messages.push(btw_question(&question));
 
         let (tx, rx) = flume::bounded(64);

@@ -19,15 +19,11 @@ pub const GENERAL_PROMPT: &str = include_str!("prompts/general.md");
 pub const COMPACTION_SYSTEM: &str = include_str!("prompts/compaction.md");
 pub const COMPACTION_USER: &str = include_str!("prompts/compaction_user.md");
 
-pub const DEFAULT_IDENTITY: &str = r#"You are Maki, an interactive CLI coding agent. Use the tools available to assist the user with software engineering tasks. Complete tasks successfully while minimizing token usage and tool calls to avoid context bloat.
-
-You must NEVER generate or guess URLs unless they are for helping the user with programming."#;
-
-pub const DEFAULT_TONE: &str = r#"- Be concise. Your output is displayed on a CLI rendered in monospace. Use GitHub-flavored markdown.
-- Only use emojis if explicitly requested.
-- Do not add comments to code unless asked.
-- Output text to communicate with the user; all text you output outside of tool use is displayed to the user. Only use tools to complete tasks. NEVER use bash echo or other command-line tools to communicate thoughts, explanations, diagrams, or instructions to the user. Output all communication directly in your response text instead.
-- NEVER create files unless absolutely necessary. ALWAYS prefer editing existing files."#;
+pub const PLAN_ENDED: &str = include_str!("prompts/plan_end.md");
+pub const CONTINUATION: &str = include_str!("prompts/continuation.md");
+pub const BTW_FALLBACK: &str = include_str!("prompts/btw_fallback.md");
+pub const DEFAULT_IDENTITY: &str = include_str!("prompts/system_identity.md");
+pub const DEFAULT_TONE: &str = include_str!("prompts/system_tone.md");
 
 const NATIVE_EFFICIENT_TOOLS: &[&str] = &["batch", "code_execution", "task"];
 const INSTRUCTIONS_MARKER: &str = "{{instructions}}";
@@ -217,6 +213,7 @@ fn fill_marker(template: &str, marker: &str, content: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::template::Vars;
     use test_case::test_case;
 
     const NATIVE_EFFICIENT_LINE: &str = "Most efficient tools: batch, code_execution, task";
@@ -465,5 +462,34 @@ mod tests {
         let out = assemble(PromptId::System, &s, "");
         assert!(out.contains("Never assume a library is available"));
         assert!(out.contains("- Extra rule"));
+    }
+
+    #[test_case(PromptId::System, include_str!("prompts/tests/system.md") ; "system")]
+    #[test_case(PromptId::Research, include_str!("prompts/tests/research.md") ; "research")]
+    #[test_case(PromptId::General, include_str!("prompts/tests/general.md") ; "general")]
+    fn defaults_preserve_pre_catalogue_bytes(id: PromptId, expected: &str) {
+        let vars = Vars::new().set(
+            "{environment}",
+            "Environment:\n- Working directory: /example\n- Platform: example\n- Date: 2000-01-01",
+        );
+        assert_eq!(
+            vars.apply(&assemble(
+                id,
+                &ResolvedSlots::default(),
+                "\n\nEXAMPLE_INSTRUCTIONS"
+            )),
+            expected
+        );
+    }
+
+    #[test_case(PLAN_PROMPT, include_str!("prompts/tests/plan.md") ; "plan")]
+    #[test_case(PLAN_ENDED, include_str!("prompts/tests/plan_end.md") ; "plan_end")]
+    #[test_case(COMPACTION_SYSTEM, include_str!("prompts/tests/compaction.md") ; "compaction_system")]
+    #[test_case(COMPACTION_USER, include_str!("prompts/tests/compaction_user.md") ; "compaction_user")]
+    #[test_case(CONTINUATION, include_str!("prompts/tests/continuation.md") ; "continuation")]
+    #[test_case(BTW_FALLBACK, include_str!("prompts/tests/btw_fallback.md") ; "btw_fallback")]
+    fn fixed_defaults_preserve_pre_catalogue_bytes(prompt: &str, expected: &str) {
+        let vars = Vars::new().set("{plan_path}", "/example/plan.md");
+        assert_eq!(vars.apply(prompt), expected);
     }
 }
