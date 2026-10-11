@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use maki_config::PROVIDER_BUILTINS;
-use maki_config::providers::{BuiltInProvider, Protocol, ProviderPlan};
+use maki_config::providers::{BuiltInProvider, Protocol, ProviderPlan, ProvidersConfig};
 
 use crate::AgentError;
 use crate::manifest;
@@ -277,7 +277,7 @@ impl ProviderRegistry {
 /// knows about a slug: a catalog-backed builtin has a spec row and is still
 /// `Catalog` here.
 pub enum Owner {
-    /// A registered declaration.
+    /// A selected or registered declaration.
     Plugin,
     /// Carries the constructor rather than the spec, so "builtin" and
     /// "buildable" cannot come apart.
@@ -299,6 +299,13 @@ impl Owner {
         let builtin = ProviderRegistry::compiled(slug);
         if let Some(native) = builtin.and_then(ProviderSpec::native) {
             return Self::Builtin(native.new);
+        }
+        if !ProviderRegistry::is_shipped(slug)
+            && ProvidersConfig::load_or_default()
+                .get(slug)
+                .is_some_and(|def| def.plugin.is_some())
+        {
+            return Self::Plugin;
         }
         if custom::base_spec(slug).is_some() {
             return Self::Custom;

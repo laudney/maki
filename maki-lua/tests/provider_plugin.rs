@@ -17,9 +17,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use maki_agent::tools::ToolRegistry;
+use maki_config::providers::{ProviderDef, ProvidersConfig};
 use maki_lua::{PluginHost, PluginPermissions};
 use maki_providers::model::{Model, ModelTier};
-use maki_providers::provider::Provider;
+use maki_providers::provider::{Provider, provider_for_slug};
 use maki_providers::retry::RetryKind;
 use maki_providers::test_support::{Canned, JSON_HEADERS, Recorded, Requests, serve};
 use maki_providers::{
@@ -52,6 +53,8 @@ const RETRY_AFTER: &str = "7";
 /// Every plugin written inline loads under this one name, so loading a second
 /// source is a reload of the first.
 const INLINE_PLUGIN: &str = "acme_inline";
+const OTHER_PLUGIN: &str = "other-package";
+const FAILED_SELECTED_LOAD: &str = "selected load failed";
 
 const RESPONSES_SLUG: &str = "acmeresponses";
 const RESPONSES_MODEL: &str = "acme-r1";
@@ -71,7 +74,7 @@ const RELOADED_SOURCE: &str = "-- the provider plugin, reloaded without its regi
 /// Shipped as a bundled plugin, which this file never loads.
 const BUILTIN_SLUG: &str = "deepseek";
 const BUILTIN_HOST: &str = "api.deepseek.com";
-const RESERVED_SLUG_MESSAGE: &str = "belongs to a built-in or models.dev provider";
+const RESERVED_SLUG_MESSAGE: &str = "is reserved";
 const CLAIM_ALLOWED: &str = "a third-party plugin took a built-in slug";
 const BUILTIN_TAKEN: &str = "a refused declaration must not be serving the slug";
 
@@ -204,6 +207,53 @@ fn plugin_host() -> PluginHost {
 fn load_inline(host: &PluginHost, source: &str, net_host: &str) {
     host.load_source_with_permissions(INLINE_PLUGIN, source, permissions_for(net_host))
         .expect(LOAD_FAILED);
+}
+
+#[test_case(None, false ; "unselected")]
+#[test_case(Some(OTHER_PLUGIN), false ; "another_package")]
+#[test_case(Some(INLINE_PLUGIN), false ; "selected")]
+#[test_case(Some(INLINE_PLUGIN), true ; "failed_selected_load")]
+fn an_optional_provider_registers_only_for_its_selected_package(
+    owner: Option<&str>,
+    fail_load: bool,
+) {
+    let _state = isolated_state();
+    let mut config = ProvidersConfig::default();
+    config.providers.insert(
+        SLUG.into(),
+        ProviderDef {
+            plugin: owner.map(str::to_owned),
+            ..ProviderDef::default()
+        },
+    );
+    config.save().unwrap();
+    let host = plugin_host();
+    let source = format!(
+        r#"if not maki.provider.is_selected({SLUG:?}) then return end
+maki.provider.register({{
+  slug = {SLUG:?}, display_name = {DISPLAY_NAME:?}, codec = "openai",
+  base_url = "https://{PARKING_HOST}/v1",
+}})
+if {fail_load} then error({FAILED_SELECTED_LOAD:?}) end"#
+    );
+    plugin::begin_load();
+    let loaded =
+        host.load_source_with_permissions(INLINE_PLUGIN, &source, permissions_for(PARKING_HOST));
+    plugin::commit_load();
+    assert_eq!(loaded.is_err(), fail_load, "{loaded:?}");
+    assert_eq!(
+        plugin::is_registered(SLUG),
+        owner == Some(INLINE_PLUGIN) && !fail_load
+    );
+    if owner == Some(INLINE_PLUGIN) && fail_load {
+        assert!(
+            loaded
+                .unwrap_err()
+                .to_string()
+                .contains(FAILED_SELECTED_LOAD)
+        );
+        assert!(provider_for_slug(SLUG, Timeouts::default()).is_err());
+    }
 }
 
 /// The fixture plugin, loaded from disk with the grant its `plugin.toml`

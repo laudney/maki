@@ -302,8 +302,10 @@ pub enum RegisterError {
     InvalidSlug(String),
     #[error("provider slug '{0}' is already defined in providers.toml")]
     ConfiguredSlug(String),
-    #[error("provider slug '{0}' belongs to a built-in or models.dev provider")]
+    #[error("provider slug '{0}' is reserved; catalog names require an explicit plugin selection")]
     ReservedSlug(String),
+    #[error("provider '{slug}' selects plugin '{owner}' in providers.toml")]
+    SelectedOwner { slug: String, owner: String },
     #[error("provider '{slug}': {message}")]
     Credentials { slug: String, message: String },
     #[error("provider '{0}' is already registered")]
@@ -425,15 +427,16 @@ struct PluginEntry {
     owner: Option<Arc<str>>,
     target: Target,
     hooks: ProviderHooks,
-    /// Shared with every other entry this slug ever had: an entry is replaced
-    /// on reload, its credentials are not. Held here rather than looked up
-    /// beside the entry, so "registered" and "has credentials" cannot come
-    /// apart at a call site.
+    /// Shared with every entry this owner registered for this slug: an entry
+    /// is replaced on reload, its credentials are not. Held here rather than
+    /// looked up beside the entry, so "registered" and "has credentials"
+    /// cannot come apart at a call site.
     auth: Arc<AuthState>,
 }
 
 /// Ordered by slug, so every listing comes out the same each run.
 type Registry = BTreeMap<Box<str>, Arc<PluginEntry>>;
+type AuthIdentity = (Box<str>, Option<Arc<str>>);
 
 /// What every read answers. Only ever replaced whole, by [`commit_load`], so
 /// there is no moment at which a reader can see a half-built registry: during
@@ -445,7 +448,8 @@ static PROVIDERS: LazyLock<RwLock<Arc<Registry>>> = LazyLock::new(RwLock::defaul
 static STAGING: LazyLock<Mutex<Option<Registry>>> =
     LazyLock::new(|| Mutex::new(Some(Registry::new())));
 /// Append-only for the life of the process: see [`shared_auth`].
-static AUTH: LazyLock<RwLock<HashMap<Box<str>, Arc<AuthState>>>> = LazyLock::new(RwLock::default);
+static AUTH: LazyLock<RwLock<HashMap<AuthIdentity, Arc<AuthState>>>> =
+    LazyLock::new(RwLock::default);
 
 /// Opens the registration window, at the top of every plugin load.
 ///
@@ -469,6 +473,10 @@ pub fn commit_load() {
     };
     for entry in staged.values() {
         let slug = &entry.decl.slug;
+        if !entry.eligible() {
+            warn!(slug, "provider owner changed before registration committed");
+            continue;
+        }
         let api_key_env = entry.decl.api_key_env.clone().filter(|var| !var.is_empty());
         if let Err(error) = entry.auth.redeclare(
             slug,
@@ -479,7 +487,11 @@ pub fn commit_load() {
             warn!(slug, %error, "provider credentials were not re-declared");
         }
     }
-    let logins = staged.values().filter_map(|e| e.built.login).collect();
+    let logins = staged
+        .values()
+        .filter(|entry| entry.eligible())
+        .filter_map(|entry| entry.built.login)
+        .collect();
     maki_config::providers::set_registered_providers(logins);
     *PROVIDERS.write().unwrap() = Arc::new(staged);
 }
@@ -531,32 +543,7 @@ fn register_owned(
     if !is_valid_slug(&slug) {
         return Err(RegisterError::InvalidSlug(slug));
     }
-    // A third party on a slug maki ships or serves from models.dev would be
-    // handed the key the user saved for that provider, and would take over
-    // its models. A bundled slug stays reserved even while its plugin is off,
-    // so turning a plugin off never frees the name.
-    let reserved = match authority {
-        DeclAuthority::Bundled => ProviderRegistry::compiled(&slug).is_some(),
-        DeclAuthority::ThirdParty => {
-            ProviderRegistry::is_shipped(&slug) || catalog::serves_slug(&slug)
-        }
-    };
-    if reserved {
-        return Err(RegisterError::ReservedSlug(slug));
-    }
-    // A `providers.toml` entry only defines a provider when it sets a
-    // `protocol`, and only a third party loses the slug to it. Without one the
-    // entry just tweaks the declaration, like `[deepseek] base_url` pointing at
-    // a gateway. A bundled plugin keeps its slug either way and only gets a
-    // warning, because failing here would abort the whole bundled load and
-    // maki would not start.
-    if authority == DeclAuthority::ThirdParty
-        && ProvidersConfig::load_or_default()
-            .get(&slug)
-            .is_some_and(|def| def.protocol.is_some())
-    {
-        return Err(RegisterError::ConfiguredSlug(slug));
-    }
+    check_owner(&slug, authority, owner.as_deref())?;
     if decl.net_hosts.is_empty() {
         return Err(RegisterError::NoNetHosts(slug));
     }
@@ -602,7 +589,7 @@ fn register_owned(
         "registered provider declaration"
     );
     vacant.insert(Arc::new(PluginEntry {
-        auth: shared_auth(&slug),
+        auth: shared_auth(&slug, owner.clone()),
         built,
         decl,
         authority,
@@ -610,6 +597,40 @@ fn register_owned(
         target,
         hooks,
     }));
+    Ok(())
+}
+
+fn check_owner(
+    slug: &str,
+    authority: DeclAuthority,
+    owner: Option<&str>,
+) -> Result<(), RegisterError> {
+    // Selecting a package is explicit consent to use this name's saved key.
+    // Catalog metadata alone cannot select that package.
+    let reserved = match authority {
+        DeclAuthority::Bundled => ProviderRegistry::compiled(slug).is_some(),
+        DeclAuthority::ThirdParty => ProviderRegistry::is_shipped(slug),
+    };
+    if reserved {
+        return Err(RegisterError::ReservedSlug(slug.into()));
+    }
+    if authority == DeclAuthority::ThirdParty {
+        let config = ProvidersConfig::load_or_default();
+        let def = config.get(slug);
+        if let Some(selected) = def.and_then(|def| def.plugin.as_deref()) {
+            if owner != Some(selected) {
+                return Err(RegisterError::SelectedOwner {
+                    slug: slug.into(),
+                    owner: selected.into(),
+                });
+            }
+        } else if catalog::serves_slug(slug) {
+            return Err(RegisterError::ReservedSlug(slug.into()));
+        }
+        if def.is_some_and(|def| def.protocol.is_some()) {
+            return Err(RegisterError::ConfiguredSlug(slug.into()));
+        }
+    }
     Ok(())
 }
 
@@ -652,16 +673,17 @@ fn target_of(decl: &ProviderDecl, hooks: &ProviderHooks) -> Result<Target, Regis
     Ok(target)
 }
 
-/// One cell of credentials per slug, for the life of the process. Reusing it
-/// is what carries a token across a reload, and what stops a reload from
+/// One cell of credentials per slug and owner, for the life of the process.
+/// Reusing it carries a token across a reload, and stops a reload from
 /// minting a second [`RefreshGate`] for a slug whose token is in flight.
-fn shared_auth(slug: &str) -> Arc<AuthState> {
+fn shared_auth(slug: &str, owner: Option<Arc<str>>) -> Arc<AuthState> {
+    let identity = (slug.into(), owner);
     let mut states = AUTH.write().unwrap();
-    if let Some(state) = states.get(slug) {
+    if let Some(state) = states.get(&identity) {
         return Arc::clone(state);
     }
     let state = Arc::new(AuthState::new());
-    states.insert(slug.into(), Arc::clone(&state));
+    states.insert(identity, Arc::clone(&state));
     state
 }
 
@@ -670,12 +692,19 @@ fn entries() -> Arc<Registry> {
 }
 
 fn entry(slug: &str) -> Option<Arc<PluginEntry>> {
-    entries().get(slug).cloned()
+    entries()
+        .get(slug)
+        .filter(|entry| entry.eligible())
+        .cloned()
 }
 
 fn unknown(slug: &str) -> AgentError {
+    let config = ProvidersConfig::load_or_default();
     AgentError::Config {
-        message: format!("unknown plugin provider '{slug}'"),
+        message: match config.get(slug).and_then(|def| def.plugin.as_deref()) {
+            Some(owner) => format!("selected plugin '{owner}' for provider '{slug}' is not loaded"),
+            None => format!("unknown plugin provider '{slug}'"),
+        },
     }
 }
 
@@ -901,9 +930,18 @@ impl AuthState {
 }
 
 impl PluginEntry {
+    fn eligible(&self) -> bool {
+        check_owner(&self.decl.slug, self.authority, self.owner.as_deref()).is_ok()
+    }
+
     /// Resolve once, lazily, from async code. Every fallible provider method
     /// starts here, so no synchronous path ever has to reach a hook.
     async fn ensure_auth(&self) -> Result<(), AgentError> {
+        check_owner(&self.decl.slug, self.authority, self.owner.as_deref()).map_err(|error| {
+            AgentError::Config {
+                message: error.to_string(),
+            }
+        })?;
         if self.auth.gate.ran() {
             return Ok(());
         }
@@ -1273,6 +1311,19 @@ pub fn resolved_auth(slug: &str) -> Option<ResolvedAuth> {
     Some(entry(slug)?.auth.current.lock().unwrap().clone())
 }
 
+/// A retained hook must not read a new owner's credentials from this slug.
+pub fn hook_auth(slug: &str, owner: &str) -> Option<ResolvedAuth> {
+    let entry = entry(slug)?;
+    if entry.owner.as_deref() != Some(owner) {
+        return None;
+    }
+    let mut auth = entry.auth.current.lock().unwrap().clone();
+    if auth.base_url.is_none() {
+        auth.base_url = resolve_base_url(&entry).map(|(base_url, _)| base_url);
+    }
+    Some(auth)
+}
+
 /// The origin a request to `slug` would reach right now, resolved the way a
 /// codec resolves it per request: an auth-supplied origin, then the user's
 /// `<SLUG>_BASE_URL` or `providers.toml`, then the declared default.
@@ -1379,20 +1430,24 @@ pub fn build_with_auth(
 }
 
 pub fn specs() -> Vec<&'static ProviderSpec> {
-    entries().values().map(|entry| entry.built.spec).collect()
+    entries()
+        .values()
+        .filter(|entry| entry.eligible())
+        .map(|entry| entry.built.spec)
+        .collect()
 }
 
 /// The providers whose `maki auth login` runs a `login` hook.
 pub fn auth_providers() -> Vec<(String, String)> {
     entries()
         .values()
-        .filter(|entry| entry.hooks.login.is_some())
+        .filter(|entry| entry.eligible() && entry.hooks.login.is_some())
         .map(|entry| (entry.decl.slug.clone(), entry.decl.display_name.clone()))
         .collect()
 }
 
 pub fn is_registered(slug: &str) -> bool {
-    entries().contains_key(slug)
+    entry(slug).is_some()
 }
 
 /// Blocks, so it belongs to the cli thread and never to the plugin host's: the
@@ -1428,6 +1483,7 @@ mod tests {
     use futures_lite::future::zip;
     use maki_config::PROVIDER_BUILTINS;
     use maki_config::providers::base_url_env_var;
+    use tempfile::TempDir;
     use test_case::test_case;
 
     use super::spec::{UNKNOWN_MODEL_CONTEXT_WINDOW, UNKNOWN_MODEL_MAX_OUTPUT};
@@ -1735,6 +1791,54 @@ mod tests {
     }
 
     #[test]
+    fn owner_changes_do_not_reuse_another_packages_auth_gate() {
+        const SLUG: &str = "owner-auth-test";
+        const FIRST_OWNER: &str = "first-owner";
+        const NEXT_OWNER: &str = "next-owner";
+        const HOST: &str = "127.0.0.1";
+        const MODELS: &[Canned] = &[
+            Canned::json(200, r#"{"data":[]}"#),
+            Canned::json(200, r#"{"data":[]}"#),
+            Canned::json(200, r#"{"data":[]}"#),
+        ];
+        let home = TempDir::new().unwrap();
+        for var in [
+            "HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_STATE_HOME",
+            "XDG_CACHE_HOME",
+        ] {
+            unsafe { std::env::set_var(var, home.path()) };
+        }
+        let (base, requests) = serve(MODELS);
+        let first = Arc::new(CountingAuth::new(true));
+        let next = Arc::new(CountingAuth::new(false));
+        for (owner, hook) in [
+            (FIRST_OWNER, &first),
+            (FIRST_OWNER, &first),
+            (NEXT_OWNER, &next),
+        ] {
+            let mut reg = registration(SLUG);
+            reg.decl.base_url = Some(base.clone());
+            reg.decl.net_hosts = vec![HOST.into()];
+            reg.hooks.auth = Some(hook.clone());
+            begin_load();
+            register_plugin(Arc::from(owner), reg, DeclAuthority::ThirdParty).unwrap();
+            commit_load();
+            let provider = create(SLUG, Timeouts::default()).unwrap();
+            smol::block_on(provider.list_models()).unwrap();
+        }
+        assert_eq!(first.calls(), 1);
+        assert_eq!(next.calls(), 1);
+        let requests = requests.lock().unwrap();
+        let tokens = requests
+            .iter()
+            .map(|request| request.headers[AUTH_HEADER].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(tokens, [FIRST_TOKEN, FIRST_TOKEN, CONSTANT_TOKEN]);
+    }
+
+    #[test]
     fn reload_keeps_the_auth_state() {
         const SLUG: &str = "reload-plugin";
         let hook = Arc::new(CountingAuth::new(true));
@@ -1785,7 +1889,7 @@ mod tests {
 
         assert!(!is_registered(SLUG), "{RELOAD_DROPS_STALE}");
         assert!(
-            AUTH.read().unwrap().contains_key(SLUG),
+            AUTH.read().unwrap().contains_key(&(SLUG.into(), None)),
             "{CREDENTIALS_DROPPED}"
         );
     }
