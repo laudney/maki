@@ -310,9 +310,9 @@ plugin = "acme-provider"
 
 Use the installed package's name. This selects the package that may receive the existing credentials saved under `acme`. Other packages cannot register that name. Compiled and bundled provider names remain reserved. An entry cannot select both a `plugin` and a custom `protocol`.
 
-The setting grants no permissions. Install and approve the package as usual. A selected package that is missing, fails to load, or no longer registers the provider makes that provider unavailable. Maki does not silently use a generic catalog client in its place. Changing the selection blocks later requests from the previous owner. Requests already in progress keep their normal lifetime.
+The setting grants no permissions. Install and approve the package as usual. A selected package that is missing, fails to load, or no longer registers the provider makes that provider unavailable. Maki does not silently use a generic catalog client in its place. Ownership is checked when plugins load. The loaded provider remains available until the next reload, even if the selection or catalog changes.
 
-Remove `plugin` to restore the default catalog fallback. Reload plugins or restart Maki after selecting a package, so it can register its provider. Optional providers in a larger package can check the selection before registering:
+Reload plugins or restart Maki after changing the selection. Remove `plugin` and reload to restore the default catalog fallback. Optional providers in a larger package can check the selection before registering:
 
 ```lua
 if not maki.provider.is_selected("acme") then
