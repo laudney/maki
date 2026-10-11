@@ -4053,8 +4053,9 @@ it does for a built-in provider.
 
 {spec} fields:
   `slug` (string) Required. Letters, digits, `_` and `-`, starting with a
-          letter or digit. Must not be a slug Maki ships, one it serves
-          from models.dev, or one defined in `providers.toml`.
+          letter or digit. Shipped names and custom protocol definitions
+          are reserved. A catalog name requires `plugin = "package-name"`
+          in providers.toml selecting this package.
   `display_name` (string) Required. Shown in the UI.
   `codec` (string) Wire format: `"openai"`, `"openai-responses"`,
           `"anthropic"` or `"google"`.
@@ -4184,6 +4185,24 @@ maki.provider.register({
   end,
 })
 ```
+
+---
+
+### `maki.provider.is_selected()` {#maki-provider-is_selected}
+
+```lua
+maki.provider.is_selected({slug})
+```
+
+Whether providers.toml selects this plugin to implement the named provider.
+Use this at load time for optional providers in a package. The query reads
+no credentials and grants no permissions.
+
+**Parameters:**
+
+- `{slug}` (`string`) Provider name selected with `plugin = "package-name"`.
+
+**Returns:** boolean Whether this package is selected.
 
 ---
 

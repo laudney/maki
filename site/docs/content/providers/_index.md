@@ -377,10 +377,11 @@ New models start at the **medium** tier until you assign one in the picker.
 
 ## providers.toml
 
-`providers.toml` lives in the config directory (`~/.config/maki/providers.toml` on Linux/macOS, `%APPDATA%\maki\providers.toml` on Windows). It is the file for provider overrides and custom HTTP providers. Two jobs:
+`providers.toml` lives in the config directory (`~/.config/maki/providers.toml` on Linux/macOS, `%APPDATA%\maki\providers.toml` on Windows). Use it to:
 
 1. Tweak a built-in (pick a plan, change its base URL, set `enable_free_models` for Opencode).
 2. Declare a custom provider that speaks OpenAI, Anthropic, or Google wire format.
+3. [Select a plugin package](#select-a-provider-package) to implement a provider name.
 
 ```toml
 # Point a built-in at a proxy. Env vars still win over this file.
@@ -419,6 +420,7 @@ supports_vision = false
 |-------|------|-------|
 | `display_name` | string | Shown in pickers and auth status |
 | `protocol` | string | `openai`, `openai-responses`, `anthropic`, or `google`. Required for custom slugs |
+| `plugin` | string | Package selected to implement this provider. Cannot be combined with `protocol`. See [provider selection](#select-a-provider-package) |
 | `base_url` | string | Origin of the API. Maki appends the protocol paths |
 | `plan` | string | Built-in plan key (see Plans below). Sets base URL and default model |
 | `api_key_env` | string | Env var that holds the key. Defaults to `<SLUG>_API_KEY` |
@@ -543,6 +545,28 @@ net_hosts = ["api.acme.com"]
 Maki sends the provider's credentials only to those hosts, plus any origin you set yourself with `<SLUG>_BASE_URL` or `providers.toml`. The `base_url` must be `https`, or `http` on loopback. See [plugin egress](/docs/permissions/#plugin-egress-net-hosts) for the pattern syntax.
 
 The [Lua API](/docs/lua-api/#maki-provider-register) lists every field. This section explains the choices.
+
+### Select a provider package
+
+Models.dev is a public metadata catalog. Maki uses its connection metadata to build generic clients for providers it does not implement locally. A package can supply its own discovery and request policy for one of those names when you select it in `providers.toml`:
+
+```toml
+[acme]
+plugin = "acme-provider"
+```
+
+Use the installed package's name. This selects the package that may receive the existing credentials saved under `acme`. Other packages cannot register that name. Compiled and bundled provider names remain reserved. An entry cannot select both a `plugin` and a custom `protocol`.
+
+The setting grants no permissions. Install and approve the package as usual. A selected package that is missing, fails to load, or no longer registers the provider makes that provider unavailable. Maki does not silently use a generic catalog client in its place. Changing the selection blocks later requests from the previous owner. Requests already in progress keep their normal lifetime.
+
+Remove `plugin` to restore the default catalog fallback. Reload plugins or restart Maki after selecting a package, so it can register its provider. Optional providers in a larger package can check the selection before registering:
+
+```lua
+if not maki.provider.is_selected("acme") then
+  return
+end
+-- Register the provider here.
+```
 
 ### codec or base
 
