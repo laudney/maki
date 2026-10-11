@@ -17,7 +17,7 @@ use tracing::error;
 use crate::agent::{self, RunContext, RunContextBuilder};
 use crate::cancel::{CancelMap, CancelToken};
 use crate::permissions::{PermissionManager, PluginRuleStore};
-use crate::prompt::ResolvedSlots;
+use crate::prompt::ResolvedPrompts;
 use crate::session::{Resumed, SessionTrack};
 use crate::template;
 use crate::tools::{FileAccess, LocalTools, RequestTools, ToolAudience, ToolRegistry};
@@ -56,7 +56,7 @@ pub struct HeadlessParams {
     pub timeouts: Timeouts,
     pub prompt: String,
     pub images: Vec<ImageSource>,
-    pub prompt_slots: ResolvedSlots,
+    pub prompt_slots: ResolvedPrompts,
     pub excluded_tools: Vec<&'static str>,
     pub mcp_handle: Option<McpHandle>,
     pub initial_wd: PathBuf,
@@ -87,7 +87,7 @@ pub struct HeadlessHandle {
 struct ContextSpec {
     vars: template::Vars,
     instructions: String,
-    slots: Arc<ResolvedSlots>,
+    slots: Arc<ResolvedPrompts>,
     config: AgentConfig,
     excluded_tools: Vec<&'static str>,
     mcp: bool,
@@ -101,7 +101,7 @@ impl ContextSpec {
     fn new(
         vars: template::Vars,
         instructions: &agent::Instructions,
-        slots: Arc<ResolvedSlots>,
+        slots: Arc<ResolvedPrompts>,
         config: AgentConfig,
         excluded_tools: Vec<&'static str>,
         mcp: Option<&McpHandle>,
@@ -129,7 +129,9 @@ impl ContextSpec {
             self.mcp,
         );
         let mut context = match &self.system_override {
-            Some(system) => RunContext::fixed(system.clone(), tools),
+            Some(system) => {
+                RunContext::fixed(system.clone(), tools).with_prompt_policy(&self.slots)
+            }
             None => RunContext::render(&self.vars, &self.instructions, &self.slots, model, tools),
         };
         if let Some(append) = &self.append_system {
@@ -268,7 +270,7 @@ pub struct InteractiveParams {
     pub config: AgentConfig,
     pub permissions_config: PermissionsConfig,
     pub timeouts: Timeouts,
-    pub prompt_slots: Arc<ResolvedSlots>,
+    pub prompt_slots: Arc<ResolvedPrompts>,
     pub excluded_tools: Vec<&'static str>,
     pub mcp_handle: Option<McpHandle>,
     pub initial_wd: PathBuf,
@@ -519,7 +521,7 @@ mod tests {
     #[test_case(None, true ; "rendered_prompt_states_them")]
     #[test_case(Some("custom"), false ; "override_leaves_them_out")]
     fn override_states_no_facts(system_override: Option<&str>, tracked: bool) {
-        let mut slots = ResolvedSlots::default();
+        let mut slots = ResolvedPrompts::default();
         slots.insert(
             PromptId::System,
             Slot::AfterInstructions,
@@ -549,6 +551,37 @@ mod tests {
             facts.is_some_and(|f| !f.instructions.is_empty() && !f.hints.is_empty()),
             tracked
         );
+    }
+
+    #[test_case(None, "You analyse information." ; "plugin_template")]
+    #[test_case(Some("Explicit SDK policy."), "Explicit SDK policy." ; "sdk_precedence")]
+    fn headless_prompt_replacement_keeps_explicit_sdk_precedence(
+        explicit: Option<&str>,
+        expected: &str,
+    ) {
+        const PLUGIN_SYSTEM: &str = "You analyse information.";
+        const OMITTED_INSTRUCTIONS: &str = "Project instructions must not be appended.";
+        let mut prompts = ResolvedPrompts::default();
+        prompts.set_template(PromptId::System, PLUGIN_SYSTEM.into());
+        let spec = ContextSpec {
+            system_override: explicit.map(String::from),
+            ..ContextSpec::new(
+                template::Vars::new(),
+                &agent::Instructions {
+                    text: OMITTED_INSTRUCTIONS.into(),
+                    ..Default::default()
+                },
+                Arc::new(prompts),
+                AgentConfig::default(),
+                Vec::new(),
+                None,
+            )
+        };
+        let model = Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap();
+        let context = spec.render(&model, false);
+        assert_eq!(context.system, expected);
+        assert!(context.facts.is_none());
+        assert!(!context.system.contains(OMITTED_INSTRUCTIONS));
     }
 
     #[test]

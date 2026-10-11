@@ -3,6 +3,8 @@ use std::sync::Arc;
 
 use strum::{Display, EnumIter, EnumString, IntoEnumIterator};
 
+use crate::template::Vars;
+
 pub trait ValidNames: IntoEnumIterator + std::fmt::Display {
     fn valid_names() -> String {
         Self::iter()
@@ -18,23 +20,17 @@ pub const RESEARCH_PROMPT: &str = include_str!("prompts/research.md");
 pub const GENERAL_PROMPT: &str = include_str!("prompts/general.md");
 pub const COMPACTION_SYSTEM: &str = include_str!("prompts/compaction.md");
 pub const COMPACTION_USER: &str = include_str!("prompts/compaction_user.md");
-
 pub const PLAN_ENDED: &str = include_str!("prompts/plan_end.md");
 pub const CONTINUATION: &str = include_str!("prompts/continuation.md");
 pub const BTW_FALLBACK: &str = include_str!("prompts/btw_fallback.md");
 pub const DEFAULT_IDENTITY: &str = include_str!("prompts/system_identity.md");
 pub const DEFAULT_TONE: &str = include_str!("prompts/system_tone.md");
 
-const NATIVE_EFFICIENT_TOOLS: &[&str] = &["batch", "code_execution", "task"];
-const INSTRUCTIONS_MARKER: &str = "{{instructions}}";
+const DEFAULT_EFFICIENT_TOOLS: &str = include_str!("prompts/efficient_tools.md");
+const INSTRUCTIONS_MARKER: &str = "instructions";
 
-/// Singleton: alphabetically last plugin wins, discarding all prior content
-/// and built-in defaults.  Used for slots with opinionated defaults where
-/// multiple contributors would conflict (identity, tone).
-///
-/// Aggregate: all entries are joined.  Used for genuinely additive slots
-/// where multiple plugins contributing is the point (tool usage hints,
-/// efficient tools, after-instructions).
+/// Singleton slots retain only the last contribution. Aggregate slots append
+/// every contribution to the selected section default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, EnumString, Display)]
 #[strum(serialize_all = "snake_case")]
 pub enum SlotKind {
@@ -51,6 +47,8 @@ pub enum Slot {
     EfficientTools,
     Conventions,
     AfterInstructions,
+    Objectivity,
+    Completion,
 }
 
 impl Slot {
@@ -62,23 +60,20 @@ impl Slot {
             Slot::EfficientTools => "{{efficient_tools}}",
             Slot::Conventions => "{{conventions}}",
             Slot::AfterInstructions => "{{after_instructions}}",
+            Slot::Objectivity => "{{objectivity}}",
+            Slot::Completion => "{{completion}}",
         }
     }
 
     pub fn kind(self) -> SlotKind {
         match self {
             Slot::Identity | Slot::Tone => SlotKind::Singleton,
-            Slot::ToolUsage
-            | Slot::EfficientTools
-            | Slot::Conventions
-            | Slot::AfterInstructions => SlotKind::Aggregate,
+            _ => SlotKind::Aggregate,
         }
     }
 
-    /// Built-in default content for singleton slots.  When no plugin
-    /// registers content for a singleton slot, the default is used.
-    /// Aggregate slots have no default (the template carries the static
-    /// text around the marker).
+    /// Legacy main-prompt singleton defaults. Catalogue rendering selects
+    /// prompt-specific defaults for children instead.
     pub fn default_content(self) -> Option<&'static str> {
         match self {
             Slot::Identity => Some(DEFAULT_IDENTITY),
@@ -102,10 +97,62 @@ pub enum PromptId {
     System,
     Research,
     General,
+    Plan,
+    PlanEnd,
+    CompactionSystem,
+    CompactionUser,
+    Continuation,
+    BtwFallback,
 }
 
 impl PromptId {
+    /// Default targets for registrations that omit an explicit prompt list.
     pub const ALL: &[PromptId] = &[PromptId::System, PromptId::Research, PromptId::General];
+
+    fn template(self) -> &'static str {
+        match self {
+            PromptId::System => SYSTEM_PROMPT,
+            PromptId::Research => RESEARCH_PROMPT,
+            PromptId::General => GENERAL_PROMPT,
+            PromptId::Plan => PLAN_PROMPT,
+            PromptId::PlanEnd => PLAN_ENDED,
+            PromptId::CompactionSystem => COMPACTION_SYSTEM,
+            PromptId::CompactionUser => COMPACTION_USER,
+            PromptId::Continuation => CONTINUATION,
+            PromptId::BtwFallback => BTW_FALLBACK,
+        }
+    }
+
+    /// Whether a section is present in this prompt's built-in template.
+    pub fn has_slot(self, slot: Slot) -> bool {
+        self.template().contains(slot.marker())
+    }
+
+    fn default_section(self, slot: Slot) -> &'static str {
+        match (self, slot) {
+            (PromptId::System, Slot::Identity) => DEFAULT_IDENTITY,
+            (PromptId::System, Slot::Tone) => DEFAULT_TONE,
+            (PromptId::System, Slot::Objectivity) => include_str!("prompts/system_objectivity.md"),
+            (PromptId::System, Slot::ToolUsage) => include_str!("prompts/system_tool_usage.md"),
+            (PromptId::System, Slot::Conventions) => include_str!("prompts/system_conventions.md"),
+            (PromptId::System, Slot::Completion) => include_str!("prompts/system_completion.md"),
+            (PromptId::Research, Slot::Identity) => include_str!("prompts/research_identity.md"),
+            (PromptId::Research, Slot::Tone) => include_str!("prompts/research_tone.md"),
+            (PromptId::Research, Slot::ToolUsage) => include_str!("prompts/research_tool_usage.md"),
+            (PromptId::Research, Slot::Completion) => {
+                include_str!("prompts/research_completion.md")
+            }
+            (PromptId::General, Slot::Identity) => include_str!("prompts/general_identity.md"),
+            (PromptId::General, Slot::Tone) => include_str!("prompts/general_tone.md"),
+            (PromptId::General, Slot::ToolUsage) => include_str!("prompts/general_tool_usage.md"),
+            (PromptId::General, Slot::Conventions) => {
+                include_str!("prompts/general_conventions.md")
+            }
+            (PromptId::General, Slot::Completion) => include_str!("prompts/general_completion.md"),
+            (_, Slot::EfficientTools) => DEFAULT_EFFICIENT_TOOLS,
+            _ => "",
+        }
+    }
 }
 
 impl ValidNames for Slot {}
@@ -117,11 +164,13 @@ pub struct SlotEntry {
 }
 
 #[derive(Default)]
-pub struct ResolvedSlots {
+pub struct ResolvedPrompts {
     entries: HashMap<(PromptId, Slot), Vec<SlotEntry>>,
+    templates: HashMap<PromptId, String>,
+    sections: HashMap<(PromptId, Slot), String>,
 }
 
-impl ResolvedSlots {
+impl ResolvedPrompts {
     pub fn get(&self, prompt: PromptId, slot: Slot) -> &[SlotEntry] {
         self.entries
             .get(&(prompt, slot))
@@ -132,94 +181,128 @@ impl ResolvedSlots {
     pub fn insert(&mut self, prompt: PromptId, slot: Slot, entry: SlotEntry) {
         self.entries.entry((prompt, slot)).or_default().push(entry);
     }
-}
 
-impl PromptId {
-    fn template(self) -> &'static str {
-        match self {
-            PromptId::System => SYSTEM_PROMPT,
-            PromptId::Research => RESEARCH_PROMPT,
-            PromptId::General => GENERAL_PROMPT,
+    pub fn set_template(&mut self, prompt: PromptId, content: String) {
+        self.templates.insert(prompt, content);
+    }
+
+    pub fn set_section(&mut self, prompt: PromptId, slot: Slot, content: String) {
+        self.sections.insert((prompt, slot), content);
+    }
+
+    pub fn has_template(&self, prompt: PromptId) -> bool {
+        self.templates.contains_key(&prompt)
+    }
+
+    pub fn has_replacements(&self) -> bool {
+        !self.templates.is_empty() || !self.sections.is_empty()
+    }
+
+    pub fn has_slot(&self, prompt: PromptId, slot: Slot) -> bool {
+        self.template(prompt).contains(slot.marker())
+    }
+
+    pub fn template(&self, prompt: PromptId) -> &str {
+        self.templates
+            .get(&prompt)
+            .map(String::as_str)
+            .unwrap_or_else(|| prompt.template())
+    }
+
+    /// Static authored policy, in catalogue order. Lengths prevent text or
+    /// delimiters in content from making distinct policies share a key.
+    pub fn policy_key(&self) -> String {
+        let mut key = String::new();
+        for prompt in PromptId::iter() {
+            if let Some(content) = self.templates.get(&prompt) {
+                key.push_str(&format!("template:{prompt}:{}:{content};", content.len()));
+            }
+            for slot in Slot::iter() {
+                if let Some(content) = self.sections.get(&(prompt, slot)) {
+                    key.push_str(&format!(
+                        "section:{prompt}:{slot}:{}:{content};",
+                        content.len()
+                    ));
+                }
+            }
         }
+        key
     }
 
-    /// A slot exists for this prompt iff its marker is present in the template.
-    /// Markers that are absent get no content (and we warn at collection time
-    /// when a plugin targets them explicitly).
-    pub fn has_slot(self, slot: Slot) -> bool {
-        self.template().contains(slot.marker())
-    }
-}
-
-fn render_slot(slots: &ResolvedSlots, prompt: PromptId, slot: Slot) -> String {
-    if slot == Slot::EfficientTools {
-        return render_efficient_tools(slots, prompt);
-    }
-    let entries = slots.get(prompt, slot);
-    match slot.kind() {
-        SlotKind::Singleton => {
-            if let Some(last) = entries.last() {
-                last.content.clone()
-            } else if let Some(default) = slot.default_content() {
-                default.to_string()
+    /// Expand only the template's variables and insertion points. Inserted
+    /// plugin text and project instructions are never recursively rendered.
+    pub fn render(&self, prompt: PromptId, vars: &Vars, instructions: &str) -> String {
+        let mut remaining = self.template(prompt);
+        let mut out = String::with_capacity(remaining.len());
+        while let Some(open) = remaining.find("{{") {
+            out.push_str(&vars.apply(&remaining[..open]));
+            let marker = &remaining[open..];
+            let Some(close) = marker.find("}}") else {
+                out.push_str(&vars.apply(marker));
+                return out;
+            };
+            let name = &marker[2..close];
+            remaining = &marker[close + 2..];
+            if name == INSTRUCTIONS_MARKER {
+                out.push_str(instructions);
+            } else if let Ok(slot) = name.parse::<Slot>() {
+                let content = self.section(prompt, slot);
+                out.push_str(&content);
+                if content.is_empty() {
+                    remaining = remaining.strip_prefix('\n').unwrap_or(remaining);
+                }
             } else {
-                String::new()
+                out.push_str(&vars.apply(&marker[..close + 2]));
             }
         }
-        // Aggregate slots have no built-in defaults; content comes entirely from plugins.
-        SlotKind::Aggregate => {
-            let mut parts = Vec::new();
-            for entry in entries {
-                parts.push(entry.content.as_str());
-            }
-            parts.join("\n")
+        out.push_str(&vars.apply(remaining));
+        out
+    }
+
+    /// Effective section content, including its default and contributions.
+    pub fn section(&self, prompt: PromptId, slot: Slot) -> String {
+        let entries = self.get(prompt, slot);
+        let replacement = self.sections.get(&(prompt, slot));
+        let default = replacement
+            .map(String::as_str)
+            .unwrap_or_else(|| prompt.default_section(slot));
+        if slot.kind() == SlotKind::Singleton {
+            return entries
+                .last()
+                .map(|entry| entry.content.as_str())
+                .unwrap_or(default)
+                .to_string();
         }
+        if slot == Slot::EfficientTools && replacement.is_none() && !entries.is_empty() {
+            let extras = entries
+                .iter()
+                .map(|entry| entry.content.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return format!("{}, {extras}.", default.trim_end_matches('.'));
+        }
+        std::iter::once(default)
+            .chain(entries.iter().map(|entry| entry.content.as_str()))
+            .filter(|content| !content.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 }
 
-fn render_efficient_tools(slots: &ResolvedSlots, prompt: PromptId) -> String {
-    let extras = slots.get(prompt, Slot::EfficientTools);
-    let names = NATIVE_EFFICIENT_TOOLS
-        .iter()
-        .copied()
-        .chain(extras.iter().map(|e| e.content.as_str()))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("Most efficient tools: {names}.")
-}
-
-/// Fill each `{{slot}}` marker in the template with its rendered content and
-/// drop the project instructions (AGENTS.md and friends) into `{{instructions}}`.
-pub fn assemble(id: PromptId, slots: &ResolvedSlots, instructions: &str) -> String {
-    let mut out = id.template().to_string();
-    for slot in Slot::iter() {
-        out = fill_marker(&out, slot.marker(), &render_slot(slots, id, slot));
-    }
-    out.replace(INSTRUCTIONS_MARKER, instructions)
-}
-
-/// Replace a slot marker with its content. When the content is empty, also drop
-/// the marker's own line (the trailing newline) so empty slots leave no blank
-/// gap, without touching any other whitespace in the prompt.
-fn fill_marker(template: &str, marker: &str, content: &str) -> String {
-    if content.is_empty() {
-        return template
-            .replace(&format!("{marker}\n"), "")
-            .replace(marker, "");
-    }
-    template.replace(marker, content)
+/// Render without environment variables, for callers that supply none.
+pub fn assemble(id: PromptId, prompts: &ResolvedPrompts, instructions: &str) -> String {
+    prompts.render(id, &Vars::default(), instructions)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::template::Vars;
     use test_case::test_case;
 
     const NATIVE_EFFICIENT_LINE: &str = "Most efficient tools: batch, code_execution, task";
 
-    fn slots(prompt: PromptId, entries: &[(Slot, &str)]) -> ResolvedSlots {
-        let mut slots = ResolvedSlots::default();
+    fn slots(prompt: PromptId, entries: &[(Slot, &str)]) -> ResolvedPrompts {
+        let mut slots = ResolvedPrompts::default();
         for &(slot, content) in entries {
             slots.insert(
                 prompt,
@@ -240,7 +323,7 @@ mod tests {
 
     #[test]
     fn empty_slots_emit_template_and_native_efficient_line() {
-        let out = assemble(PromptId::System, &ResolvedSlots::default(), "");
+        let out = assemble(PromptId::System, &ResolvedPrompts::default(), "");
         assert!(out.starts_with("You are Maki"));
         assert!(
             !out.contains("{{"),
@@ -316,7 +399,7 @@ mod tests {
     /// but never leaks into the subagent prompts.
     #[test]
     fn after_instructions_only_reaches_system() {
-        let mut s = ResolvedSlots::default();
+        let mut s = ResolvedPrompts::default();
         for &pid in PromptId::ALL {
             s.insert(
                 pid,
@@ -354,11 +437,11 @@ mod tests {
     #[test_case(PromptId::System, Slot::Tone, true ; "system_tone")]
     #[test_case(PromptId::Research, Slot::Conventions, false ; "research_no_conventions")]
     #[test_case(PromptId::Research, Slot::AfterInstructions, false ; "research_no_after")]
-    #[test_case(PromptId::Research, Slot::Identity, false ; "research_no_identity")]
-    #[test_case(PromptId::Research, Slot::Tone, false ; "research_no_tone")]
+    #[test_case(PromptId::Research, Slot::Identity, true ; "research_identity")]
+    #[test_case(PromptId::Research, Slot::Tone, true ; "research_tone")]
     #[test_case(PromptId::General, Slot::AfterInstructions, false ; "general_no_after")]
-    #[test_case(PromptId::General, Slot::Identity, false ; "general_no_identity")]
-    #[test_case(PromptId::General, Slot::Tone, false ; "general_no_tone")]
+    #[test_case(PromptId::General, Slot::Identity, true ; "general_identity")]
+    #[test_case(PromptId::General, Slot::Tone, true ; "general_tone")]
     fn has_slot(prompt: PromptId, slot: Slot, expected: bool) {
         assert_eq!(prompt.has_slot(slot), expected);
     }
@@ -389,13 +472,13 @@ mod tests {
 
     #[test]
     fn singleton_default_used_when_empty() {
-        let out = assemble(PromptId::System, &ResolvedSlots::default(), "");
+        let out = assemble(PromptId::System, &ResolvedPrompts::default(), "");
         assert!(out.starts_with("You are Maki"));
     }
 
     #[test]
     fn singleton_entry_replaces_default() {
-        let mut s = ResolvedSlots::default();
+        let mut s = ResolvedPrompts::default();
         s.insert(
             PromptId::System,
             Slot::Identity,
@@ -411,7 +494,7 @@ mod tests {
 
     #[test]
     fn singleton_last_entry_wins() {
-        let mut s = ResolvedSlots::default();
+        let mut s = ResolvedPrompts::default();
         s.insert(
             PromptId::System,
             Slot::Identity,
@@ -435,22 +518,22 @@ mod tests {
     }
 
     #[test]
-    fn identity_only_in_system_not_subagents() {
-        assert!(PromptId::System.has_slot(Slot::Identity));
-        assert!(!PromptId::Research.has_slot(Slot::Identity));
-        assert!(!PromptId::General.has_slot(Slot::Identity));
+    fn identity_is_overridable_in_all_conversational_prompts() {
+        for &id in PromptId::ALL {
+            assert!(id.has_slot(Slot::Identity));
+        }
     }
 
     #[test]
-    fn tone_only_in_system_not_subagents() {
-        assert!(PromptId::System.has_slot(Slot::Tone));
-        assert!(!PromptId::Research.has_slot(Slot::Tone));
-        assert!(!PromptId::General.has_slot(Slot::Tone));
+    fn tone_is_overridable_in_all_conversational_prompts() {
+        for &id in PromptId::ALL {
+            assert!(id.has_slot(Slot::Tone));
+        }
     }
 
     #[test]
     fn conventions_entry_appends_to_template_defaults() {
-        let mut s = ResolvedSlots::default();
+        let mut s = ResolvedPrompts::default();
         s.insert(
             PromptId::System,
             Slot::Conventions,
@@ -467,29 +550,146 @@ mod tests {
     #[test_case(PromptId::System, include_str!("prompts/tests/system.md") ; "system")]
     #[test_case(PromptId::Research, include_str!("prompts/tests/research.md") ; "research")]
     #[test_case(PromptId::General, include_str!("prompts/tests/general.md") ; "general")]
+    #[test_case(PromptId::Plan, include_str!("prompts/tests/plan.md") ; "plan")]
+    #[test_case(PromptId::PlanEnd, include_str!("prompts/tests/plan_end.md") ; "plan_end")]
+    #[test_case(PromptId::CompactionSystem, include_str!("prompts/tests/compaction.md") ; "compaction_system")]
+    #[test_case(PromptId::CompactionUser, include_str!("prompts/tests/compaction_user.md") ; "compaction_user")]
+    #[test_case(PromptId::Continuation, include_str!("prompts/tests/continuation.md") ; "continuation")]
+    #[test_case(PromptId::BtwFallback, include_str!("prompts/tests/btw_fallback.md") ; "btw_fallback")]
     fn defaults_preserve_pre_catalogue_bytes(id: PromptId, expected: &str) {
-        let vars = Vars::new().set(
-            "{environment}",
-            "Environment:\n- Working directory: /example\n- Platform: example\n- Date: 2000-01-01",
-        );
+        let vars = Vars::new()
+            .set("{environment}", "Environment:\n- Working directory: /example\n- Platform: example\n- Date: 2000-01-01")
+            .set("{plan_path}", "/example/plan.md");
         assert_eq!(
-            vars.apply(&assemble(
-                id,
-                &ResolvedSlots::default(),
-                "\n\nEXAMPLE_INSTRUCTIONS"
-            )),
+            ResolvedPrompts::default().render(id, &vars, "\n\nEXAMPLE_INSTRUCTIONS"),
             expected
         );
     }
 
-    #[test_case(PLAN_PROMPT, include_str!("prompts/tests/plan.md") ; "plan")]
-    #[test_case(PLAN_ENDED, include_str!("prompts/tests/plan_end.md") ; "plan_end")]
-    #[test_case(COMPACTION_SYSTEM, include_str!("prompts/tests/compaction.md") ; "compaction_system")]
-    #[test_case(COMPACTION_USER, include_str!("prompts/tests/compaction_user.md") ; "compaction_user")]
-    #[test_case(CONTINUATION, include_str!("prompts/tests/continuation.md") ; "continuation")]
-    #[test_case(BTW_FALLBACK, include_str!("prompts/tests/btw_fallback.md") ; "btw_fallback")]
-    fn fixed_defaults_preserve_pre_catalogue_bytes(prompt: &str, expected: &str) {
-        let vars = Vars::new().set("{plan_path}", "/example/plan.md");
-        assert_eq!(vars.apply(prompt), expected);
+    #[test]
+    fn section_replacement_removes_default_and_preserves_additive_hints() {
+        const REPLACEMENT: &str = "- Cite evidence.";
+        const HINT: &str = "- Additional guidance.";
+        let mut prompts = slots(PromptId::System, &[(Slot::Conventions, HINT)]);
+        prompts.set_section(PromptId::System, Slot::Conventions, REPLACEMENT.into());
+        let out = assemble(PromptId::System, &prompts, "");
+        assert!(!out.contains("Never assume a library is available"));
+        assert!(out.contains(&format!("{REPLACEMENT}\n{HINT}")));
+    }
+
+    #[test]
+    fn efficient_tools_default_can_be_removed_without_dropping_hints() {
+        const EXTRA: &str = "search";
+        let mut prompts = slots(PromptId::System, &[(Slot::EfficientTools, EXTRA)]);
+        prompts.set_section(PromptId::System, Slot::EfficientTools, String::new());
+        let out = assemble(PromptId::System, &prompts, "");
+        assert!(!out.contains(NATIVE_EFFICIENT_LINE));
+        assert!(out.contains(&format!("\n{EXTRA}\n")));
+    }
+
+    #[test]
+    fn empty_section_is_distinct_from_missing_section() {
+        let mut prompts = ResolvedPrompts::default();
+        prompts.set_section(PromptId::System, Slot::Identity, String::new());
+        let out = assemble(PromptId::System, &prompts, "");
+        assert!(!out.contains("You are Maki"));
+        assert!(!out.starts_with("\n\n"));
+        assert!(prompts.has_replacements());
+        assert!(!prompts.policy_key().is_empty());
+    }
+
+    #[test]
+    fn complete_template_contains_only_explicit_insertions() {
+        const TEMPLATE: &str = "You analyse evidence.";
+        let mut prompts = slots(PromptId::System, &[(Slot::ToolUsage, "IGNORED_HINT")]);
+        prompts.set_template(PromptId::System, TEMPLATE.into());
+        assert_eq!(
+            assemble(PromptId::System, &prompts, "IGNORED_INSTRUCTIONS"),
+            TEMPLATE
+        );
+        assert!(!prompts.has_slot(PromptId::System, Slot::ToolUsage));
+        prompts.set_template(PromptId::System, String::new());
+        assert!(prompts.has_template(PromptId::System));
+        assert_eq!(
+            assemble(PromptId::System, &prompts, "IGNORED_INSTRUCTIONS"),
+            ""
+        );
+    }
+
+    #[test]
+    fn whole_and_section_replacements_compose_in_either_order() {
+        const TEMPLATE: &str = "{{objectivity}}\n{{instructions}}";
+        const SECTION: &str = "Follow the evidence.";
+        let mut first = ResolvedPrompts::default();
+        first.set_template(PromptId::Research, TEMPLATE.into());
+        first.set_section(PromptId::Research, Slot::Objectivity, SECTION.into());
+        let mut second = ResolvedPrompts::default();
+        second.set_section(PromptId::Research, Slot::Objectivity, SECTION.into());
+        second.set_template(PromptId::Research, TEMPLATE.into());
+        assert!(first.has_slot(PromptId::Research, Slot::Objectivity));
+        assert_eq!(
+            assemble(PromptId::Research, &first, "INSTRUCTIONS"),
+            format!("{SECTION}\nINSTRUCTIONS")
+        );
+        assert_eq!(first.policy_key(), second.policy_key());
+        assert_eq!(
+            assemble(PromptId::Research, &first, "INSTRUCTIONS"),
+            assemble(PromptId::Research, &second, "INSTRUCTIONS")
+        );
+    }
+
+    #[test]
+    fn inserted_content_is_not_interpreted_as_template_text() {
+        const SECTION: &str = "{environment} {{tone}} {{instructions}}";
+        const INSTRUCTIONS: &str = "{environment} {{identity}}";
+        let vars = Vars::new().set("{environment}", "ENVIRONMENT");
+        let mut prompts = slots(PromptId::System, &[(Slot::ToolUsage, SECTION)]);
+        prompts.set_template(
+            PromptId::System,
+            "{environment}\n{{tool_usage}}\n{{instructions}}".into(),
+        );
+        prompts.set_section(PromptId::System, Slot::ToolUsage, String::new());
+        assert_eq!(
+            prompts.render(PromptId::System, &vars, INSTRUCTIONS),
+            format!("ENVIRONMENT\n{SECTION}\n{INSTRUCTIONS}")
+        );
+    }
+
+    #[test]
+    fn policy_covers_all_static_replacements_but_not_legacy_hints() {
+        let mut prompts = slots(PromptId::System, &[(Slot::Identity, "Legacy identity")]);
+        assert!(prompts.policy_key().is_empty());
+        assert!(!prompts.has_replacements());
+        let mut keys = Vec::new();
+        for id in PromptId::iter() {
+            prompts.set_template(id, String::new());
+            let key = prompts.policy_key();
+            assert!(!key.is_empty());
+            assert!(!keys.contains(&key));
+            keys.push(key);
+        }
+        prompts.set_section(PromptId::System, Slot::Objectivity, String::new());
+        assert!(!keys.contains(&prompts.policy_key()));
+    }
+
+    #[test]
+    fn legacy_singleton_last_entry_still_wins_with_static_section() {
+        let mut prompts = slots(PromptId::System, &[(Slot::Identity, "Legacy identity")]);
+        prompts.set_section(PromptId::System, Slot::Identity, "Static identity".into());
+        prompts.set_template(PromptId::System, "{{identity}}".into());
+        assert_eq!(assemble(PromptId::System, &prompts, ""), "Legacy identity");
+    }
+
+    #[test]
+    fn variable_values_cannot_add_insertion_points() {
+        const ENVIRONMENT: &str = "Working directory: {{identity}}";
+        let vars = Vars::new().set("{environment}", ENVIRONMENT);
+        let mut prompts = ResolvedPrompts::default();
+        prompts.set_template(PromptId::System, "{environment}\n{{identity}}".into());
+        prompts.set_section(PromptId::System, Slot::Identity, "Selected identity".into());
+        assert_eq!(
+            prompts.render(PromptId::System, &vars, ""),
+            format!("{ENVIRONMENT}\nSelected identity")
+        );
     }
 }

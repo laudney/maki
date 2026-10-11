@@ -28,7 +28,7 @@ use crate::runtime::{
     self, ClickFallback, ConfigScope, EndSession, LoadChunk, LoadContext, LuaThread, Request,
     RestoreItem,
 };
-use maki_agent::prompt::ResolvedSlots;
+use maki_agent::prompt::ResolvedPrompts;
 use maki_storage::id::MakiId;
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -1149,7 +1149,7 @@ impl EventHandle {
         });
     }
 
-    pub fn collect_prompt_slots(&self) -> ResolvedSlots {
+    pub fn collect_prompt_slots(&self) -> ResolvedPrompts {
         let (tx, rx) = flume::bounded(1);
         let _ = self.tx.send(Request::CollectPromptSlots { reply: tx });
         rx.recv().unwrap_or_default()
@@ -1169,7 +1169,7 @@ impl EventHandle {
         Ok(crate::pack::PackContext::new(declared, installed, active))
     }
 
-    pub async fn collect_prompt_slots_async(&self) -> ResolvedSlots {
+    pub async fn collect_prompt_slots_async(&self) -> ResolvedPrompts {
         let (tx, rx) = flume::bounded(1);
         let _ = self.tx.send(Request::CollectPromptSlots { reply: tx });
         rx.recv_async().await.unwrap_or_default()
@@ -1327,7 +1327,7 @@ mod tests {
     use crate::api::keymap::TAKEN_ERR;
     use crate::api::util::command::{LuaCommandInfo, LuaCommandWriter};
     use crossterm::event::KeyCode;
-    use maki_agent::prompt::{PromptId, ResolvedSlots, Slot};
+    use maki_agent::prompt::{PromptId, ResolvedPrompts, Slot};
     use maki_agent::tools::ToolRegistry;
     use std::time::Instant;
     use test_case::test_case;
@@ -1409,14 +1409,14 @@ mod tests {
 
     /// Load `src` as one plugin, collect resolved slots.
     /// Panics on failure; use `load_err` to inspect errors.
-    fn slots_from(plugin: &str, src: &str) -> (PluginHost, ResolvedSlots) {
+    fn slots_from(plugin: &str, src: &str) -> (PluginHost, ResolvedPrompts) {
         let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
         host.load_source(plugin, src).unwrap();
         let slots = host.event_handle().collect_prompt_slots();
         (host, slots)
     }
 
-    fn contents(slots: &ResolvedSlots, prompt: PromptId, slot: Slot) -> Vec<&str> {
+    fn contents(slots: &ResolvedPrompts, prompt: PromptId, slot: Slot) -> Vec<&str> {
         slots
             .get(prompt, slot)
             .iter()
@@ -2014,7 +2014,7 @@ mod tests {
     }
 
     #[test]
-    fn identity_slot_lands_on_system_only() {
+    fn identity_slot_defaults_to_conversational_prompts() {
         let (_host, slots) = slots_from(
             "id",
             r#"
@@ -2024,16 +2024,13 @@ mod tests {
             })
             "#,
         );
-        assert_eq!(
-            contents(&slots, PromptId::System, Slot::Identity),
-            ["Custom identity"]
-        );
-        assert!(contents(&slots, PromptId::Research, Slot::Identity).is_empty());
-        assert!(contents(&slots, PromptId::General, Slot::Identity).is_empty());
+        for &pid in PromptId::ALL {
+            assert_eq!(contents(&slots, pid, Slot::Identity), ["Custom identity"]);
+        }
     }
 
     #[test]
-    fn tone_slot_lands_on_system_only() {
+    fn tone_slot_defaults_to_conversational_prompts() {
         let (_host, slots) = slots_from(
             "tone",
             r#"
@@ -2043,12 +2040,9 @@ mod tests {
             })
             "#,
         );
-        assert_eq!(
-            contents(&slots, PromptId::System, Slot::Tone),
-            ["Custom tone"]
-        );
-        assert!(contents(&slots, PromptId::Research, Slot::Tone).is_empty());
-        assert!(contents(&slots, PromptId::General, Slot::Tone).is_empty());
+        for &pid in PromptId::ALL {
+            assert_eq!(contents(&slots, pid, Slot::Tone), ["Custom tone"]);
+        }
     }
 
     #[test]
@@ -2111,6 +2105,8 @@ mod tests {
             contents(&slots, PromptId::System, Slot::Identity),
             ["Explicit identity"]
         );
+        assert!(contents(&slots, PromptId::Research, Slot::Identity).is_empty());
+        assert!(contents(&slots, PromptId::General, Slot::Identity).is_empty());
     }
 
     #[test]
@@ -2178,7 +2174,7 @@ mod tests {
         let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
         let r = host.load_source(
             "bad",
-            r#"maki.api.set_prompt({ slot = "identity", prompt = "research", content = "x" })"#,
+            r#"maki.api.set_prompt({ slot = "identity", prompt = "plan", content = "x" })"#,
         );
         assert!(r.is_err());
         assert!(r.unwrap_err().to_string().contains("not available"));

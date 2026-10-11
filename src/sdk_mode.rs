@@ -20,7 +20,7 @@ use flume::Sender;
 use maki_agent::headless::{self, InteractiveHandle, InteractiveParams};
 use maki_agent::mcp;
 use maki_agent::permissions::{PermissionAnswer, PluginRuleStore, TaggedAnswer};
-use maki_agent::prompt::ResolvedSlots;
+use maki_agent::prompt::ResolvedPrompts;
 use maki_agent::session::Resumed;
 use maki_agent::tools::QUESTION_TOOL_NAME;
 use maki_agent::{
@@ -455,7 +455,7 @@ pub struct SdkParams {
     pub config: AgentConfig,
     pub permissions_config: PermissionsConfig,
     pub timeouts: Timeouts,
-    pub prompt_slots: ResolvedSlots,
+    pub prompt_slots: ResolvedPrompts,
     pub defaults: SessionDefaults,
     pub model_policy: Arc<ModelPolicy>,
     pub plugin_rules: Arc<PluginRuleStore>,

@@ -5,7 +5,7 @@ use maki_agent::agent::{self, AgentHooks};
 use maki_agent::mcp::config::McpServerStatus;
 use maki_agent::mcp::{McpHandle, McpSession};
 use maki_agent::permissions::PermissionManager;
-use maki_agent::prompt::ResolvedSlots;
+use maki_agent::prompt::ResolvedPrompts;
 use maki_agent::session::Resumed;
 use maki_agent::template;
 use maki_agent::template::Vars;
@@ -206,7 +206,7 @@ impl AgentLoop {
     /// What a run would start with now. Every run and `/compact` take it from
     /// here, so the frame a compaction leaves behind is the one the next run
     /// keeps, not a near copy that costs it the cache.
-    async fn context_builder(&mut self) -> (RunContextBuilder, Arc<ResolvedSlots>) {
+    async fn context_builder(&mut self) -> (RunContextBuilder, Arc<ResolvedPrompts>) {
         let old_cwd = self.vars.apply("{cwd}").into_owned();
         self.vars = template::env_vars();
         if *self.vars.apply("{cwd}") != old_cwd {
@@ -231,7 +231,7 @@ impl AgentLoop {
         compaction: &Compaction,
         cancel: &CancelToken,
     ) -> Result<DoneReason, AgentError> {
-        let (context, _) = self.context_builder().await;
+        let (context, prompts) = self.context_builder().await;
         let slot = self.seed.model_slot.load();
         let (provider, model) = agent::resolve_compaction_model(
             &slot.provider,
@@ -261,6 +261,7 @@ impl AgentLoop {
             event_tx,
             &hooks,
             &self.seed.config,
+            &prompts,
             compaction.instructions.as_deref(),
             self.seed.timeouts.retry,
         )

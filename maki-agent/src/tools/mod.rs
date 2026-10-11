@@ -38,6 +38,7 @@ use crate::agent::{CallInstructions, LoadedInstructions};
 use crate::cancel::{CancelMap, CancelToken};
 use crate::mcp::McpSession;
 use crate::permissions::PermissionManager;
+use crate::prompt::ResolvedPrompts;
 use crate::{AgentConfig, AgentMode, EventSender, RunLedger, SharedBuf};
 use maki_config::{ModelPolicy, ToolOutputLines};
 use maki_providers::Model;
@@ -354,7 +355,7 @@ pub struct ToolContext {
     pub permissions: Arc<PermissionManager>,
     pub timeouts: maki_providers::Timeouts,
     pub file_access: Arc<FileAccess>,
-    pub prompt_slots: Arc<crate::prompt::ResolvedSlots>,
+    pub prompt_slots: Arc<ResolvedPrompts>,
     pub opts: RequestOptions,
     pub subagent_cancels: Arc<CancelMap<String>>,
     /// Shared with the run that spawned this tool, so a subagent's spend lands
@@ -589,7 +590,7 @@ pub fn interpreter_ctx(
         permissions,
         timeouts: maki_providers::Timeouts::default(),
         file_access,
-        prompt_slots: Arc::new(crate::prompt::ResolvedSlots::default()),
+        prompt_slots: Arc::new(ResolvedPrompts::default()),
         opts: RequestOptions::default(),
         subagent_cancels: Arc::new(CancelMap::new()),
         ledger: Arc::default(),

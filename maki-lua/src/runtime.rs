@@ -18,7 +18,7 @@ use event_listener::Event;
 use include_dir::Dir;
 use maki_agent::cancel::{CancelMap, CancelSlot, CancelToken};
 use maki_agent::permissions::PluginRuleStore;
-use maki_agent::prompt::{PromptId, ResolvedSlots, Slot, SlotEntry};
+use maki_agent::prompt::{PromptId, ResolvedPrompts, Slot, SlotEntry};
 use maki_agent::tools::hook::{Authority, Verdict};
 use maki_agent::tools::{
     HeaderResult, PermissionScopes, RegistryError, Tool, ToolLive, ToolRegistry, ToolSource,
@@ -450,7 +450,7 @@ pub enum Request {
         depth: u8,
     },
     CollectPromptSlots {
-        reply: flume::Sender<ResolvedSlots>,
+        reply: flume::Sender<ResolvedPrompts>,
     },
     CollectPluginOptions {
         reply: flume::Sender<PluginOptionSpecs>,
@@ -2817,7 +2817,7 @@ impl LuaRuntime {
         }
     }
 
-    async fn collect_prompt_slots(&self) -> ResolvedSlots {
+    async fn collect_prompt_slots(&self) -> ResolvedPrompts {
         struct Pending {
             plugin: Arc<str>,
             prompts: Option<Vec<PromptId>>,
@@ -2831,7 +2831,7 @@ impl LuaRuntime {
 
         let pending: Vec<Pending> = {
             let Some(map) = self.lua.app_data_ref::<PromptHintCallbacks>() else {
-                return ResolvedSlots::default();
+                return ResolvedPrompts::default();
             };
             map.iter()
                 .flat_map(|(plugin, regs)| {
@@ -2857,7 +2857,7 @@ impl LuaRuntime {
                 .collect()
         };
 
-        let mut slots = ResolvedSlots::default();
+        let mut slots = ResolvedPrompts::default();
         for item in pending {
             let content = match item.content {
                 PendingContent::Static(s) => Some(s),

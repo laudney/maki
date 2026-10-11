@@ -2,7 +2,8 @@ use std::sync::Arc;
 
 use flume::Sender;
 use futures_lite::future;
-use maki_agent::prompt::BTW_FALLBACK;
+use maki_agent::prompt::PromptId;
+use maki_agent::template;
 use maki_providers::provider::Provider;
 use maki_providers::{Message, Model, ProviderEvent, RequestOptions};
 use maki_storage::id::SessionRef;
@@ -43,21 +44,25 @@ impl App {
         let system = snapshot
             .as_ref()
             .and_then(|s| s.frame.as_ref())
-            .map_or_else(|| BTW_FALLBACK.to_string(), |f| f.system.clone());
+            .map(|f| f.system.clone());
         messages.push(btw_question(&question));
 
         let (tx, rx) = flume::bounded(64);
         self.btw_modal.open(&question, rx);
 
         let session_id = SessionRef::from(self.state.session.id);
-        smol::spawn(run_btw(
-            provider,
-            model,
-            system,
-            messages,
-            tx,
-            Some(session_id),
-        ))
+        let lua_handle = self.lua_event_handle.clone();
+        smol::spawn(async move {
+            let system = match system {
+                Some(system) => system,
+                None => lua_handle.collect_prompt_slots_async().await.render(
+                    PromptId::BtwFallback,
+                    &template::env_vars(),
+                    "",
+                ),
+            };
+            run_btw(provider, model, system, messages, tx, Some(session_id)).await;
+        })
         .detach();
     }
 }

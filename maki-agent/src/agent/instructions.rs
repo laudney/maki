@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::InstructionBlock;
 use crate::command::project_ancestor_dirs;
+use crate::prompt::{PromptId, ResolvedPrompts};
 use crate::template::Vars;
 use maki_providers::model::Model;
 
@@ -91,13 +92,17 @@ pub fn is_instruction_file(name: &str) -> bool {
 pub fn build_system_prompt(
     vars: &Vars,
     instructions: &str,
-    slots: &crate::prompt::ResolvedSlots,
+    slots: &ResolvedPrompts,
     model: &Model,
 ) -> String {
+    let vars = vars.clone().set("{model}", model.spec());
+    if slots.has_template(PromptId::System) {
+        return slots.render(PromptId::System, &vars, instructions);
+    }
     let env = vars.apply("\n\n{environment}");
     let env = format!("{env}\n- Model: {}", model.spec());
     let instructions = format!("{env}{instructions}");
-    crate::prompt::assemble(crate::prompt::PromptId::System, slots, &instructions)
+    slots.render(PromptId::System, &vars, &instructions)
 }
 
 fn read_unseen(path: &Path, loaded: &LoadedInstructions) -> Option<(PathBuf, String)> {
@@ -252,6 +257,7 @@ pub fn find_subdirectory_instructions(
 
 #[cfg(test)]
 mod tests {
+    use crate::prompt::{Slot, SlotEntry};
     use std::fs;
 
     use test_case::test_case;
@@ -263,15 +269,14 @@ mod tests {
 
     #[test]
     fn after_instructions_slot_lands_after_instructions() {
-        use std::sync::Arc;
         const INSTR: &str = "Project instructions here";
         const EXTRA: &str = "MEMORY_EXTRA";
         let vars = Vars::new().set("{cwd}", "/tmp").set("{platform}", "linux");
-        let mut slots = crate::prompt::ResolvedSlots::default();
+        let mut slots = ResolvedPrompts::default();
         slots.insert(
-            crate::prompt::PromptId::System,
-            crate::prompt::Slot::AfterInstructions,
-            crate::prompt::SlotEntry {
+            PromptId::System,
+            Slot::AfterInstructions,
+            SlotEntry {
                 plugin: Arc::from("memory"),
                 content: EXTRA.into(),
             },

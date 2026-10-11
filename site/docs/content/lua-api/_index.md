@@ -1301,7 +1301,8 @@ print(model.spec, model.tier)
 maki.agent.system_prompt({ctx}, {opts})
 ```
 
-Build a system prompt from a built-in template. Environment variables like
+Build a system prompt from the parent's resolved prompt catalogue.
+Plugin template and section replacements apply. Environment variables like
 `{cwd}` are substituted automatically. Use this when you need a ready-made
 prompt for a subagent session.
 
@@ -1313,8 +1314,9 @@ prompt for a subagent session.
 
   Optional fields:
 
-  - `instructions` (`string|boolean?`) extra text appended to the prompt.
-    `true` loads instructions from the project `.maki/instructions` file.
+  - `instructions` (`string|boolean?`) text inserted at the template's
+    `{{instructions}}` marker.
+    `true` loads project instruction files.
     `false` or nil omits them.
 
 **Returns:** (`string?`, `string?`) The assembled prompt string, or `(nil, err)` on failure.

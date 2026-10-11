@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use maki_agent::permissions::PluginRuleStore;
-use maki_agent::prompt::ResolvedSlots;
+use maki_agent::prompt::ResolvedPrompts;
 use maki_agent::{AgentConfig, SessionEndReason};
 use maki_config::project::TrustMode;
 use maki_config::{ModelPolicy, SessionDefaults, TrustConfig};
@@ -25,7 +25,7 @@ pub struct AcpParams {
     pub config: AgentConfig,
     pub timeouts: Timeouts,
     pub initial_wd: PathBuf,
-    pub prompt_slots: Arc<ResolvedSlots>,
+    pub prompt_slots: Arc<ResolvedPrompts>,
     pub yolo: bool,
     /// ACP exposes no toggles of its own, so the `always_*` knobs are the whole
     /// answer for every prompt this server runs.

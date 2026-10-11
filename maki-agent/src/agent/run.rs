@@ -25,6 +25,7 @@ use super::tool_dispatch::{self, RecentCalls};
 use crate::cancel::{CancelMap, CancelToken};
 use crate::mcp::{McpSession, ToolDeferral};
 use crate::permissions::PermissionManager;
+use crate::prompt::ResolvedPrompts;
 use crate::tools::hook::Verdict;
 use crate::tools::{
     Deadline, FileAccess, LocalTools, ToolAudience, ToolContext, ToolFilter, ToolOutputMode,
@@ -114,7 +115,7 @@ pub struct AgentParams {
     pub mailbox: Option<SessionMailbox>,
     pub timeouts: maki_providers::Timeouts,
     pub file_access: Arc<FileAccess>,
-    pub prompt_slots: Arc<crate::prompt::ResolvedSlots>,
+    pub prompt_slots: Arc<ResolvedPrompts>,
     pub subagent_cancels: Arc<CancelMap<String>>,
     /// Subagents inherit this, so a turn's totals cover everything it spawned.
     pub ledger: Arc<RunLedger>,
@@ -172,7 +173,7 @@ pub struct Agent<'h> {
     mailbox: Option<SessionMailbox>,
     timeouts: maki_providers::Timeouts,
     file_access: Arc<FileAccess>,
-    prompt_slots: Arc<crate::prompt::ResolvedSlots>,
+    prompt_slots: Arc<ResolvedPrompts>,
     subagent_cancels: Arc<crate::cancel::CancelMap<String>>,
     registry: Arc<crate::tools::ToolRegistry>,
     audience: ToolAudience,
@@ -442,6 +443,11 @@ impl<'h> Agent<'h> {
             self.event_tx.send(AgentEvent::Notice {
                 text: FRAME_REBUILT.into(),
             })?;
+            if self.mode.plan_path().is_some() {
+                let mut told = self.history.told().unwrap_or_default();
+                told.plan = None;
+                self.tell_changes_from(&told);
+            }
         }
         Ok(())
     }
@@ -451,16 +457,19 @@ impl<'h> Agent<'h> {
     /// (a run start, an interrupt switching modes, a model switch, a
     /// compaction) has to remember to tell it.
     fn tell_changes(&mut self) {
+        let Some(told) = self.history.told() else {
+            return;
+        };
+        self.tell_changes_from(&told);
+    }
+
+    fn tell_changes_from(&mut self, told: &LiveFacts) {
         // Plan mode is in no rendered prompt, so only the agent knows it.
         let now = LiveFacts {
             plan: self.mode.plan_path().map(Path::to_path_buf),
             prompt: self.prompt_facts.clone(),
         };
-        if let Some(update) = self
-            .history
-            .told()
-            .and_then(|told| context_update(&told, &now))
-        {
+        if let Some(update) = context_update(told, &now, &self.prompt_slots) {
             self.history.push(update);
         }
     }
@@ -998,6 +1007,7 @@ impl<'h> Agent<'h> {
             self.history
                 .push(Message::synthetic(compaction::continue_message(
                     &self.config,
+                    &self.prompt_slots,
                     steer.continue_text.as_deref(),
                 )));
         } else if let Some(text) = steer.continue_text {
@@ -1040,6 +1050,7 @@ impl<'h> Agent<'h> {
             &self.event_tx,
             &hooks,
             &self.config,
+            &self.prompt_slots,
             instructions,
             carry_len,
             self.timeouts.retry,
@@ -1161,16 +1172,28 @@ mod tests {
 
     use super::compaction::FIELD_CONTINUE;
     use super::*;
-    use crate::agent::frame::{PLAN_ENDED, RunContext};
+    use crate::agent::frame::RunContext;
     use crate::agent::hook::testing::{Seen, script};
     use crate::mcp::test_support::stub_session;
     use crate::mcp::tool_names;
     use crate::permissions::PermissionManager;
+    use crate::prompt::{PromptId, Slot, SlotEntry};
+    use crate::template::Vars;
     use crate::tools::RequestTools;
     use crate::{EarlierInput, Envelope};
 
     const QUEUED_MESSAGES: [&str; 3] = ["first", "second", "third"];
     const RESPONSE_TEXT: &str = "response";
+    const PLAN_ENDED: &str = "Plan mode ended. You may edit files again.";
+    const CUSTOM_SYSTEM: &str = "You analyse information.";
+    const CUSTOM_CONVENTIONS: &str = "State the evidence and uncertainty.";
+    const CUSTOM_PLAN: &str = "Draft an analysis in {plan_path}.";
+    const CUSTOM_CONTINUATION: &str = "Continue the analysis.";
+    const CUSTOM_COMPACTION_SYSTEM: &str = "Summarize the analysis.";
+    const CUSTOM_COMPACTION_USER: &str = "Preserve claims and supporting evidence.";
+    const FIRST_IDENTITY: &str = "You are the first research assistant.";
+    const LAST_IDENTITY: &str = "You are the last research assistant.";
+    const DEFAULT_IDENTITY_PREFIX: &str = "You are Maki, an interactive CLI coding agent.";
     const ONE_GAUGE_MSG: &str =
         "TurnComplete, Done, and the compaction trigger must read one context gauge";
 
@@ -1387,7 +1410,7 @@ mod tests {
                 mailbox: None,
                 timeouts: maki_providers::Timeouts::default(),
                 file_access: FileAccess::fresh(),
-                prompt_slots: Arc::new(crate::prompt::ResolvedSlots::default()),
+                prompt_slots: Arc::new(ResolvedPrompts::default()),
                 subagent_cancels: Arc::new(crate::cancel::CancelMap::new()),
                 ledger: Arc::new(RunLedger::default()),
                 registry: Arc::new(crate::tools::ToolRegistry::new()),
@@ -1419,6 +1442,154 @@ mod tests {
             prompt: None,
             source: InputSource::Tui,
         }
+    }
+
+    #[test_case(false ; "section_replacement")]
+    #[test_case(true ; "complete_replacement")]
+    fn prompt_policy_reuses_then_rebuilds_the_request_frame(complete: bool) {
+        smol::block_on(async {
+            let mock =
+                MockProvider::new((0..3).map(|_| text_response(StopReason::EndTurn)).collect());
+            let requests = Arc::clone(&mock.requests);
+            let provider: Arc<dyn Provider> = Arc::new(mock);
+            let mut history = History::new(Vec::new());
+            for changed in [true, true, false] {
+                let mut prompts = ResolvedPrompts::default();
+                if changed {
+                    if complete {
+                        prompts.set_template(PromptId::System, CUSTOM_SYSTEM.into());
+                    } else {
+                        prompts.set_section(
+                            PromptId::System,
+                            Slot::Conventions,
+                            CUSTOM_CONVENTIONS.into(),
+                        );
+                    }
+                }
+                let prompts = Arc::new(prompts);
+                let (mut agent, events) =
+                    make_agent_with(Arc::clone(&provider), default_model(), &mut history);
+                agent.prompt_slots = Arc::clone(&prompts);
+                agent.context = Arc::new(move |model, _| {
+                    RunContext::render(&Vars::new(), "", &prompts, model, RequestTools::default())
+                });
+                agent.run(default_input()).await.unwrap();
+                drop(agent);
+                let rebuilt = drain_events(&events).iter().any(|event| {
+                    matches!(&event.event, AgentEvent::Notice { text } if text == FRAME_REBUILT)
+                });
+                assert_eq!(rebuilt, !changed);
+            }
+            let requests = requests.lock().unwrap();
+            assert_append_only(&requests[0], &requests[1]);
+            if complete {
+                assert_eq!(requests[0].system, CUSTOM_SYSTEM);
+            } else {
+                assert!(requests[0].system.contains(CUSTOM_CONVENTIONS));
+                assert!(
+                    !requests[0]
+                        .system
+                        .contains("Never assume a library is available")
+                );
+            }
+            assert!(
+                requests[2]
+                    .system
+                    .contains("Never assume a library is available")
+            );
+        });
+    }
+
+    #[test]
+    fn singleton_unload_updates_the_effective_identity() {
+        smol::block_on(async {
+            let mock =
+                MockProvider::new((0..3).map(|_| text_response(StopReason::EndTurn)).collect());
+            let requests = Arc::clone(&mock.requests);
+            let provider: Arc<dyn Provider> = Arc::new(mock);
+            let mut history = History::new(Vec::new());
+            for owners in [
+                vec![("aaa", FIRST_IDENTITY), ("zzz", LAST_IDENTITY)],
+                vec![("aaa", FIRST_IDENTITY)],
+                Vec::new(),
+            ] {
+                let mut prompts = ResolvedPrompts::default();
+                for (plugin, content) in owners {
+                    prompts.insert(
+                        PromptId::System,
+                        Slot::Identity,
+                        SlotEntry {
+                            plugin: Arc::from(plugin),
+                            content: content.into(),
+                        },
+                    );
+                }
+                let prompts = Arc::new(prompts);
+                let (mut agent, _events) =
+                    make_agent_with(Arc::clone(&provider), default_model(), &mut history);
+                agent.prompt_slots = Arc::clone(&prompts);
+                agent.context = Arc::new(move |model, _| {
+                    RunContext::render(&Vars::new(), "", &prompts, model, RequestTools::default())
+                });
+                agent.run(default_input()).await.unwrap();
+            }
+            let requests = requests.lock().unwrap();
+            assert!(requests[0].system.starts_with(LAST_IDENTITY));
+            assert_append_only(&requests[0], &requests[1]);
+            assert_append_only(&requests[1], &requests[2]);
+            let second = requests[1]
+                .messages
+                .iter()
+                .map(Value::to_string)
+                .collect::<String>();
+            let third = requests[2]
+                .messages
+                .iter()
+                .map(Value::to_string)
+                .collect::<String>();
+            assert!(second.contains(FIRST_IDENTITY));
+            assert!(third.contains(DEFAULT_IDENTITY_PREFIX));
+        });
+    }
+
+    #[test]
+    fn plan_policy_reload_reannounces_an_active_plan() {
+        smol::block_on(async {
+            let mock =
+                MockProvider::new((0..2).map(|_| text_response(StopReason::EndTurn)).collect());
+            let requests = Arc::clone(&mock.requests);
+            let provider: Arc<dyn Provider> = Arc::new(mock);
+            let mut history = History::new(Vec::new());
+            for custom in [false, true] {
+                let mut prompts = ResolvedPrompts::default();
+                if custom {
+                    prompts.set_template(PromptId::Plan, CUSTOM_PLAN.into());
+                }
+                let prompts = Arc::new(prompts);
+                let (mut agent, _events) =
+                    make_agent_with(Arc::clone(&provider), default_model(), &mut history);
+                agent.prompt_slots = Arc::clone(&prompts);
+                agent.context = Arc::new(move |model, _| {
+                    RunContext::render(&Vars::new(), "", &prompts, model, RequestTools::default())
+                });
+                agent
+                    .run(AgentInput {
+                        mode: AgentMode::Plan(Path::new("/plans/analysis.md").to_path_buf()),
+                        ..default_input()
+                    })
+                    .await
+                    .unwrap();
+            }
+            let requests = requests.lock().unwrap();
+            let messages = requests[1]
+                .messages
+                .iter()
+                .map(Value::to_string)
+                .collect::<String>();
+            assert!(messages.contains("Draft an analysis in /plans/analysis.md."));
+            let updates = updates(&history);
+            assert!(!updates.last().unwrap().contains("Plan mode ACTIVE"));
+        });
     }
 
     #[test]
@@ -2307,7 +2478,11 @@ mod tests {
             agent.auto_compact = true;
         });
 
-        let continue_text = compaction::continue_message(&AgentConfig::default(), None);
+        let continue_text = compaction::continue_message(
+            &AgentConfig::default(),
+            &ResolvedPrompts::default(),
+            None,
+        );
         let messages = h.history.as_slice();
         assert!(
             messages
@@ -2804,6 +2979,39 @@ mod tests {
                 &last.content[0],
                 ContentBlock::Text { text } if text.ends_with(POST) && text != POST
             ));
+        });
+    }
+
+    #[test]
+    fn compaction_uses_plugin_summary_and_continuation_prompts() {
+        smol::block_on(async {
+            let mock = MockProvider::new(vec![text_response(StopReason::EndTurn)]);
+            let requests = Arc::clone(&mock.requests);
+            let mut history = History::new(vec![Message::user("go".into())]);
+            let (mut agent, _events) = make_agent(mock, &mut history);
+            let mut prompts = ResolvedPrompts::default();
+            prompts.set_template(PromptId::CompactionSystem, CUSTOM_COMPACTION_SYSTEM.into());
+            prompts.set_template(PromptId::CompactionUser, CUSTOM_COMPACTION_USER.into());
+            prompts.set_template(PromptId::Continuation, CUSTOM_CONTINUATION.into());
+            agent.prompt_slots = Arc::new(prompts);
+            agent.carry_from = agent.history.len();
+            agent.do_compact(CompactSteer::default()).await.unwrap();
+            drop(agent);
+
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests[0].system, CUSTOM_COMPACTION_SYSTEM);
+            assert!(
+                requests[0]
+                    .messages
+                    .last()
+                    .unwrap()
+                    .to_string()
+                    .contains(CUSTOM_COMPACTION_USER)
+            );
+            assert_eq!(
+                history.as_slice().last().unwrap().first_text_content(),
+                Some(CUSTOM_CONTINUATION)
+            );
         });
     }
 

@@ -712,7 +712,7 @@ pub fn prompt(
 ) -> Result<()> {
     use crate::cli::PromptVariant;
     use maki_agent::agent::{build_system_prompt, load_instruction_text, plan_mode_update};
-    use maki_agent::prompt::{PromptId, assemble};
+    use maki_agent::prompt::PromptId;
     use maki_agent::template;
     use maki_agent::tools::{DescriptionContext, ToolAudience, ToolFilter, ToolRegistry};
     use maki_providers::Model;
@@ -767,18 +767,14 @@ pub fn prompt(
             if plan {
                 format!(
                     "{prompt}\n\n{}",
-                    plan_mode_update(Path::new(PLAN_PREVIEW_PATH))
+                    plan_mode_update(Path::new(PLAN_PREVIEW_PATH), &slots)
                 )
             } else {
                 prompt
             }
         }
-        PromptVariant::Research => vars
-            .apply(&assemble(PromptId::Research, &slots, &instructions))
-            .into_owned(),
-        PromptVariant::General => vars
-            .apply(&assemble(PromptId::General, &slots, &instructions))
-            .into_owned(),
+        PromptVariant::Research => slots.render(PromptId::Research, &vars, &instructions),
+        PromptVariant::General => slots.render(PromptId::General, &vars, &instructions),
     };
 
     print!("{output}");

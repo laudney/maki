@@ -289,7 +289,8 @@ async fn resolve_model(
     Ok((Some(model_to_lua_table(&lua, &model)?), None))
 }
 
-/// Build a system prompt from a built-in template. Environment variables like
+/// Build a system prompt from the parent's resolved prompt catalogue.
+/// Plugin template and section replacements apply. Environment variables like
 /// `{cwd}` are substituted automatically. Use this when you need a ready-made
 /// prompt for a subagent session.
 ///
@@ -297,8 +298,9 @@ async fn resolve_model(
 /// @param opts table Required fields:
 ///   `prompt_id` (string) - one of `"research"`, `"general"`, `"system"`.
 /// Optional fields:
-///   `instructions` (string|boolean?) - extra text appended to the prompt.
-///     `true` loads instructions from the project `.maki/instructions` file.
+///   `instructions` (string|boolean?) - text inserted at the template's
+///     `{{instructions}}` marker.
+///     `true` loads project instruction files.
 ///     `false` or nil omits them.
 /// @return (string?, string?) The assembled prompt string, or `(nil, err)` on failure.
 /// @example
@@ -337,8 +339,7 @@ async fn system_prompt(
         _ => return Err(mlua::Error::runtime("instructions must be bool or string")),
     };
 
-    let assembled = maki_agent::prompt::assemble(prompt_id, &slots, &instructions);
-    Ok((Some(vars.apply(&assembled).into_owned()), None))
+    Ok((Some(slots.render(prompt_id, &vars, &instructions)), None))
 }
 
 /// Get the list of tool definitions for a given audience. Pass the result
@@ -1536,12 +1537,15 @@ fn call_local_tool(
 
 #[cfg(test)]
 mod tests {
+    use flume::Sender;
     use futures_lite::future::poll_once;
+    use maki_agent::prompt::{PromptId, ResolvedPrompts};
     use maki_agent::tools::test_support::stub_ctx_with;
     use maki_agent::{DoneReason, TurnCompleteEvent};
     use maki_providers::provider::{BoxFuture, Provider};
     use maki_providers::{
-        AgentError, Message, ModelInfo, ProviderEvent, StreamResponse, TokenUsage,
+        AgentError, ContentBlock, Message, ModelInfo, ProviderEvent, Role, StopReason,
+        StreamResponse, TokenUsage,
     };
     use maki_storage::id::SessionRef;
     use mlua::AnyUserData;
@@ -1706,6 +1710,94 @@ mod tests {
                 panic!("session close waited for the active prompt");
             },
         ));
+    }
+
+    use crate::runtime::SpawnedTasks;
+    use maki_agent::tools::ToolRegistry;
+
+    const CHILD_REQUEST: &str = "Analyse the supplied evidence.";
+    const CHILD_SYSTEM: &str = "You analyse evidence.\n{{instructions}}";
+    const CHILD_INSTRUCTIONS: &str = "Keep {{identity}} literal.";
+    const CHILD_RESPONSE: &str = "Analysis complete.";
+
+    struct PromptRecorder(Sender<String>);
+
+    impl Provider for PromptRecorder {
+        fn stream_message<'a>(
+            &'a self,
+            _: &'a Model,
+            _: &'a [Message],
+            system: &'a str,
+            _: &'a JsonValue,
+            _: &'a Sender<ProviderEvent>,
+            _: RequestOptions,
+            _: Option<&'a SessionRef>,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            Box::pin(async move {
+                self.0.send(system.to_owned()).unwrap();
+                Ok(StreamResponse {
+                    message: Message {
+                        role: Role::Assistant,
+                        content: vec![ContentBlock::Text {
+                            text: CHILD_RESPONSE.into(),
+                        }],
+                        ..Default::default()
+                    },
+                    stop_reason: Some(StopReason::EndTurn),
+                    ..Default::default()
+                })
+            })
+        }
+
+        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    #[test_case("research", PromptId::Research ; "research_child")]
+    #[test_case("general", PromptId::General ; "general_child")]
+    fn child_session_receives_the_parent_prompt_policy(name: &str, id: PromptId) {
+        let lua = Lua::new();
+        lua.set_app_data(SpawnedTasks::default());
+        lua.set_app_data(Arc::new(ToolRegistry::new()));
+        let (sent, requests) = flume::unbounded();
+        let mut ctx = stub_ctx_with(&AgentMode::Build, None, Some(PARENT_ID));
+        ctx.provider = Arc::new(PromptRecorder(sent));
+        let mut prompts = ResolvedPrompts::default();
+        prompts.set_template(id, CHILD_SYSTEM.into());
+        ctx.prompt_slots = Arc::new(prompts);
+        smol::block_on(async {
+            let ctx = lua.create_userdata(LuaCtx::handler(&ctx)).unwrap();
+            let opts = lua.create_table().unwrap();
+            opts.set("prompt_id", name).unwrap();
+            opts.set("instructions", CHILD_INSTRUCTIONS).unwrap();
+            let (system, error) = system_prompt(lua.clone(), ctx.borrow().unwrap(), opts)
+                .await
+                .unwrap();
+            assert!(error.is_none(), "{error:?}");
+            let opts = lua.create_table().unwrap();
+            opts.set("system", system.unwrap()).unwrap();
+            let (sess, error) = session(
+                lua.clone(),
+                Arc::from("test"),
+                PluginPermissions::trusted(),
+                LuaEither::Left(ctx.borrow().unwrap()),
+                Some(opts),
+            )
+            .await
+            .unwrap();
+            assert!(error.is_none(), "{error:?}");
+            let sess = sess.unwrap();
+            let (_, error) = prompt(lua.clone(), sess.borrow().unwrap(), CHILD_REQUEST.into())
+                .await
+                .unwrap();
+            close(lua.clone(), sess.borrow().unwrap()).await.unwrap();
+            assert!(error.is_none(), "{error:?}");
+        });
+        assert_eq!(
+            requests.recv().unwrap(),
+            format!("You analyse evidence.\n{CHILD_INSTRUCTIONS}")
+        );
     }
 
     fn call(src: &str, input: JsonValue) -> Result<String, String> {
