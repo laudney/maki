@@ -1281,6 +1281,7 @@ impl Drop for SessionCancellation {
 
 impl Drop for LuaSession {
     fn drop(&mut self) {
+        self.cancellation.cancel();
         match self.inner.try_lock() {
             Some(mut s) => s.close(),
             // Prompt still in flight: close asynchronously so history
@@ -1500,21 +1501,14 @@ async fn prompt(
 /// leaves the work to the Lua garbage collector, which may never run while
 /// the VM sits idle, and the subagent's event relay stays alive until it does.
 ///
-/// On a background session, `close` cancels a running prompt rather than
-/// waiting for it.
+/// Close cancels a running prompt before waiting to flush its history. That
+/// prompt returns a cancelled error and any partial text.
 ///
 /// @return
 #[lua_fn]
 async fn close(_lua: Lua, this: mlua::UserDataRef<LuaSession>) -> LuaResult<()> {
+    this.cancellation.cancel();
     let inner = Arc::clone(&this.inner);
-    // Dropping the entry cancels the prompt, so the lock below frees up soon.
-    // Taking the lock first would wait on a prompt that may never end. Worst
-    // case is a `SessionEnd` callback: the host cancels the session's
-    // background work only after the callbacks return, so it would wait on
-    // itself and hold up every hook behind it.
-    if let Some(registry) = &this.cancellation.background {
-        registry.remove(&this.cancellation.ui_id);
-    }
     drop(this);
     let mut s = inner.lock().await;
     s.close();
@@ -1551,7 +1545,11 @@ mod tests {
     use futures_lite::future::poll_once;
     use maki_agent::tools::test_support::stub_ctx_with;
     use maki_agent::{DoneReason, TurnCompleteEvent};
-    use maki_providers::{Message, TokenUsage};
+    use maki_providers::provider::{BoxFuture, Provider};
+    use maki_providers::{
+        AgentError, Message, ModelInfo, ProviderEvent, StreamResponse, TokenUsage,
+    };
+    use maki_storage::id::SessionRef;
     use mlua::AnyUserData;
     use serde_json::json;
     use test_case::test_case;
@@ -1560,6 +1558,39 @@ mod tests {
     use crate::runtime::{TaskCell, TaskScope};
 
     const PLUGIN: &str = "monitor";
+    const SESSION_PROMPT: &str = "work until closed";
+    const PARTIAL_TEXT: &str = "partial response";
+    const SESSION_TIMEOUT: Duration = Duration::from_secs(5);
+    const CLOSE_SESSION: &str = "function(sess) sess:close() end";
+
+    struct PendingProvider(flume::Sender<()>);
+
+    impl Provider for PendingProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _model: &'a Model,
+            _messages: &'a [Message],
+            _system: &'a str,
+            _tools: &'a JsonValue,
+            events: &'a flume::Sender<ProviderEvent>,
+            _opts: RequestOptions,
+            _session_id: Option<&'a SessionRef>,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            Box::pin(async move {
+                events
+                    .send(ProviderEvent::TextDelta {
+                        text: PARTIAL_TEXT.into(),
+                    })
+                    .unwrap();
+                self.0.send(()).unwrap();
+                std::future::pending().await
+            })
+        }
+
+        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
 
     async fn native_session(lua: &Lua, ctx: &ToolContext) -> AnyUserData {
         lua.set_app_data(Arc::clone(ToolRegistry::global_arc()));
@@ -1609,6 +1640,78 @@ mod tests {
                 close(lua.clone(), session.borrow().unwrap()).await.unwrap();
             }
         });
+    }
+
+    #[test_case(false ; "close_during_prompt")]
+    #[test_case(true ; "dispose_during_prompt")]
+    fn session_close_does_not_wait_for_the_prompt_lock(dispose: bool) {
+        let lua = Lua::new();
+        let (started_tx, started_rx) = flume::unbounded();
+        let (event_tx, events) = flume::unbounded();
+        let event_tx = EventSender::new(event_tx, RUN_ID);
+        let mut ctx = stub_ctx_with(&AgentMode::Build, Some(&event_tx), Some(PARENT_ID));
+        ctx.provider = Arc::new(PendingProvider(started_tx));
+        smol::block_on(futures_lite::future::or(
+            async {
+                let sess = native_session(&lua, &ctx).await;
+                let (result, ()) = futures::future::join(
+                    prompt(lua.clone(), sess.borrow().unwrap(), SESSION_PROMPT.into()),
+                    async {
+                        started_rx.recv_async().await.unwrap();
+                        if dispose {
+                            drop(sess.take::<LuaSession>().unwrap());
+                        } else {
+                            let close: Function = lua.load(CLOSE_SESSION).eval().unwrap();
+                            close.call_async::<()>(sess.clone()).await.unwrap();
+                            close.call_async::<()>(sess.clone()).await.unwrap();
+                        }
+                    },
+                )
+                .await;
+                let (partial, error) = result.unwrap();
+                assert_eq!(error.as_deref(), Some(CANCELLED_MSG));
+                assert!(
+                    partial
+                        .unwrap()
+                        .get::<String>("text")
+                        .unwrap()
+                        .starts_with(PARTIAL_TEXT)
+                );
+                if !dispose {
+                    let (_, error) =
+                        prompt(lua.clone(), sess.borrow().unwrap(), SESSION_PROMPT.into())
+                            .await
+                            .unwrap();
+                    assert_eq!(error.as_deref(), Some(SESSION_CLOSED_ERR));
+                    assert!(started_rx.is_empty());
+                }
+                loop {
+                    if let AgentEvent::SubagentHistory {
+                        tool_use_id,
+                        messages,
+                    } = events.recv_async().await.unwrap().event
+                    {
+                        assert_eq!(tool_use_id, PARENT_ID);
+                        assert!(messages.iter().any(|message| {
+                            matches!(message.role, Role::Assistant)
+                                && message.content.iter().any(|block| {
+                                    matches!(block, ContentBlock::Text { text } if text.starts_with(PARTIAL_TEXT))
+                                })
+                        }));
+                        break;
+                    }
+                }
+                assert!(
+                    !events
+                        .try_iter()
+                        .any(|event| matches!(event.event, AgentEvent::SubagentHistory { .. }))
+                );
+            },
+            async {
+                smol::Timer::after(SESSION_TIMEOUT).await;
+                panic!("session close waited for the active prompt");
+            },
+        ));
     }
 
     fn call(src: &str, input: JsonValue) -> Result<String, String> {

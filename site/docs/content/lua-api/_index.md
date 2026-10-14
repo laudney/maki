@@ -1664,8 +1664,8 @@ Close on every path, error paths included. Dropping the session instead
 leaves the work to the Lua garbage collector, which may never run while
 the VM sits idle, and the subagent's event relay stays alive until it does.
 
-On a background session, `close` cancels a running prompt rather than
-waiting for it.
+Close cancels a running prompt before waiting to flush its history. That
+prompt returns a cancelled error and any partial text.
 
 
 ## maki.async {#maki-async}
