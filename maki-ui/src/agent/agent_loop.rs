@@ -231,7 +231,7 @@ impl AgentLoop {
         compaction: &Compaction,
         cancel: &CancelToken,
     ) -> Result<DoneReason, AgentError> {
-        let (context, prompts) = self.context_builder().await;
+        let (context, _) = self.context_builder().await;
         let slot = self.seed.model_slot.load();
         let (provider, model) = agent::resolve_compaction_model(
             &slot.provider,
@@ -261,7 +261,6 @@ impl AgentLoop {
             event_tx,
             &hooks,
             &self.seed.config,
-            &prompts,
             compaction.instructions.as_deref(),
             self.seed.timeouts.retry,
         )

@@ -2,8 +2,6 @@ use std::sync::Arc;
 
 use flume::Sender;
 use futures_lite::future;
-use maki_agent::prompt::PromptId;
-use maki_agent::template;
 use maki_providers::provider::Provider;
 use maki_providers::{Message, Model, ProviderEvent, RequestOptions};
 use maki_storage::id::SessionRef;
@@ -18,6 +16,9 @@ single response.\n- You have NO tools: you cannot read files, run commands, or t
 - One-off response: there are no follow-up turns.\n- Answer ONLY from the existing conversation \
 context.\n- Never say \"Let me...\", \"I'll now...\", or promise any action.\n- If you don't know, \
 say so; do not offer to look it up.\n</system-reminder>";
+
+const BTW_FALLBACK_SYSTEM: &str = "You are a helpful coding assistant. Answer concisely \
+from the conversation context.";
 
 /// The reminder leads so the model treats the question as a quick aside, not a task to act on.
 pub(crate) fn btw_question(question: &str) -> Message {
@@ -44,25 +45,21 @@ impl App {
         let system = snapshot
             .as_ref()
             .and_then(|s| s.frame.as_ref())
-            .map(|f| f.system.clone());
+            .map_or_else(|| BTW_FALLBACK_SYSTEM.to_string(), |f| f.system.clone());
         messages.push(btw_question(&question));
 
         let (tx, rx) = flume::bounded(64);
         self.btw_modal.open(&question, rx);
 
         let session_id = SessionRef::from(self.state.session.id);
-        let lua_handle = self.lua_event_handle.clone();
-        smol::spawn(async move {
-            let system = match system {
-                Some(system) => system,
-                None => lua_handle.collect_prompt_slots_async().await.render(
-                    PromptId::BtwFallback,
-                    &template::env_vars(),
-                    "",
-                ),
-            };
-            run_btw(provider, model, system, messages, tx, Some(session_id)).await;
-        })
+        smol::spawn(run_btw(
+            provider,
+            model,
+            system,
+            messages,
+            tx,
+            Some(session_id),
+        ))
         .detach();
     }
 }
@@ -119,6 +116,7 @@ mod tests {
     use super::*;
     use arc_swap::ArcSwap;
     use maki_agent::HistorySnapshot;
+    use maki_agent::prompt::{PromptId, Slot};
     use maki_agent::tools::ToolRegistry;
     use maki_lua::PluginHost;
     use maki_providers::provider::BoxFuture;
@@ -128,7 +126,6 @@ mod tests {
     use test_case::test_case;
 
     const Q: &str = "why sqlite?";
-    const FALLBACK_POLICY: &str = "Answer the research question.";
     const FRAME_POLICY: &str = "Use the active conversation policy.";
 
     struct RecordingProvider(Sender<(String, Value)>);
@@ -155,15 +152,19 @@ mod tests {
         }
     }
 
-    #[test_case(false, FALLBACK_POLICY ; "configured_fallback")]
+    #[test_case(false, BTW_FALLBACK_SYSTEM ; "native_fallback")]
     #[test_case(true, FRAME_POLICY ; "stored_frame_precedence")]
     fn side_question_uses_the_selected_policy(with_frame: bool, expected: &str) {
         let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
         host.load_source(
-            "research",
-            &format!(
-                "maki.api.set_prompt({{prompt = \"btw_fallback\", content = {FALLBACK_POLICY:?}}})"
-            ),
+            "persona",
+            r#"
+            local calls = 0
+            maki.api.set_prompt({ slot = "identity", content = function()
+                calls += 1
+                return tostring(calls)
+            end })
+            "#,
         )
         .unwrap();
         let mut app = crate::app::tests::test_app();
@@ -187,6 +188,11 @@ mod tests {
         let (system, tools) = smol::block_on(requests.recv_async()).unwrap();
         assert_eq!(system, expected);
         assert!(tools.as_array().unwrap().is_empty());
+        let prompts = host.event_handle().collect_prompt_slots();
+        assert_eq!(
+            prompts.get(PromptId::System, Slot::Identity)[0].content,
+            "1"
+        );
     }
 
     fn user_text(msg: &Message) -> String {

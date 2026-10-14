@@ -65,17 +65,15 @@ instructions are appended to a complete replacement.
 | --- | --- |
 | `system` | Main agent in the TUI, print, SDK, and ACP |
 | `research`, `general` | Built-in task agents |
-| `plan`, `plan_end` | Plan entry and exit updates |
-| `compaction_system`, `compaction_user` | Conversation summary request |
-| `continuation` | Continuation after automatic compaction |
-| `btw_fallback` | Side question before the session has a request frame |
+| `plan` | Plan entry update |
 
 Sections are `identity`, `tone`, `objectivity`, `tool_usage`, `efficient_tools`,
 `conventions`, `completion`, and `after_instructions`. A section must occur in
 the selected template. A known section absent from an explicit target is
 ignored with a warning. Research and general prompts also have identity and
-tone sections. Omitting `prompt` targets the conversational prompts containing
-that section.
+tone sections. Omitting `prompt` in `set_prompt` targets only `system`.
+Additive hints without `prompt` target all conversational prompts that contain
+the section.
 
 Use `content = ""` to remove default section text or supply an empty template.
 Use [`register_prompt_hint`](/docs/lua-api/#maki-api-register_prompt_hint) to add
@@ -93,8 +91,8 @@ updates. Unloading the last override tells the model that it no longer applies.
 Changes to the date, working directory, or project instructions also use
 context updates, including with a complete main template. Changing the static
 system or plan replacement policy starts an announced new request frame.
-A changed plan prompt applies when the agent next enters plan mode. A stored
-frame takes precedence over `btw_fallback` for side questions.
+A changed plan prompt applies when the agent next enters plan mode.
+Side questions use the stored frame when one exists.
 An explicit SDK system-prompt override takes precedence over a plugin's main
 template.
 

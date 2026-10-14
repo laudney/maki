@@ -20,9 +20,6 @@ pub const RESEARCH_PROMPT: &str = include_str!("prompts/research.md");
 pub const GENERAL_PROMPT: &str = include_str!("prompts/general.md");
 pub const COMPACTION_SYSTEM: &str = include_str!("prompts/compaction.md");
 pub const COMPACTION_USER: &str = include_str!("prompts/compaction_user.md");
-pub const PLAN_ENDED: &str = include_str!("prompts/plan_end.md");
-pub const CONTINUATION: &str = include_str!("prompts/continuation.md");
-pub const BTW_FALLBACK: &str = include_str!("prompts/btw_fallback.md");
 pub const DEFAULT_IDENTITY: &str = include_str!("prompts/system_identity.md");
 pub const DEFAULT_TONE: &str = include_str!("prompts/system_tone.md");
 
@@ -73,16 +70,6 @@ impl Slot {
         }
     }
 
-    /// Legacy main-prompt singleton defaults. Catalogue rendering selects
-    /// prompt-specific defaults for children instead.
-    pub fn default_content(self) -> Option<&'static str> {
-        match self {
-            Slot::Identity => Some(DEFAULT_IDENTITY),
-            Slot::Tone => Some(DEFAULT_TONE),
-            _ => None,
-        }
-    }
-
     pub fn names_for_kind(kind: SlotKind) -> String {
         Self::iter()
             .filter(|s| s.kind() == kind)
@@ -99,15 +86,10 @@ pub enum PromptId {
     Research,
     General,
     Plan,
-    PlanEnd,
-    CompactionSystem,
-    CompactionUser,
-    Continuation,
-    BtwFallback,
 }
 
 impl PromptId {
-    /// Default targets for registrations that omit an explicit prompt list.
+    /// Default targets for additive hints without an explicit prompt list.
     pub const ALL: &[PromptId] = &[PromptId::System, PromptId::Research, PromptId::General];
 
     fn template(self) -> &'static str {
@@ -116,11 +98,6 @@ impl PromptId {
             PromptId::Research => RESEARCH_PROMPT,
             PromptId::General => GENERAL_PROMPT,
             PromptId::Plan => PLAN_PROMPT,
-            PromptId::PlanEnd => PLAN_ENDED,
-            PromptId::CompactionSystem => COMPACTION_SYSTEM,
-            PromptId::CompactionUser => COMPACTION_USER,
-            PromptId::Continuation => CONTINUATION,
-            PromptId::BtwFallback => BTW_FALLBACK,
         }
     }
 
@@ -267,17 +244,17 @@ impl ResolvedPrompts {
     /// Effective section content, including its default and contributions.
     pub fn section(&self, prompt: PromptId, slot: Slot) -> String {
         let entries = self.get(prompt, slot);
-        let replacement = self.sections.get(&(prompt, slot));
-        let default = replacement
-            .map(String::as_str)
-            .unwrap_or_else(|| prompt.default_section(slot));
         if slot.kind() == SlotKind::Singleton {
             return entries
                 .last()
                 .map(|entry| entry.content.as_str())
-                .unwrap_or(default)
+                .unwrap_or_else(|| prompt.default_section(slot))
                 .to_string();
         }
+        let replacement = self.sections.get(&(prompt, slot));
+        let default = replacement
+            .map(String::as_str)
+            .unwrap_or_else(|| prompt.default_section(slot));
         if slot == Slot::EfficientTools && replacement.is_none() && !entries.is_empty() {
             let extras = entries
                 .iter()
@@ -556,11 +533,6 @@ mod tests {
     #[test_case(PromptId::Research, include_str!("prompts/tests/research.md") ; "research")]
     #[test_case(PromptId::General, include_str!("prompts/tests/general.md") ; "general")]
     #[test_case(PromptId::Plan, include_str!("prompts/tests/plan.md") ; "plan")]
-    #[test_case(PromptId::PlanEnd, include_str!("prompts/tests/plan_end.md") ; "plan_end")]
-    #[test_case(PromptId::CompactionSystem, include_str!("prompts/tests/compaction.md") ; "compaction_system")]
-    #[test_case(PromptId::CompactionUser, include_str!("prompts/tests/compaction_user.md") ; "compaction_user")]
-    #[test_case(PromptId::Continuation, include_str!("prompts/tests/continuation.md") ; "continuation")]
-    #[test_case(PromptId::BtwFallback, include_str!("prompts/tests/btw_fallback.md") ; "btw_fallback")]
     fn defaults_preserve_pre_catalogue_bytes(id: PromptId, expected: &str) {
         let vars = Vars::new()
             .set("{environment}", "Environment:\n- Working directory: /example\n- Platform: example\n- Date: 2000-01-01")
@@ -595,9 +567,9 @@ mod tests {
     #[test]
     fn empty_section_is_distinct_from_missing_section() {
         let mut prompts = ResolvedPrompts::default();
-        prompts.set_section(PromptId::System, Slot::Identity, String::new());
+        prompts.set_section(PromptId::System, Slot::Conventions, String::new());
         let out = assemble(PromptId::System, &prompts, "");
-        assert!(!out.contains("You are Maki"));
+        assert!(!out.contains("Never assume a library is available"));
         assert!(!out.starts_with("\n\n"));
         assert!(prompts.has_replacements());
         assert!(!prompts.policy_key().is_empty());
@@ -682,20 +654,11 @@ mod tests {
     }
 
     #[test]
-    fn legacy_singleton_last_entry_still_wins_with_static_section() {
-        let mut prompts = slots(PromptId::System, &[(Slot::Identity, "Legacy identity")]);
-        prompts.set_section(PromptId::System, Slot::Identity, "Static identity".into());
-        prompts.set_template(PromptId::System, "{{identity}}".into());
-        assert_eq!(assemble(PromptId::System, &prompts, ""), "Legacy identity");
-    }
-
-    #[test]
     fn variable_values_cannot_add_insertion_points() {
         const ENVIRONMENT: &str = "Working directory: {{identity}}";
         let vars = Vars::new().set("{environment}", ENVIRONMENT);
-        let mut prompts = ResolvedPrompts::default();
+        let mut prompts = slots(PromptId::System, &[(Slot::Identity, "Selected identity")]);
         prompts.set_template(PromptId::System, "{environment}\n{{identity}}".into());
-        prompts.set_section(PromptId::System, Slot::Identity, "Selected identity".into());
         assert_eq!(
             prompts.render(PromptId::System, &vars, ""),
             format!("{ENVIRONMENT}\nSelected identity")

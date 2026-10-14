@@ -33,6 +33,7 @@ use crate::tools::RequestTools;
 
 const UPDATE_OPEN: &str = "<context-update>\nThis changed since the conversation started and replaces what the system prompt says about it.\n\n";
 const UPDATE_CLOSE: &str = "\n</context-update>";
+pub(crate) const PLAN_ENDED: &str = "Plan mode ended. You may edit files again.";
 const INSTRUCTIONS_GONE: &str = "No project instructions apply anymore.";
 const FINGERPRINT_BYTES: usize = 16;
 pub(crate) const FRAME_REBUILT: &str =
@@ -277,7 +278,7 @@ pub(crate) fn context_update(
     }
     match &update.plan {
         Some(PlanChange::Entered(path)) => parts.push(plan_text(path, prompts)),
-        Some(PlanChange::Ended) => parts.push(prompts.render(PromptId::PlanEnd, &Vars::new(), "")),
+        Some(PlanChange::Ended) => parts.push(PLAN_ENDED.to_owned()),
         None => {}
     }
     for (key, content) in &update.hints {

@@ -15,12 +15,12 @@ use super::history::{History, remove_orphaned_tool_results, strip_thinking};
 use super::hook::{AgentHooks, AgentSlot};
 use super::streaming::{StreamError, StreamRequest, min_output, stream_with_retry};
 use crate::mcp::McpSession;
-use crate::prompt::{PromptId, ResolvedPrompts};
-use crate::template;
+use crate::prompt::COMPACTION_USER;
 use crate::tools::hook::Verdict;
 use crate::tools::truncate_bytes;
 use crate::{AgentError, AgentEvent, DoneReason, EventSender, TurnCompleteEvent};
 
+const CONTINUE_AFTER_COMPACT: &str = "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed. If the summary contains a todo list, restore it with todo_write and keep it updated. If you learned important project context during this session, consider saving it to memory before it's lost.";
 const TOOL_RESULT_PLACEHOLDER: &str = "[tool result]";
 /// How much of the newest tool output survives a compaction verbatim. This
 /// used to be a count, which kept three huge results and threw away thirty
@@ -149,12 +149,7 @@ fn normalize(text: Option<&str>) -> Option<&str> {
 
 /// Config instructions steer every compaction, `request` only the one the user
 /// asked for with `/compact <guidance>`, so both are kept and neither wins.
-fn summary_prompt(
-    config: &AgentConfig,
-    prompts: &ResolvedPrompts,
-    request: Option<&str>,
-) -> String {
-    let base = prompts.render(PromptId::CompactionUser, &template::env_vars(), "");
+fn summary_prompt(config: &AgentConfig, request: Option<&str>) -> String {
     let extras = [
         normalize(config.compaction_instructions.as_deref()),
         normalize(request),
@@ -164,20 +159,15 @@ fn summary_prompt(
     .collect::<Vec<_>>()
     .join("\n");
     if extras.is_empty() {
-        return base;
+        return COMPACTION_USER.to_string();
     }
-    format!("{base}\n\nAdditional instructions:\n{extras}")
+    format!("{COMPACTION_USER}\n\nAdditional instructions:\n{extras}")
 }
 
-pub(super) fn continue_message(
-    config: &AgentConfig,
-    prompts: &ResolvedPrompts,
-    added: Option<&str>,
-) -> String {
-    let base = prompts.render(PromptId::Continuation, &template::env_vars(), "");
+pub(super) fn continue_message(config: &AgentConfig, added: Option<&str>) -> String {
     match join_lines([config.post_compaction_instructions.as_deref(), added]) {
-        Some(extra) => format!("{base}\n\n{extra}"),
-        None => base,
+        Some(extra) => format!("{CONTINUE_AFTER_COMPACT}\n\n{extra}"),
+        None => CONTINUE_AFTER_COMPACT.to_string(),
     }
 }
 
@@ -204,7 +194,6 @@ pub(super) async fn compact_history(
     event_tx: &EventSender,
     hooks: &AgentHooks<'_>,
     config: &AgentConfig,
-    prompts: &ResolvedPrompts,
     instructions: Option<&str>,
     carry_len: usize,
     retry: RetryPolicy,
@@ -216,8 +205,7 @@ pub(super) async fn compact_history(
     strip_images(&mut compaction_history);
     strip_thinking(&mut compaction_history);
     prepare_collapse(hooks, &mut compaction_history, RECENT_TOOL_RESULT_BUDGET).await;
-    compaction_history.push(Message::user(summary_prompt(config, prompts, instructions)));
-    let system = prompts.render(PromptId::CompactionSystem, &template::env_vars(), "");
+    compaction_history.push(Message::user(summary_prompt(config, instructions)));
 
     let empty_tools = serde_json::json!([]);
     let max_attempts = 3;
@@ -229,7 +217,7 @@ pub(super) async fn compact_history(
                 provider,
                 model,
                 messages: &compaction_history,
-                system: &system,
+                system: crate::prompt::COMPACTION_SYSTEM,
                 tools: &empty_tools,
                 opts: RequestOptions::default(),
                 output_budget: SUMMARY_OUTPUT_BUDGET,
@@ -340,7 +328,6 @@ pub async fn compact(
     event_tx: &EventSender,
     hooks: &AgentHooks<'_>,
     config: &AgentConfig,
-    prompts: &ResolvedPrompts,
     instructions: Option<&str>,
     retry: RetryPolicy,
 ) -> Result<DoneReason, AgentError> {
@@ -368,7 +355,6 @@ pub async fn compact(
         event_tx,
         hooks,
         config,
-        prompts,
         steer.instructions.as_deref(),
         0,
         retry,
@@ -773,7 +759,6 @@ mod tests {
             &EventSender::new(raw_tx, 0),
             &test_hooks(&registry, None, &model, cancel),
             config,
-            &ResolvedPrompts::default(),
             instructions,
             RetryPolicy::default(),
         )
@@ -797,7 +782,6 @@ mod tests {
             &EventSender::new(raw_tx, 0),
             &test_hooks(&registry, session_id, &model, &cancel),
             &AgentConfig::default(),
-            &ResolvedPrompts::default(),
             None,
             carry_len,
             RetryPolicy::default(),
@@ -1057,7 +1041,6 @@ mod tests {
             &EventSender::new(raw_tx, 0),
             &test_hooks(&registry, None, &model, &cancel),
             &AgentConfig::default(),
-            &ResolvedPrompts::default(),
             instructions,
             RetryPolicy::default(),
         )
@@ -1180,12 +1163,13 @@ mod tests {
             compaction_instructions: config_extra.map(str::to_string),
             ..Default::default()
         };
-        let prompts = ResolvedPrompts::default();
-        let base = prompts.render(PromptId::CompactionUser, &template::env_vars(), "");
-        let prompt = summary_prompt(&config, &prompts, request);
+        let prompt = summary_prompt(&config, request);
 
-        assert!(prompt.starts_with(&base));
-        assert_eq!(prompt.len() > base.len(), has_config || has_request);
+        assert!(prompt.starts_with(COMPACTION_USER));
+        assert_eq!(
+            prompt.len() > COMPACTION_USER.len(),
+            has_config || has_request
+        );
         assert_eq!(prompt.contains(CONFIG_EXTRA), has_config);
         assert_eq!(prompt.contains(REQUEST_EXTRA), has_request);
     }

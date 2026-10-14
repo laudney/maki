@@ -999,7 +999,6 @@ impl<'h> Agent<'h> {
             self.history
                 .push(Message::synthetic(compaction::continue_message(
                     &self.config,
-                    &self.prompt_slots,
                     steer.continue_text.as_deref(),
                 )));
         } else if let Some(text) = steer.continue_text {
@@ -1042,7 +1041,6 @@ impl<'h> Agent<'h> {
             &self.event_tx,
             &hooks,
             &self.config,
-            &self.prompt_slots,
             instructions,
             carry_len,
             self.timeouts.retry,
@@ -1180,9 +1178,6 @@ mod tests {
     const CUSTOM_SYSTEM: &str = "You analyse information.";
     const CUSTOM_CONVENTIONS: &str = "State the evidence and uncertainty.";
     const CUSTOM_PLAN: &str = "Draft an analysis in {plan_path}.";
-    const CUSTOM_CONTINUATION: &str = "Continue the analysis.";
-    const CUSTOM_COMPACTION_SYSTEM: &str = "Summarize the analysis.";
-    const CUSTOM_COMPACTION_USER: &str = "Preserve claims and supporting evidence.";
     const FIRST_IDENTITY: &str = "You are the first research assistant.";
     const LAST_IDENTITY: &str = "You are the last research assistant.";
     const DEFAULT_IDENTITY_PREFIX: &str = "You are Maki, an interactive CLI coding agent.";
@@ -2577,11 +2572,7 @@ mod tests {
             agent.auto_compact = true;
         });
 
-        let continue_text = compaction::continue_message(
-            &AgentConfig::default(),
-            &ResolvedPrompts::default(),
-            None,
-        );
+        let continue_text = compaction::continue_message(&AgentConfig::default(), None);
         let messages = h.history.as_slice();
         assert!(
             messages
@@ -3078,39 +3069,6 @@ mod tests {
                 &last.content[0],
                 ContentBlock::Text { text } if text.ends_with(POST) && text != POST
             ));
-        });
-    }
-
-    #[test]
-    fn compaction_uses_plugin_summary_and_continuation_prompts() {
-        smol::block_on(async {
-            let mock = MockProvider::new(vec![text_response(StopReason::EndTurn)]);
-            let requests = Arc::clone(&mock.requests);
-            let mut history = History::new(vec![Message::user("go".into())]);
-            let (mut agent, _events) = make_agent(mock, &mut history);
-            let mut prompts = ResolvedPrompts::default();
-            prompts.set_template(PromptId::CompactionSystem, CUSTOM_COMPACTION_SYSTEM.into());
-            prompts.set_template(PromptId::CompactionUser, CUSTOM_COMPACTION_USER.into());
-            prompts.set_template(PromptId::Continuation, CUSTOM_CONTINUATION.into());
-            agent.prompt_slots = Arc::new(prompts);
-            agent.carry_from = agent.history.len();
-            agent.do_compact(CompactSteer::default()).await.unwrap();
-            drop(agent);
-
-            let requests = requests.lock().unwrap();
-            assert_eq!(requests[0].system, CUSTOM_COMPACTION_SYSTEM);
-            assert!(
-                requests[0]
-                    .messages
-                    .last()
-                    .unwrap()
-                    .to_string()
-                    .contains(CUSTOM_COMPACTION_USER)
-            );
-            assert_eq!(
-                history.as_slice().last().unwrap().first_text_content(),
-                Some(CUSTOM_CONTINUATION)
-            );
         });
     }
 

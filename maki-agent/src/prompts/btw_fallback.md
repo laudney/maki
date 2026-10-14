@@ -1,1 +1,0 @@
-You are a helpful coding assistant. Answer concisely from the conversation context.

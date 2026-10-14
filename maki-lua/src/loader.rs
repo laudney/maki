@@ -2012,35 +2012,21 @@ mod tests {
         assert!(host.load_source("bad", &src).is_err());
     }
 
-    #[test]
-    fn identity_slot_defaults_to_conversational_prompts() {
-        let (_host, slots) = slots_from(
-            "id",
-            r#"
-            maki.api.set_prompt({
-                slot = "identity",
-                content = "Custom identity",
-            })
-            "#,
+    #[test_case(Slot::Identity ; "identity")]
+    #[test_case(Slot::Tone ; "tone")]
+    #[test_case(Slot::Conventions ; "static_section")]
+    fn omitted_replacement_targets_only_the_main_prompt(slot: Slot) {
+        const CONTENT: &str = "Custom policy";
+        let (_host, prompts) = slots_from(
+            "persona",
+            &format!("maki.api.set_prompt({{ slot = \"{slot}\", content = {CONTENT:?} }})"),
         );
-        for &pid in PromptId::ALL {
-            assert_eq!(contents(&slots, pid, Slot::Identity), ["Custom identity"]);
-        }
-    }
-
-    #[test]
-    fn tone_slot_defaults_to_conversational_prompts() {
-        let (_host, slots) = slots_from(
-            "tone",
-            r#"
-            maki.api.set_prompt({
-                slot = "tone",
-                content = "Custom tone",
-            })
-            "#,
-        );
-        for &pid in PromptId::ALL {
-            assert_eq!(contents(&slots, pid, Slot::Tone), ["Custom tone"]);
+        assert!(assemble(PromptId::System, &prompts, "").contains(CONTENT));
+        for pid in [PromptId::Research, PromptId::General] {
+            assert_eq!(
+                assemble(pid, &prompts, ""),
+                assemble(pid, &ResolvedPrompts::default(), ""),
+            );
         }
     }
 
@@ -2231,7 +2217,7 @@ mod tests {
             "live",
             r#"
             local count = 0
-            maki.api.set_prompt({ slot = "identity", content = function()
+            maki.api.set_prompt({ prompt = {"system", "research", "general"}, slot = "identity", content = function()
                 count += 1
                 return tostring(count)
             end })
@@ -2295,11 +2281,6 @@ mod tests {
     #[test_case("research", PromptId::Research ; "research")]
     #[test_case("general", PromptId::General ; "general")]
     #[test_case("plan", PromptId::Plan ; "plan")]
-    #[test_case("plan_end", PromptId::PlanEnd ; "plan_end")]
-    #[test_case("compaction_system", PromptId::CompactionSystem ; "compaction_system")]
-    #[test_case("compaction_user", PromptId::CompactionUser ; "compaction_user")]
-    #[test_case("continuation", PromptId::Continuation ; "continuation")]
-    #[test_case("btw_fallback", PromptId::BtwFallback ; "btw_fallback")]
     fn complete_replacement_has_no_implicit_sections(name: &str, id: PromptId) {
         const TEMPLATE: &str = "You help analyse information.";
         let (_host, slots) = slots_from(
@@ -2433,6 +2414,11 @@ mod tests {
     #[test_case(r#"{ content = "x" }"# ; "whole_requires_prompt")]
     #[test_case(r#"{ prompt = { "system", "general" }, content = "x" }"# ; "whole_requires_one_prompt")]
     #[test_case(r#"{ prompt = "nope", content = "x" }"# ; "unknown_prompt")]
+    #[test_case(r#"{ prompt = "btw_fallback", content = "x" }"# ; "unsupported_btw_fallback")]
+    #[test_case(r#"{ prompt = "continuation", content = "x" }"# ; "unsupported_continuation")]
+    #[test_case(r#"{ prompt = "compaction_user", content = "x" }"# ; "unsupported_compaction_user")]
+    #[test_case(r#"{ prompt = "compaction_system", content = "x" }"# ; "unsupported_compaction_system")]
+    #[test_case(r#"{ prompt = "plan_end", content = "x" }"# ; "unsupported_plan_end")]
     #[test_case(r#"{ prompt = "system" }"# ; "missing_whole_content")]
     #[test_case(r#"{ prompt = "system", content = function() return "x" end }"# ; "whole_callback")]
     #[test_case(r#"{ slot = "conventions", content = function() return "x" end }"# ; "section_callback")]

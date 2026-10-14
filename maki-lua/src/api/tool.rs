@@ -638,11 +638,17 @@ fn register_prompt(
     content: HintContent,
 ) -> LuaResult<()> {
     let explicit = prompts.is_some();
-    let prompts = prompts.unwrap_or_else(|| PromptId::ALL.to_vec());
     let replacing = match target {
         PromptTarget::Slot(slot) => slot.kind() == SlotKind::Singleton,
         PromptTarget::Section(_) | PromptTarget::Template => true,
     };
+    let prompts = prompts.unwrap_or_else(|| {
+        if replacing {
+            vec![PromptId::System]
+        } else {
+            PromptId::ALL.to_vec()
+        }
+    });
     let mut map = lua
         .app_data_mut::<PromptHintCallbacks>()
         .ok_or_else(|| mlua::Error::runtime("not initialized"))?;
@@ -1049,23 +1055,22 @@ fn register_prompt_hint(lua: &Lua, #[ctx] plugin: Arc<str>, spec: Table) -> LuaR
 /// string clears a template or section. The alphabetically last plugin wins,
 /// and its last registration wins within that plugin. Unload removes its values.
 ///
-/// Prompt IDs: `system`, `research`, `general`, `plan`, `plan_end`,
-/// `compaction_system`, `compaction_user`, `continuation`, and `btw_fallback`.
+/// Prompt IDs: `system`, `research`, `general`, and `plan`.
 /// Sections: `identity`, `tone`, `tool_usage`, `efficient_tools`, `conventions`,
 /// `after_instructions`, `objectivity`, and `completion`.
 ///
 /// Identity and tone are available in system, research, and general prompts.
-/// Specify `prompt = "system"` to limit a replacement to the main agent.
-/// Identity and tone also accept a function called before every run. Its first
-/// value goes in the system prompt. Later changes reach the main agent as a
-/// context update. Other replacements require static strings.
+/// Sections target the main agent when `prompt` is omitted. Only identity and
+/// tone accept a function called before every run. Its first value goes in the
+/// system prompt. Later changes reach the main agent as a context update.
+/// Other replacements require static strings.
 /// A known section missing from the resolved template is ignored, with a warning
 /// for explicit prompt targets.
 ///
 /// @param spec table Prompt replacement:
 ///   slot    (string)         Optional. Named section, e.g. "identity", "tone", "conventions".
 ///   content (string|function) Required. Replacement text, including empty text. Max 1 MiB. Only identity and tone accept functions.
-///   prompt  (string|string[]) Optional for sections; defaults to conversational prompts containing the section. A whole replacement requires one explicit prompt ID.
+///   prompt  (string|string[]) Optional for sections; defaults to "system". A whole replacement requires one explicit prompt ID.
 /// @return
 /// @example
 /// maki.api.set_prompt({
