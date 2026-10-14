@@ -839,13 +839,19 @@ async fn session(
         .subagent_cancels
         .insert(ui_id.clone(), child_trigger);
 
+    let cancellation = Arc::new(SessionCancellation {
+        parent_cancels: Arc::clone(&agent_ctx.subagent_cancels),
+        ui_id,
+        slot: cancel_slot,
+        background: owner.as_ref().map(|_| BackgroundSessions::of(&lua)),
+    });
     let name = name.unwrap_or_default();
     let background = match owner {
         Some((session, task, cancel)) => {
             let registry = BackgroundSessions::of(&lua);
             try_pair!(registry.register(BackgroundSession {
                 info: BackgroundInfo {
-                    id: ui_id.clone(),
+                    id: cancellation.ui_id.clone(),
                     plugin,
                     name: name.clone(),
                     running: false,
@@ -889,7 +895,7 @@ async fn session(
             permissions: Arc::clone(&agent_ctx.permissions),
             session_id: agent_ctx.session_id.clone(),
             background_for: agent_ctx.background_for,
-            task_id: Some(Arc::from(ui_id.as_str())),
+            task_id: Some(Arc::from(cancellation.ui_id.as_str())),
             mailbox: None,
             timeouts: agent_ctx.timeouts,
             // Shared with the parent, not fresh: a lock that a subagent does
@@ -921,9 +927,7 @@ async fn session(
         answer_tx,
         reauth: agent_ctx.reauth,
         inbox: Arc::new(SubagentInbox::default()),
-        parent_cancels: Arc::clone(&agent_ctx.subagent_cancels),
-        ui_id,
-        cancel_slot,
+        cancellation: Arc::clone(&cancellation),
         parent_event_tx: parent_tx,
         subagent_info,
         local_tools: Arc::new(local_map),
@@ -934,10 +938,9 @@ async fn session(
         background,
     };
 
-    let background_id = state.background.as_ref().map(|_| state.ui_id.clone());
     let sess = lua.create_userdata(LuaSession {
         inner: Arc::new(AsyncMutex::new(state)),
-        background_id,
+        cancellation,
     })?;
     Ok((Some(sess), None))
 }
@@ -1149,13 +1152,7 @@ struct SessionState {
     /// Shared with the host through [`SubagentInfo`], so a user watching this
     /// session can queue messages that its next turn boundary picks up.
     inbox: Arc<SubagentInbox>,
-    parent_cancels: Arc<CancelMap<String>>,
-    /// Stable identity for UI, cancel, and history. Falls back to a synthetic
-    /// id for workflow-mode sessions (no model-issued tool call exists).
-    /// Shared with any sibling session the same tool call opened.
-    ui_id: String,
-    /// Which registration under [`ui_id`](Self::ui_id) is ours.
-    cancel_slot: CancelSlot,
+    cancellation: Arc<SessionCancellation>,
     parent_event_tx: EventSender,
     subagent_info: Arc<OnceLock<SubagentInfo>>,
     local_tools: LocalTools,
@@ -1238,14 +1235,11 @@ impl SessionState {
         }
         self.closed = true;
         self.stream_guard.take();
-        self.parent_cancels.retire(&self.ui_id, self.cancel_slot);
-        if let Some(background) = &self.background {
-            background.registry.remove(&self.ui_id);
-        }
+        self.cancellation.cancel();
         let usage = self.params.ledger.totals().usage;
         let messages = std::mem::replace(&mut self.history, History::new(Vec::new())).into_vec();
         let _ = self.parent_event_tx.send(AgentEvent::SubagentHistory {
-            tool_use_id: self.ui_id.clone(),
+            tool_use_id: self.cancellation.ui_id.clone(),
             messages,
         });
         info!(
@@ -1260,9 +1254,29 @@ impl SessionState {
 
 struct LuaSession {
     inner: Arc<AsyncMutex<SessionState>>,
-    /// A background session's registry id, kept out here because a running
-    /// prompt holds `inner` until it ends, and that can be never.
-    background_id: Option<String>,
+    cancellation: Arc<SessionCancellation>,
+}
+
+struct SessionCancellation {
+    parent_cancels: Arc<CancelMap<String>>,
+    ui_id: String,
+    slot: CancelSlot,
+    background: Option<BackgroundSessions>,
+}
+
+impl SessionCancellation {
+    fn cancel(&self) {
+        self.parent_cancels.retire(&self.ui_id, self.slot);
+        if let Some(registry) = &self.background {
+            registry.remove(&self.ui_id);
+        }
+    }
+}
+
+impl Drop for SessionCancellation {
+    fn drop(&mut self) {
+        self.cancel();
+    }
 }
 
 impl Drop for LuaSession {
@@ -1309,7 +1323,10 @@ async fn prompt(
     // wait for the session lock to the end of the run, or the handler would sit
     // there until the host gives up on it. Only the caller's own stack knows
     // which task it is, so this has to happen before the first await.
-    let caller_cancel = match (this.background_id.is_some(), active_task_cancel(&lua)) {
+    let caller_cancel = match (
+        this.cancellation.background.is_some(),
+        active_task_cancel(&lua),
+    ) {
         (false, _) => None,
         (true, Some((_, cancel))) => Some(cancel),
         (true, None) => return Ok(err_pair(TASK_REQUIRED_ERR)),
@@ -1341,13 +1358,16 @@ async fn prompt(
                 seed.chat_opts(),
                 &s.params.model,
             );
-            Some((caller_cancel, background.start_prompt(&s.ui_id)))
+            Some((
+                caller_cancel,
+                background.start_prompt(&s.cancellation.ui_id),
+            ))
         }
         _ => None,
     };
     if s.subagent_info.get().is_none() {
         let _ = s.subagent_info.set(SubagentInfo {
-            parent_tool_use_id: s.ui_id.clone(),
+            parent_tool_use_id: s.cancellation.ui_id.clone(),
             name: s.name.clone(),
             prompt: Some(message.clone()),
             model: Some(s.params.model.spec()),
@@ -1485,15 +1505,15 @@ async fn prompt(
 ///
 /// @return
 #[lua_fn]
-async fn close(lua: Lua, this: mlua::UserDataRef<LuaSession>) -> LuaResult<()> {
+async fn close(_lua: Lua, this: mlua::UserDataRef<LuaSession>) -> LuaResult<()> {
     let inner = Arc::clone(&this.inner);
     // Dropping the entry cancels the prompt, so the lock below frees up soon.
     // Taking the lock first would wait on a prompt that may never end. Worst
     // case is a `SessionEnd` callback: the host cancels the session's
     // background work only after the callbacks return, so it would wait on
     // itself and hold up every hook behind it.
-    if let Some(id) = &this.background_id {
-        BackgroundSessions::of(&lua).remove(id);
+    if let Some(registry) = &this.cancellation.background {
+        registry.remove(&this.cancellation.ui_id);
     }
     drop(this);
     let mut s = inner.lock().await;
@@ -1529,14 +1549,67 @@ fn call_local_tool(
 #[cfg(test)]
 mod tests {
     use futures_lite::future::poll_once;
+    use maki_agent::tools::test_support::stub_ctx_with;
     use maki_agent::{DoneReason, TurnCompleteEvent};
     use maki_providers::{Message, TokenUsage};
+    use mlua::AnyUserData;
     use serde_json::json;
+    use test_case::test_case;
 
     use super::*;
     use crate::runtime::{TaskCell, TaskScope};
 
     const PLUGIN: &str = "monitor";
+
+    async fn native_session(lua: &Lua, ctx: &ToolContext) -> AnyUserData {
+        lua.set_app_data(Arc::clone(ToolRegistry::global_arc()));
+        let ctx = lua.create_userdata(LuaCtx::handler(ctx)).unwrap();
+        let (session, error) = session(
+            lua.clone(),
+            Arc::from(PLUGIN),
+            PluginPermissions::trusted(),
+            LuaEither::Left(ctx.borrow().unwrap()),
+            Some(lua.create_table().unwrap()),
+        )
+        .await
+        .unwrap();
+        assert!(error.is_none(), "{error:?}");
+        session.unwrap()
+    }
+
+    #[test_case(false ; "close")]
+    #[test_case(true ; "dispose")]
+    fn closing_a_session_leaves_its_siblings_running(dispose: bool) {
+        let lua = Lua::new();
+        let ctx = stub_ctx_with(&AgentMode::Build, None, Some(PARENT_ID));
+        smol::block_on(async {
+            let first = native_session(&lua, &ctx).await;
+            let sibling = native_session(&lua, &ctx).await;
+            if dispose {
+                drop(first.take::<LuaSession>().unwrap());
+            } else {
+                close(lua.clone(), first.borrow().unwrap()).await.unwrap();
+                close(lua.clone(), first.borrow().unwrap()).await.unwrap();
+            }
+            let replacement = native_session(&lua, &ctx).await;
+            if !dispose {
+                close(lua.clone(), first.borrow().unwrap()).await.unwrap();
+            }
+            for session in [sibling, replacement] {
+                assert!(
+                    !session
+                        .borrow::<LuaSession>()
+                        .unwrap()
+                        .inner
+                        .lock()
+                        .await
+                        .child_cancel
+                        .is_cancelled()
+                );
+                close(lua.clone(), session.borrow().unwrap()).await.unwrap();
+            }
+        });
+    }
 
     fn call(src: &str, input: JsonValue) -> Result<String, String> {
         let lua = Lua::new();
