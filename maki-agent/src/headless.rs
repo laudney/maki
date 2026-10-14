@@ -580,7 +580,7 @@ mod tests {
         let model = Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap();
         let context = spec.render(&model, false);
         assert_eq!(context.system, expected);
-        assert!(context.facts.is_none());
+        assert_eq!(context.facts.is_none(), explicit.is_some());
         assert!(!context.system.contains(OMITTED_INSTRUCTIONS));
     }
 

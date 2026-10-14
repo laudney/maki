@@ -88,11 +88,13 @@ the built-in default. Complete templates and section overrides compose after
 all registrations are resolved.
 
 Whole templates and default section replacements take static strings.
-Identity and tone also accept functions. Under the built-in main template,
-changed values arrive through context updates, including fallback values after
-plugin unload. A complete main template starts a new frame when its rendered
-text changes. Changing static replacement policy starts an announced new
-request frame. A stored frame takes precedence over `btw_fallback` for side questions.
+Identity and tone also accept functions. Changed values arrive through context
+updates. Unloading the last override tells the model that it no longer applies.
+Changes to the date, working directory, or project instructions also use
+context updates, including with a complete main template. Changing the static
+system or plan replacement policy starts an announced new request frame.
+A changed plan prompt applies when the agent next enters plan mode. A stored
+frame takes precedence over `btw_fallback` for side questions.
 An explicit SDK system-prompt override takes precedence over a plugin's main
 template.
 

@@ -1057,10 +1057,8 @@ fn register_prompt_hint(lua: &Lua, #[ctx] plugin: Arc<str>, spec: Table) -> LuaR
 /// Identity and tone are available in system, research, and general prompts.
 /// Specify `prompt = "system"` to limit a replacement to the main agent.
 /// Identity and tone also accept a function called before every run. Its first
-/// value goes in the system prompt. Under the built-in main template, later
-/// changes reach the model as a context update. Under a complete main template,
-/// changed rendered text starts a new frame. Other replacements require static
-/// strings.
+/// value goes in the system prompt. Later changes reach the main agent as a
+/// context update. Other replacements require static strings.
 /// A known section missing from the resolved template is ignored, with a warning
 /// for explicit prompt targets.
 ///

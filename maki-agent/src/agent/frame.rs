@@ -59,9 +59,6 @@ impl RunContext {
         tools: RequestTools,
     ) -> Self {
         let system = build_system_prompt(vars, instructions, slots, model);
-        if slots.has_template(PromptId::System) {
-            return Self::fixed(system, tools).with_prompt_policy(slots);
-        }
         Self {
             system,
             tools,
@@ -69,7 +66,11 @@ impl RunContext {
                 date: vars.apply("{date}").into_owned(),
                 cwd: vars.apply("{cwd}").into_owned(),
                 model: model.spec(),
-                instructions: instructions.to_owned(),
+                instructions: if slots.renders_instructions(PromptId::System) {
+                    instructions.to_owned()
+                } else {
+                    String::new()
+                },
                 hints: hint_facts(slots),
             }),
             authored: String::new(),
@@ -104,10 +105,10 @@ fn hint_facts(slots: &ResolvedPrompts) -> BTreeMap<String, String> {
     let mut hints: BTreeMap<String, String> = BTreeMap::new();
     for slot in Slot::iter() {
         if slot.kind() == SlotKind::Singleton {
-            hints.insert(
-                format!("prompt/{slot}"),
-                slots.section(PromptId::System, slot),
-            );
+            let content = slots.section(PromptId::System, slot);
+            if content != PromptId::System.default_section(slot) {
+                hints.insert(format!("prompt/{slot}"), content);
+            }
             continue;
         }
         for entry in slots.get(PromptId::System, slot) {

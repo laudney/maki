@@ -28,6 +28,7 @@ pub const DEFAULT_TONE: &str = include_str!("prompts/system_tone.md");
 
 const DEFAULT_EFFICIENT_TOOLS: &str = include_str!("prompts/efficient_tools.md");
 const INSTRUCTIONS_MARKER: &str = "instructions";
+const INSTRUCTIONS_SLOT: &str = "{{instructions}}";
 
 /// Singleton slots retain only the last contribution. Aggregate slots append
 /// every contribution to the selected section default.
@@ -128,7 +129,7 @@ impl PromptId {
         self.template().contains(slot.marker())
     }
 
-    fn default_section(self, slot: Slot) -> &'static str {
+    pub(crate) fn default_section(self, slot: Slot) -> &'static str {
         match (self, slot) {
             (PromptId::System, Slot::Identity) => DEFAULT_IDENTITY,
             (PromptId::System, Slot::Tone) => DEFAULT_TONE,
@@ -202,6 +203,10 @@ impl ResolvedPrompts {
         self.template(prompt).contains(slot.marker())
     }
 
+    pub fn renders_instructions(&self, prompt: PromptId) -> bool {
+        self.template(prompt).contains(INSTRUCTIONS_SLOT)
+    }
+
     pub fn template(&self, prompt: PromptId) -> &str {
         self.templates
             .get(&prompt)
@@ -213,7 +218,7 @@ impl ResolvedPrompts {
     /// delimiters in content from making distinct policies share a key.
     pub fn policy_key(&self) -> String {
         let mut key = String::new();
-        for prompt in PromptId::iter() {
+        for prompt in [PromptId::System, PromptId::Plan] {
             if let Some(content) = self.templates.get(&prompt) {
                 key.push_str(&format!("template:{prompt}:{}:{content};", content.len()));
             }
@@ -656,20 +661,24 @@ mod tests {
     }
 
     #[test]
-    fn policy_covers_all_static_replacements_but_not_legacy_hints() {
+    fn frame_policy_covers_only_system_and_plan_static_replacements() {
         let mut prompts = slots(PromptId::System, &[(Slot::Identity, "Legacy identity")]);
         assert!(prompts.policy_key().is_empty());
-        assert!(!prompts.has_replacements());
-        let mut keys = Vec::new();
-        for id in PromptId::iter() {
+        for id in [PromptId::Research, PromptId::General] {
             prompts.set_template(id, String::new());
-            let key = prompts.policy_key();
-            assert!(!key.is_empty());
-            assert!(!keys.contains(&key));
-            keys.push(key);
+            prompts.set_section(id, Slot::Objectivity, String::new());
+            assert!(prompts.policy_key().is_empty());
         }
-        prompts.set_section(PromptId::System, Slot::Objectivity, String::new());
-        assert!(!keys.contains(&prompts.policy_key()));
+        let mut keys = vec![prompts.policy_key()];
+        for id in [PromptId::System, PromptId::Plan] {
+            prompts.set_template(id, String::new());
+            keys.push(prompts.policy_key());
+            prompts.set_section(id, Slot::Objectivity, String::new());
+            keys.push(prompts.policy_key());
+        }
+        for (index, key) in keys.iter().enumerate() {
+            assert!(!keys[index + 1..].contains(key));
+        }
     }
 
     #[test]

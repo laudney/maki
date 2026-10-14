@@ -443,11 +443,6 @@ impl<'h> Agent<'h> {
             self.event_tx.send(AgentEvent::Notice {
                 text: FRAME_REBUILT.into(),
             })?;
-            if self.mode.plan_path().is_some() {
-                let mut told = self.history.told().unwrap_or_default();
-                told.plan = None;
-                self.tell_changes_from(&told);
-            }
         }
         Ok(())
     }
@@ -457,19 +452,16 @@ impl<'h> Agent<'h> {
     /// (a run start, an interrupt switching modes, a model switch, a
     /// compaction) has to remember to tell it.
     fn tell_changes(&mut self) {
-        let Some(told) = self.history.told() else {
-            return;
-        };
-        self.tell_changes_from(&told);
-    }
-
-    fn tell_changes_from(&mut self, told: &LiveFacts) {
         // Plan mode is in no rendered prompt, so only the agent knows it.
         let now = LiveFacts {
             plan: self.mode.plan_path().map(Path::to_path_buf),
             prompt: self.prompt_facts.clone(),
         };
-        if let Some(update) = context_update(told, &now, &self.prompt_slots) {
+        if let Some(update) = self
+            .history
+            .told()
+            .and_then(|told| context_update(&told, &now, &self.prompt_slots))
+        {
             self.history.push(update);
         }
     }
@@ -1500,6 +1492,101 @@ mod tests {
         });
     }
 
+    #[test_case(false ; "no_persona")]
+    #[test_case(true ; "explicit_default_persona")]
+    fn legacy_frame_resume_does_not_announce_default_singletons(explicit_defaults: bool) {
+        smol::block_on(async {
+            let mut prompts = ResolvedPrompts::default();
+            if explicit_defaults {
+                for slot in [Slot::Identity, Slot::Tone] {
+                    prompts.insert(
+                        PromptId::System,
+                        slot,
+                        SlotEntry {
+                            plugin: Arc::from("persona"),
+                            content: PromptId::System.default_section(slot).into(),
+                        },
+                    );
+                }
+            }
+            let prompts = Arc::new(prompts);
+            let model = default_model();
+            let context =
+                RunContext::render(&Vars::new(), "", &prompts, &model, RequestTools::default());
+            let mut history = History::new(Vec::new());
+            fit_frame(&mut history, context, None, &model);
+            let mut stored = history.frame().unwrap().as_ref().clone();
+            stored.facts.as_mut().unwrap().hints.clear();
+            let mut history = History::restored(Vec::new()).with_frame(Some(Arc::new(stored)));
+            let (mut agent, events) = make_agent(
+                MockProvider::new(vec![text_response(StopReason::EndTurn)]),
+                &mut history,
+            );
+            agent.context = Arc::new(move |model, _| {
+                RunContext::render(&Vars::new(), "", &prompts, model, RequestTools::default())
+            });
+            agent.run(default_input()).await.unwrap();
+            drop(agent);
+            assert!(updates(&history).is_empty());
+            assert!(!drain_events(&events).iter().any(|event| {
+                matches!(&event.event, AgentEvent::Notice { text } if text == FRAME_REBUILT)
+            }));
+        });
+    }
+
+    #[test_case("{environment}\n{{instructions}}", true ; "environment_and_instructions")]
+    #[test_case("A static analysis policy.", false ; "no_fact_markers")]
+    fn custom_main_template_reuses_frame_for_live_fact_changes(
+        template: &str,
+        renders_instructions: bool,
+    ) {
+        smol::block_on(async {
+            const OLD_DATE: &str = "2026-10-02";
+            const OLD_ENV: &str = "Previous environment";
+            const NEW_ENV: &str = "Current environment";
+            const OLD_INSTRUCTIONS: &str = "Previous instructions";
+            const NEW_INSTRUCTIONS: &str = "Current instructions";
+            let mock =
+                MockProvider::new((0..2).map(|_| text_response(StopReason::EndTurn)).collect());
+            let requests = Arc::clone(&mock.requests);
+            let provider: Arc<dyn Provider> = Arc::new(mock);
+            let mut prompts = ResolvedPrompts::default();
+            prompts.set_template(PromptId::System, template.into());
+            let prompts = Arc::new(prompts);
+            let mut history = History::new(Vec::new());
+            for changed in [false, true] {
+                let vars = Vars::new()
+                    .set("{environment}", if changed { NEW_ENV } else { OLD_ENV })
+                    .set("{cwd}", if changed { "/new" } else { "/old" })
+                    .set("{date}", if changed { NEXT_DATE } else { OLD_DATE });
+                let instructions = if changed {
+                    NEW_INSTRUCTIONS
+                } else {
+                    OLD_INSTRUCTIONS
+                };
+                let slots = Arc::clone(&prompts);
+                let (mut agent, events) =
+                    make_agent_with(Arc::clone(&provider), default_model(), &mut history);
+                agent.prompt_slots = Arc::clone(&prompts);
+                agent.context = Arc::new(move |model, _| {
+                    RunContext::render(&vars, instructions, &slots, model, RequestTools::default())
+                });
+                agent.run(default_input()).await.unwrap();
+                drop(agent);
+                assert!(!drain_events(&events).iter().any(|event| {
+                    matches!(&event.event, AgentEvent::Notice { text } if text == FRAME_REBUILT)
+                }));
+            }
+            let requests = requests.lock().unwrap();
+            assert_append_only(&requests[0], &requests[1]);
+            let updates = updates(&history);
+            assert_eq!(updates.len(), 1);
+            assert!(updates[0].contains("/new"));
+            assert!(updates[0].contains(NEXT_DATE));
+            assert_eq!(updates[0].contains(NEW_INSTRUCTIONS), renders_instructions);
+        });
+    }
+
     #[test]
     fn singleton_unload_updates_the_effective_identity() {
         smol::block_on(async {
@@ -1548,19 +1635,20 @@ mod tests {
                 .map(Value::to_string)
                 .collect::<String>();
             assert!(second.contains(FIRST_IDENTITY));
-            assert!(third.contains(DEFAULT_IDENTITY_PREFIX));
+            assert!(third.contains("`prompt/identity` no longer applies."));
+            assert!(!third.contains(DEFAULT_IDENTITY_PREFIX));
         });
     }
 
     #[test]
-    fn plan_policy_reload_reannounces_an_active_plan() {
+    fn changed_plan_policy_applies_on_next_entry() {
         smol::block_on(async {
             let mock =
-                MockProvider::new((0..2).map(|_| text_response(StopReason::EndTurn)).collect());
+                MockProvider::new((0..4).map(|_| text_response(StopReason::EndTurn)).collect());
             let requests = Arc::clone(&mock.requests);
             let provider: Arc<dyn Provider> = Arc::new(mock);
             let mut history = History::new(Vec::new());
-            for custom in [false, true] {
+            for (custom, plan) in [(false, true), (true, true), (true, false), (true, true)] {
                 let mut prompts = ResolvedPrompts::default();
                 if custom {
                     prompts.set_template(PromptId::Plan, CUSTOM_PLAN.into());
@@ -1574,7 +1662,11 @@ mod tests {
                 });
                 agent
                     .run(AgentInput {
-                        mode: AgentMode::Plan(Path::new("/plans/analysis.md").to_path_buf()),
+                        mode: if plan {
+                            AgentMode::Plan(Path::new("/plans/analysis.md").to_path_buf())
+                        } else {
+                            AgentMode::Build
+                        },
                         ..default_input()
                     })
                     .await
@@ -1586,9 +1678,16 @@ mod tests {
                 .iter()
                 .map(Value::to_string)
                 .collect::<String>();
-            assert!(messages.contains("Draft an analysis in /plans/analysis.md."));
+            assert_eq!(messages.matches("Plan mode ACTIVE").count(), 1);
+            assert!(!messages.contains("Draft an analysis in /plans/analysis.md."));
             let updates = updates(&history);
-            assert!(!updates.last().unwrap().contains("Plan mode ACTIVE"));
+            assert_eq!(updates.len(), 3);
+            assert!(
+                updates
+                    .last()
+                    .unwrap()
+                    .contains("Draft an analysis in /plans/analysis.md.")
+            );
         });
     }
 
