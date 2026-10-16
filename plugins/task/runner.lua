@@ -47,6 +47,10 @@ local schema = {
       type = "string",
       description = 'Model tier (optional, omit to use current model, capped at current tier):\n- "strong" (e.g. Opus): Deep reasoning, complex architecture, subtle bugs, most critical sections. ~5x cost of medium.\n- "medium" (e.g. Sonnet): Balanced. Refactors, features, multi-file changes.\n- "weak" (e.g. Haiku): Fast/cheap. Search, summarize, boilerplate, simple edits.',
     },
+    background = {
+      type = "boolean",
+      description = "Return a background task id immediately instead of waiting. Defaults to false.",
+    },
     thinking = {
       description = "Thinking: off|adaptive|minimal|low|medium|high|xhigh|max|int budget. Omit to inherit parent; capped at parent.",
     },

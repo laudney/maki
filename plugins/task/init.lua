@@ -14,6 +14,7 @@ local output_limits = require("maki.output_limits")
 require("picker")
 
 local Runner = require("runner")
+local Background = require("background")
 
 -- Worst case is a batch child: tool body + batch body indents (2 + 2),
 -- plus the transcript's scrollbar column.
@@ -32,6 +33,7 @@ Notes:
 2. The agent's result is not visible to the user. Summarize it in your response.
 3. Each invocation starts fresh - inline any needed context into the prompt.
 4. Tell it to return concise summaries with file:line refs, not full file contents.
+5. Set background=true to return an id immediately. Use task_result to wait for its result or task_cancel to stop it. Requires a live TUI chat. Background tasks cannot ask for permissions.
 ]]
 
 local examples = {
@@ -46,6 +48,10 @@ local function handler(input, ctx)
   local prepared, prepare_err = Runner.prepare(input, ctx)
   if prepare_err then
     return { llm_output = prepare_err, is_error = true }
+  end
+
+  if input.background == true then
+    return Background.start(prepared, ctx)
   end
 
   local permit = Runner.semaphore:acquire()
@@ -95,4 +101,39 @@ maki.api.register_tool({
   handler = handler,
   header = header,
   restore = restore,
+})
+
+local receipt_schema = {
+  type = "object",
+  required = { "id" },
+  additionalProperties = false,
+  properties = {
+    id = { type = "string", description = "Background task id returned by task in this chat." },
+  },
+}
+
+maki.api.register_tool({
+  name = "task_result",
+  description = "Wait for a background task and return its result. Results stay available until the chat ends or plugins reload. Cancelling this wait does not stop the task.",
+  kind = "execute",
+  audiences = { "main", "workflow" },
+  schema = receipt_schema,
+  timeout = false,
+  handler = Background.result,
+  header = function(input)
+    return input.id
+  end,
+  restore = restore,
+})
+
+maki.api.register_tool({
+  name = "task_cancel",
+  description = "Cancel a queued or running background task in this chat. Use task_result to read its final or partial output.",
+  kind = "execute",
+  audiences = { "main", "workflow" },
+  schema = receipt_schema,
+  handler = Background.cancel,
+  header = function(input)
+    return input.id
+  end,
 })
