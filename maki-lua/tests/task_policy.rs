@@ -11,6 +11,7 @@ use maki_lua::PluginHost;
 use serde_json::{Value, json};
 
 const TASK_PLUGIN_SRC: &str = include_str!("../../plugins/task/init.lua");
+const TASK_RUNNER_SRC: &str = include_str!("../../plugins/task/runner.lua");
 
 // Mirrors of the plugin's error contracts and policy numbers.
 const STRUCTURED_OUTPUT_TOOL: &str = "structured_output";
@@ -201,12 +202,26 @@ fn load_task_host_with_opts(
         .replace("@RAISE_MSG@", RAISE_MSG)
         .replace("@PARTIAL_TEXT@", PARTIAL_TEXT)
         .replace("@CANCELLED_ERR@", CANCELLED_ERR);
-    host.load_source_with_opts(
-        "task_policy",
-        &format!("{prelude}\n{TASK_PLUGIN_SRC}"),
-        opts,
-    )
-    .unwrap();
+    let source = format!(
+        r#"{prelude}
+local builtin_require = require
+local runner
+local function require(name)
+  if name == "runner" then
+    if runner == nil then
+      runner = (function()
+{TASK_RUNNER_SRC}
+      end)()
+    end
+    return runner
+  end
+  return builtin_require(name)
+end
+{TASK_PLUGIN_SRC}
+"#
+    );
+    host.load_source_with_opts("task_policy", &source, opts)
+        .unwrap();
     (reg, host)
 }
 
