@@ -125,14 +125,15 @@ local function build_body(ctx, code)
   return buf, view, highlight
 end
 
-local description = [[Execute Python in a sandbox where every tool is an async function.
+local description = [[Execute a Python subset (Monty) in a sandbox where every tool is an async function.
 
-Use for chained/dependent tool calls and filtering/processing results, e.g. filtering web tool output. **DRAMATICALLY** cheaper than sequential tool calls!
+Use for chained/dependent tool calls and filtering results before they enter context.
 
-- All tools are async and return strings: `result = await read(path='file.txt', offset=1, limit=0)`. Parse output yourself.
+- Tools are already in scope: `result = await read(path='file.txt', offset=1, limit=0)`. No `import tools` or `tools.read`. All tools are async and return strings, not objects. Parse output yourself.
 - Tool results are complete. Only what you print/return is capped.
 - Concurrency: `a, b = await gather(read(path='a.py', offset=1, limit=0), grep(pattern='x'))`. Pass calls directly, never wrapped in `async def`.
-- Available libs: re, asyncio, sys, os, json. No other imports, no classes, no network access. `open()` works on text files.
+- Use loops, lists/dicts, string methods, `re` and `json` to process results. Preloaded modules: re, asyncio, sys, os, json. Their APIs are limited: no `os.path`, `sys.exit` or `asyncio.create_task`.
+- Imports such as subprocess, glob, tempfile and yaml are unavailable. Call `await glob(pattern='...')` for file discovery. Use `await bash(command='...')` for shell commands, full Python or installed packages. No direct process or network access. `open()` works on text files.
 - Fresh sandbox each run: no state persists between executions.
 - 30s script timeout (`timeout` param); time awaiting tool calls doesn't count.
 - Skip it when a single tool call needs no transformation.
