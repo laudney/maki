@@ -44,8 +44,8 @@ pub use pack::{
 };
 pub use plugin_permissions::{Permission, PluginPermissions, Requested};
 pub use runtime::{
-    KILL_GRACE, MAX_INFLIGHT_TOOLS, PLAN_FORM_SLOT_DEADLINE, PLAN_ROW_HANDLER_DEADLINE,
-    RestoreItem, RestoreReason, WARM_TOOL_CAP,
+    KILL_GRACE, MAX_CODE_BLOCK_SOURCE_BYTES, MAX_INFLIGHT_TOOLS, PLAN_FORM_SLOT_DEADLINE,
+    PLAN_ROW_HANDLER_DEADLINE, RestoreItem, RestoreReason, WARM_TOOL_CAP,
 };
 pub use session_snapshot::{SessionQueueSnapshot, SessionSnapshot};
 
@@ -216,9 +216,16 @@ pub mod test_support {
         (handle.layering(&[crate::api::slot::PLAN_FORM_SLOT]), probe)
     }
 
-    pub fn probed_event_handle_layering_code_block() -> (crate::EventHandle, RequestProbe) {
+    pub fn probed_event_handle_layering_code_block(
+        languages: &[&str],
+    ) -> (crate::EventHandle, RequestProbe) {
         let (handle, probe) = probed_event_handle();
-        (handle.layering(&[crate::api::slot::CODE_BLOCK_SLOT]), probe)
+        let slots: Vec<String> = languages
+            .iter()
+            .map(|language| crate::api::slot::code_block_slot(language))
+            .collect();
+        let names: Vec<&str> = slots.iter().map(String::as_str).collect();
+        (handle.layering(&names), probe)
     }
 
     /// Publishes {binds} as one plugin's global keymap. The Lua state the

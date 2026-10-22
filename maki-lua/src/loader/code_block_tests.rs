@@ -10,10 +10,11 @@ use rustix::process::{Pid, PidfdFlags, pidfd_open};
 use test_case::test_case;
 
 use super::{CodeBlockRender, EventHandle, PluginHost};
-use crate::api::slot::CODE_BLOCK_SLOT;
+use crate::MAX_CODE_BLOCK_SOURCE_BYTES;
+use crate::api::slot::code_block_slot;
 use crate::api::util::command::{UiAction, UiReply};
 use crate::plugin_permissions::PluginPermissions;
-use crate::runtime::{MAX_CODE_BLOCK_SOURCE_BYTES, Request};
+use crate::runtime::Request;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 const LANGUAGE: &str = "mermaid";
@@ -27,7 +28,10 @@ fn host() -> PluginHost {
 }
 
 fn layer_source(body: &str) -> String {
-    format!("maki.api.set_slot('{CODE_BLOCK_SLOT}', function(prev, ev) {body} end)")
+    format!(
+        "maki.api.set_slot('{}', function(prev, ev) {body} end)",
+        code_block_slot(LANGUAGE)
+    )
 }
 
 fn layer(host: &PluginHost, name: &str, body: &str) {
@@ -100,6 +104,39 @@ fn code_block_layers_chain_in_registration_order() {
     assert_eq!(answer(&submit(&host)), Some(vec!["outer:inner".into()]));
 }
 
+#[test_case("ui.code_block"; "bare_slot")]
+#[test_case("ui.code_block.*"; "wildcard_slot")]
+#[test_case("ui.code_block.rust"; "another_language")]
+fn unclaimed_languages_are_declined_before_submission(slot: &str) {
+    let (tx, rx) = flume::unbounded();
+    let events = EventHandle::probed_for_test(tx).layering(&[slot]);
+    assert!(!events.code_block_layered(LANGUAGE));
+    let request = events.render_code_block(LANGUAGE.into(), SOURCE.into(), WIDTH);
+    assert_eq!(request.try_recv(), Ok(None));
+    assert!(rx.is_empty());
+}
+
+#[test]
+fn code_block_layers_only_receive_their_language() {
+    let host = host();
+    layer(
+        &host,
+        RENDERER,
+        "assert(ev.language == 'mermaid'); return { 'diagram' }",
+    );
+    host.load_source(
+        "text",
+        "maki.api.set_slot('ui.code_block.text', function(_, ev)\n\
+         assert(ev.language == 'text'); return { 'plain' } end)",
+    )
+    .unwrap();
+    assert_eq!(answer(&submit(&host)), Some(vec!["diagram".into()]));
+    let request = host
+        .event_handle()
+        .render_code_block("text".into(), SOURCE.into(), WIDTH);
+    assert_eq!(answer(&request), Some(vec!["plain".into()]));
+}
+
 #[test]
 fn a_broken_layer_defers_to_the_remaining_chain() {
     let host = host();
@@ -161,7 +198,7 @@ fn code_block_byte_limit_applies_even_when_each_line_fits() {
 #[test]
 fn zero_width_and_large_sources_are_declined_before_submission() {
     let (tx, rx) = flume::unbounded();
-    let events = EventHandle::probed_for_test(tx).layering(&[CODE_BLOCK_SLOT]);
+    let events = EventHandle::probed_for_test(tx).layering(&[&code_block_slot(LANGUAGE)]);
     for (code, width) in [
         (SOURCE.to_owned(), 0),
         ("a".repeat(MAX_CODE_BLOCK_SOURCE_BYTES + 1), WIDTH),
@@ -266,14 +303,14 @@ fn an_expired_queued_request_never_enters_the_callback() {
 fn slot_changes_invalidate_an_already_completed_reply() {
     let host = host();
     let events = host.event_handle();
-    assert!(!events.code_block_layered());
+    assert!(!events.code_block_layered(LANGUAGE));
     let initial_generation = events.code_block_generation();
     layer(
         &host,
         RENDERER,
         "maki.ui.flash('completed'); return { 'old' }",
     );
-    assert!(events.code_block_layered());
+    assert!(events.code_block_layered(LANGUAGE));
     assert!(events.code_block_generation() > initial_generation);
     let request = submit(&host);
     assert!(matches!(
@@ -282,7 +319,7 @@ fn slot_changes_invalidate_an_already_completed_reply() {
     ));
     host.unload(RENDERER).unwrap();
 
-    assert!(!events.code_block_layered());
+    assert!(!events.code_block_layered(LANGUAGE));
     assert_eq!(request.try_recv(), Ok(None));
     layer(&host, RENDERER, "return { 'new' }");
     assert_eq!(answer(&submit(&host)), Some(vec!["new".into()]));

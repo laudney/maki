@@ -1,7 +1,6 @@
-use maki_lua::{CodeBlockRender, EventHandle};
+use maki_lua::{CodeBlockRender, EventHandle, MAX_CODE_BLOCK_SOURCE_BYTES};
 
-const MAX_ENTRIES: usize = 128;
-const MAX_SOURCE_BYTES: usize = 32 * 1024;
+pub(super) const MAX_ENTRIES: usize = 128;
 
 enum RenderedBlock {
     Pending(CodeBlockRender),
@@ -11,6 +10,7 @@ enum RenderedBlock {
 struct Entry {
     language: String,
     source: String,
+    position: (usize, usize),
     rendered: RenderedBlock,
 }
 
@@ -19,7 +19,6 @@ pub(super) struct CodeBlockRenders {
     width: u16,
     theme: u64,
     generation: u64,
-    layered: bool,
 }
 
 impl CodeBlockRenders {
@@ -29,7 +28,6 @@ impl CodeBlockRenders {
             width: 0,
             theme: 0,
             generation: handle.code_block_generation(),
-            layered: handle.code_block_layered(),
         }
     }
 
@@ -50,13 +48,10 @@ impl CodeBlockRenders {
 
     pub fn poll(&mut self, handle: &EventHandle) -> bool {
         let generation = handle.code_block_generation();
-        let layered = handle.code_block_layered();
-        if self.generation != generation || self.layered != layered {
-            let changed = self.layered || layered;
+        if self.generation != generation {
             self.generation = generation;
-            self.layered = layered;
             self.clear();
-            return changed;
+            return true;
         }
         let mut changed = false;
         for entry in &mut self.entries {
@@ -83,30 +78,45 @@ impl CodeBlockRenders {
     pub fn render(
         &mut self,
         handle: &EventHandle,
+        position: (usize, usize),
         language: &str,
         source: &str,
         width: u16,
     ) -> Option<Vec<String>> {
-        if !self.layered || width == 0 || source.len() > MAX_SOURCE_BYTES {
+        if width == 0
+            || source.len() > MAX_CODE_BLOCK_SOURCE_BYTES
+            || !handle.code_block_layered(language)
+        {
             return None;
         }
         if let Some(entry) = self
             .entries
-            .iter()
+            .iter_mut()
             .find(|entry| entry.language == language && entry.source == source)
         {
+            entry.position = entry.position.max(position);
             return match &entry.rendered {
                 RenderedBlock::Ready(lines) => lines.clone(),
                 RenderedBlock::Pending(_) => None,
             };
         }
         if self.entries.len() == MAX_ENTRIES {
-            return None;
+            let (oldest, entry) = self
+                .entries
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, entry)| entry.position)?;
+            // Reflow must not let an evicted fence displace newer fences.
+            if position <= entry.position {
+                return None;
+            }
+            self.entries.swap_remove(oldest);
         }
         let request = handle.render_code_block(language.to_owned(), source.to_owned(), width);
         self.entries.push(Entry {
             language: language.to_owned(),
             source: source.to_owned(),
+            position,
             rendered: RenderedBlock::Pending(request),
         });
         None

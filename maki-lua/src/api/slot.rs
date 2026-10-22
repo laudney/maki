@@ -39,9 +39,11 @@ pub(crate) const PLAN_FORM_SLOT: &str = "ui.plan_form";
 /// Fired just before the plan form opens. The default answers with the
 /// built-in rows.
 pub(crate) const PLAN_FORM_ACTIONS_SLOT: &str = "ui.plan_form.actions";
-pub(crate) const CODE_BLOCK_SLOT: &str = "ui.code_block";
-
 const SEAM: &str = "slot";
+
+pub(crate) fn code_block_slot(language: &str) -> String {
+    format!("ui.code_block.{language}")
+}
 
 #[derive(Clone)]
 pub(crate) struct SlotLayer {
@@ -638,7 +640,10 @@ fn parse_slot_capability(
 /// menu, and `ui.plan_form` asks whether the form opens at all. Both are
 /// documented under [maki.plan](/docs/lua-api/#maki-plan).
 ///
-/// `ui.code_block` renders closed fenced blocks in assistant chat messages.
+/// `ui.code_block.<language>` renders closed fenced blocks in assistant chat
+/// messages for that language, for example `ui.code_block.mermaid`. Other
+/// languages display their source without calling a renderer. There is no
+/// catch-all slot.
 /// Its layer receives `function(prev, ev)` with
 /// `ev = { language = string, code = string, width = integer }`. Return a
 /// nonempty array of plain text lines, or call `prev(ev)` to defer. The host
@@ -652,9 +657,10 @@ fn parse_slot_capability(
 /// cannot contain control characters, and must fit `ev.width` terminal cells
 /// per line. Nil, invalid output, and errors leave the source visible. The
 /// host caches the result until width, theme, or slot registrations change.
-/// Each chat generation admits at most 128 distinct blocks. Additional blocks
-/// display their source. A resize or closed chat cancels pending work. Plugin
-/// reload drains pending work and invalidates old replies.
+/// The cache holds the 128 newest distinct claimed blocks. Older evicted
+/// blocks display their source until the layout or slots change. A resize or
+/// closed chat cancels pending work. Plugin reload drains pending work and
+/// invalidates old replies.
 ///
 /// Maki fires two slots per tool itself: `tool.<name>.input` before
 /// permissions look at the call, and `tool.<name>.output` on the text it
