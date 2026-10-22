@@ -54,8 +54,9 @@ pub use plugin_permissions::{
     Missing, Permission, PluginPermissions, PluginReach, Requested, SENDS_PROMPT,
 };
 pub use runtime::{
-    KILL_GRACE, MAX_INFLIGHT_TOOLS, MoveOutcome, PLAN_FORM_SLOT_DEADLINE,
-    PLAN_ROW_HANDLER_DEADLINE, RestoreItem, RestoreReason, SLICE_WARN, WARM_TOOL_CAP,
+    KILL_GRACE, MAX_CODE_BLOCK_SOURCE_BYTES, MAX_INFLIGHT_TOOLS, MoveOutcome,
+    PLAN_FORM_SLOT_DEADLINE, PLAN_ROW_HANDLER_DEADLINE, RestoreItem, RestoreReason, SLICE_WARN,
+    WARM_TOOL_CAP,
 };
 pub use session_snapshot::{SessionQueueSnapshot, SessionSnapshot};
 
@@ -241,9 +242,16 @@ pub mod test_support {
         (handle.layering(&[crate::api::slot::PLAN_FORM_SLOT]), probe)
     }
 
-    pub fn probed_event_handle_layering_code_block() -> (crate::EventHandle, RequestProbe) {
+    pub fn probed_event_handle_layering_code_block(
+        languages: &[&str],
+    ) -> (crate::EventHandle, RequestProbe) {
         let (handle, probe) = probed_event_handle();
-        (handle.layering(&[crate::api::slot::CODE_BLOCK_SLOT]), probe)
+        let slots: Vec<String> = languages
+            .iter()
+            .map(|language| crate::api::slot::code_block_slot(language))
+            .collect();
+        let names: Vec<&str> = slots.iter().map(String::as_str).collect();
+        (handle.layering(&names), probe)
     }
 
     /// Switches {reader}'s mode the way `maki.ui.set_mode` would.

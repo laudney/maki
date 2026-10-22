@@ -60,8 +60,8 @@ use crate::api::plan::{
     install_row_handlers, row_handler_opts, rows_from_table, rows_to_table,
 };
 use crate::api::slot::{
-    CODE_BLOCK_SLOT, ChainObserver, LayerCost, LayeredTools, PERMISSION_PROMPT_SLOT,
-    PLAN_FORM_ACTIONS_SLOT, PLAN_FORM_SLOT, SlotLayer, SlotStore, layer_plugins, run_host_chain,
+    ChainObserver, LayerCost, LayeredTools, PERMISSION_PROMPT_SLOT, PLAN_FORM_ACTIONS_SLOT,
+    PLAN_FORM_SLOT, SlotLayer, SlotStore, code_block_slot, layer_plugins, run_host_chain,
     run_host_chain_with,
 };
 use crate::api::tool::{
@@ -180,7 +180,7 @@ const FINAL_DRAIN_BUDGET: usize = 256;
 pub const PLAN_FORM_SLOT_DEADLINE: Duration = Duration::from_secs(5);
 pub(crate) const CODE_BLOCK_DEADLINE: Duration = Duration::from_secs(2);
 const CODE_BLOCK_COST: LayerCost<'static> = LayerCost::Named(&[Permission::SessionRead]);
-pub(crate) const MAX_CODE_BLOCK_SOURCE_BYTES: usize = 32 * 1024;
+pub const MAX_CODE_BLOCK_SOURCE_BYTES: usize = 32 * 1024;
 const MAX_CODE_BLOCK_LINES: usize = 256;
 const MAX_CODE_BLOCK_OUTPUT_BYTES: usize = 64 * 1024;
 const INVALID_CODE_BLOCK_ERR: &str = "code block renderer must return a dense, nonempty array of plain text lines within the display limits";
@@ -5856,11 +5856,13 @@ pub fn spawn(
                             let gate = Rc::clone(&gate);
                             let layered = Arc::clone(&layered_thread);
                             spawn_local(async move {
+                                let slot = code_block_slot(&language);
                                 if cancel.is_cancelled()
                                     || deadline <= Instant::now()
                                     || generation != layered.revision()
                                     || width == 0
                                     || code.len() > MAX_CODE_BLOCK_SOURCE_BYTES
+                                    || !layered.layers_surface(&slot)
                                 {
                                     let _ = reply.send(None);
                                     return;
@@ -5874,7 +5876,7 @@ pub fn spawn(
                                     let allow_layer = layer_delegation(&lua, &plugins, CODE_BLOCK_COST);
                                     run_host_chain_with(
                                         &lua,
-                                        &[CODE_BLOCK_SLOT],
+                                        &[&slot],
                                         default,
                                         MultiValue::from_vec(vec![LuaValue::Table(event)]),
                                         &allow_layer,
@@ -5889,11 +5891,11 @@ pub fn spawn(
                                     Ok(Ok(lines)) if generation == layered.revision() => lines,
                                     Ok(Ok(_)) => None,
                                     Ok(Err(error)) => {
-                                        tracing::warn!(slot = CODE_BLOCK_SLOT, plugins = %layer_plugins(&lua, CODE_BLOCK_SLOT), error = %strip_traceback(&error), "code block renderer failed");
+                                        tracing::warn!(slot = %slot, plugins = %layer_plugins(&lua, &slot), error = %strip_traceback(&error), "code block renderer failed");
                                         None
                                     }
                                     Err(reason) => {
-                                        tracing::debug!(slot = CODE_BLOCK_SLOT, plugins = %layer_plugins(&lua, CODE_BLOCK_SLOT), reason, "code block rendering abandoned");
+                                        tracing::debug!(slot = %slot, plugins = %layer_plugins(&lua, &slot), reason, "code block rendering abandoned");
                                         None
                                     }
                                 };

@@ -1145,11 +1145,20 @@ impl MessagesPanel {
             self.push_live_segment(lines, drawn_collapsed);
         }
         if !self.streaming_text.is_empty() {
+            let mut block_index = 0;
+            let message_index = self.messages.len();
             let lines = self
                 .streaming_text
                 .render_lines_with_code_blocks(width, |language, source, width| {
-                    self.code_blocks
-                        .render(&self.lua_event_handle, language, source, width)
+                    let position = (message_index, block_index);
+                    block_index += 1;
+                    self.code_blocks.render(
+                        &self.lua_event_handle,
+                        position,
+                        language,
+                        source,
+                        width,
+                    )
                 })
                 .to_vec();
             self.push_live_segment(lines, false);
@@ -1637,6 +1646,7 @@ impl MessagesPanel {
             } else {
                 let (lines, truncated) = message_view(
                     msg,
+                    i,
                     self.thinking_lines,
                     self.viewport_width,
                     &mut self.code_blocks,
@@ -1740,6 +1750,7 @@ impl MessagesPanel {
         };
         let (lines, truncated) = message_view(
             msg,
+            msg_idx,
             self.thinking_lines,
             width,
             &mut self.code_blocks,
@@ -1801,6 +1812,7 @@ fn message_search_text(msg: &DisplayMessage) -> String {
 /// collapsed, which is what makes a click on them expand it.
 fn message_view(
     msg: &DisplayMessage,
+    message_index: usize,
     mode: ThinkingLines,
     width: u16,
     code_blocks: &mut CodeBlockRenders,
@@ -1816,7 +1828,7 @@ fn message_view(
     {
         return (lines, true);
     }
-    let mut lines = build_message_lines(msg, width, code_blocks, handle);
+    let mut lines = build_message_lines(msg, message_index, width, code_blocks, handle);
     if let Some(end) = msg.task_end
         && let Some(first) = lines.first_mut()
     {
@@ -1855,6 +1867,7 @@ fn push_notice_detail(lines: &mut Vec<Line<'static>>, detail: &str, expanded: bo
 /// identical segments.
 fn build_message_lines(
     msg: &DisplayMessage,
+    message_index: usize,
     width: u16,
     code_blocks: &mut CodeBlockRenders,
     handle: &EventHandle,
@@ -1867,6 +1880,7 @@ fn build_message_lines(
         &msg.text
     };
     let mut lines = if matches!(msg.role, DisplayRole::Assistant) {
+        let mut block_index = 0;
         text_to_lines_with_code_blocks(
             text,
             prefix,
@@ -1874,7 +1888,11 @@ fn build_message_lines(
             style.prefix_style,
             width,
             style.max_line_bytes,
-            |language, source, width| code_blocks.render(handle, language, source, width),
+            |language, source, width| {
+                let position = (message_index, block_index);
+                block_index += 1;
+                code_blocks.render(handle, position, language, source, width)
+            },
         )
     } else if style.use_markdown {
         text_to_lines(

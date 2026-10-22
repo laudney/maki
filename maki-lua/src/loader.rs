@@ -20,7 +20,7 @@ use tokio::task::spawn_blocking;
 use crate::agent_autocmd::HostEvent;
 use crate::api::keymap::{KeybindTicket, KeymapReader};
 use crate::api::options::{PluginOptionSpecs, PluginOpts};
-use crate::api::slot::{CODE_BLOCK_SLOT, LayeredTools, PLAN_FORM_ACTIONS_SLOT, PLAN_FORM_SLOT};
+use crate::api::slot::{LayeredTools, PLAN_FORM_ACTIONS_SLOT, PLAN_FORM_SLOT, code_block_slot};
 use crate::api::ui::marks::InputRulesReader;
 use crate::api::util::command::{
     HintReader, LuaCommandReader, PlanActionOutcome, PlanFormRow, PlanMenu, UiAction, UiAttachment,
@@ -1181,13 +1181,13 @@ impl EventHandle {
         self.layered.revision()
     }
 
-    /// Whether any plugin can replace a code block's display.
-    pub fn code_block_layered(&self) -> bool {
-        self.layered.layers_surface(CODE_BLOCK_SLOT)
+    /// Whether a plugin registered a code-block layer for this language.
+    pub fn code_block_layered(&self, language: &str) -> bool {
+        self.layered.layers_surface(&code_block_slot(language))
     }
 
-    /// Starts a bounded, asynchronous `ui.code_block` request. The caller
-    /// keeps the source visible until this request answers with text lines.
+    /// Starts a bounded, asynchronous `ui.code_block.<language>` request. The
+    /// caller keeps the source visible until this request answers with text lines.
     pub fn render_code_block(&self, language: String, code: String, width: u16) -> CodeBlockRender {
         let deadline = Instant::now() + runtime::CODE_BLOCK_DEADLINE;
         let generation = self.code_block_generation();
@@ -1195,7 +1195,7 @@ impl EventHandle {
         let (trigger, cancel) = CancelToken::new();
         if width == 0
             || code.len() > runtime::MAX_CODE_BLOCK_SOURCE_BYTES
-            || !self.code_block_layered()
+            || !self.code_block_layered(&language)
         {
             let _ = reply.send(None);
         } else {
