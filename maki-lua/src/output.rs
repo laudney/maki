@@ -106,7 +106,7 @@ struct Captured {
     lines: VecDeque<Line>,
     retained: usize,
     total: usize,
-    started: bool,
+    line_count: usize,
 }
 
 impl Captured {
@@ -120,8 +120,8 @@ impl Captured {
         self.total = self
             .total
             .saturating_add(bytes)
-            .saturating_add(usize::from(self.started));
-        self.started = true;
+            .saturating_add(usize::from(self.line_count > 0));
+        self.line_count = self.line_count.saturating_add(1);
         let capacity = self.capacity();
         let max_lines = self.limits.lines.unwrap_or(usize::MAX).min(
             self.limits
@@ -175,11 +175,18 @@ impl Captured {
         } else {
             self.total
         };
-        if self.tail.is_some() {
-            with_notice(
+        if let Some(tail) = self.tail {
+            let mut result = with_notice(
                 prefix(&text, self.limits.bytes.unwrap_or(usize::MAX)),
                 total,
-            )
+            );
+            let dropped_lines = self.line_count.min(tail).saturating_sub(self.lines.len());
+            if dropped_lines > 0 {
+                result.push_str(&format!(
+                    "\n\n[truncated {dropped_lines} lines from requested tail]"
+                ));
+            }
+            result
         } else {
             truncate(&text, &self.limits, total)
         }
@@ -197,7 +204,7 @@ impl OutputCapture {
             lines: VecDeque::new(),
             retained: 0,
             total: 0,
-            started: false,
+            line_count: 0,
         })))
     }
 
@@ -426,6 +433,30 @@ mod tests {
                 bytes: Some(BYTES),
             },
             Some(3),
+        );
+        for line in input.split('\n') {
+            capture.append(line, line.len());
+        }
+        assert_eq!(capture.result(), expected);
+    }
+
+    #[test_case("a\nb\nc", 1, "c" ; "below_limit")]
+    #[test_case("a\nb\nc", 2, "b\nc" ; "at_limit")]
+    #[test_case("a\nb\nc", 3, "b\nc\n\n[truncated 1 lines from requested tail]" ; "above_limit")]
+    #[test_case("a\nb\nc", 5, "b\nc\n\n[truncated 1 lines from requested tail]" ; "short_input")]
+    #[test_case("a\nb\nc\nd\ne", 3, "d\ne\n\n[truncated 1 lines from requested tail]" ; "exclude_earlier_lines")]
+    #[test_case("a\nb\nc\nd\ne", 5, "d\ne\n\n[truncated 3 lines from requested tail]" ; "several_dropped_lines")]
+    fn tail_reports_only_lines_dropped_within_the_requested_window(
+        input: &str,
+        tail: usize,
+        expected: &str,
+    ) {
+        let capture = OutputCapture::new(
+            Limits {
+                lines: Some(2),
+                bytes: Some(1024),
+            },
+            Some(tail),
         );
         for line in input.split('\n') {
             capture.append(line, line.len());

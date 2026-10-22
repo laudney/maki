@@ -18,6 +18,7 @@ const CHUNK_BYTES: usize = 8 * 1024;
 const CHUNK_COUNT: usize = STREAM_BYTES / CHUNK_BYTES;
 const RECORD_COUNT: usize = MODEL_LINES * 3;
 const TAIL_LINES: usize = 2;
+const OVERSIZED_TAIL_LINES: usize = MODEL_LINES * 2;
 const TIMEOUT_SECS: usize = 120;
 const CALL_ID: &str = "output-capture-test";
 const FINAL_MARKER: &str = "final-output-marker";
@@ -98,21 +99,31 @@ fn bash_bounds_large_output_before_lua(single_line: bool) {
     );
 }
 
-#[test_case::test_case(0, false ; "stdout_success")]
-#[test_case::test_case(FAILURE_CODE, false ; "stdout_failure")]
-#[test_case::test_case(0, true ; "stderr_success")]
-#[test_case::test_case(FAILURE_CODE, true ; "stderr_failure")]
-fn bash_preserves_tail_and_exit_status(exit_code: usize, stderr: bool) {
+#[test_case::test_case(0, false, TAIL_LINES ; "stdout_success")]
+#[test_case::test_case(FAILURE_CODE, false, TAIL_LINES ; "stdout_failure")]
+#[test_case::test_case(0, true, TAIL_LINES ; "stderr_success")]
+#[test_case::test_case(FAILURE_CODE, true, TAIL_LINES ; "stderr_failure")]
+#[test_case::test_case(0, false, OVERSIZED_TAIL_LINES ; "limited_stdout_success")]
+#[test_case::test_case(FAILURE_CODE, false, OVERSIZED_TAIL_LINES ; "limited_stdout_failure")]
+#[test_case::test_case(0, true, OVERSIZED_TAIL_LINES ; "limited_stderr_success")]
+#[test_case::test_case(FAILURE_CODE, true, OVERSIZED_TAIL_LINES ; "limited_stderr_failure")]
+fn bash_preserves_tail_and_exit_status(exit_code: usize, stderr: bool, tail: usize) {
     let (_host, ctx) = setup();
     let redirect = if stderr { " >&2" } else { "" };
     let command = format!(
         "awk 'BEGIN {{ for (i = 0; i < {RECORD_COUNT}; i++) print \"record-\" i }}'{redirect}; exit {exit_code}"
     );
-    let output = run(&ctx, json!({ "command": command, "tail": TAIL_LINES }));
-    let expected = (RECORD_COUNT - TAIL_LINES..RECORD_COUNT)
+    let output = run(&ctx, json!({ "command": command, "tail": tail }));
+    let mut expected = (RECORD_COUNT - tail.min(MODEL_LINES)..RECORD_COUNT)
         .map(|i| format!("record-{i}"))
         .collect::<Vec<_>>()
         .join("\n");
+    if tail > MODEL_LINES {
+        let dropped = tail.min(RECORD_COUNT) - MODEL_LINES;
+        expected.push_str(&format!(
+            "\n\n[truncated {dropped} lines from requested tail]"
+        ));
+    }
     if exit_code == 0 {
         assert_eq!(output.unwrap(), expected);
     } else {
