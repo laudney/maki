@@ -528,7 +528,6 @@ pub enum Request {
         width: u16,
         generation: u64,
         cancel: CancelToken,
-        deadline: Instant,
         reply: flume::Sender<Option<Vec<String>>>,
     },
     ComputeHeader {
@@ -5848,7 +5847,6 @@ pub fn spawn(
                             width,
                             generation,
                             cancel,
-                            deadline,
                             reply,
                         } => {
                             let lua = rt.lua.clone();
@@ -5858,7 +5856,6 @@ pub fn spawn(
                             spawn_local(async move {
                                 let slot = code_block_slot(&language);
                                 if cancel.is_cancelled()
-                                    || deadline <= Instant::now()
                                     || generation != layered.revision()
                                     || width == 0
                                     || code.len() > MAX_CODE_BLOCK_SOURCE_BYTES
@@ -5867,6 +5864,7 @@ pub fn spawn(
                                     let _ = reply.send(None);
                                     return;
                                 }
+                                let deadline = Instant::now() + CODE_BLOCK_DEADLINE;
                                 let run = async {
                                     let event = lua.create_table()?;
                                     event.set("language", language)?;

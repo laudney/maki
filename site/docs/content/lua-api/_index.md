@@ -1239,8 +1239,9 @@ and are not parsed as Markdown. Stored messages and model context retain
 the source. Layers need `session_read` to receive code from the chat.
 This slot grants no other permissions. A renderer process still needs `run`.
 
-Rendering is asynchronous and has a two-second deadline. Only source up
-to 32 KiB reaches the slot. Output is limited to 256 lines and 64 KiB,
+Rendering is asynchronous, with a two-second deadline starting when Lua
+begins the request. Only source up to 32 KiB reaches the slot. Output is
+limited to 256 lines and 64 KiB,
 cannot contain control characters, and must fit `ev.width` terminal cells
 per line. Nil, invalid output, and errors leave the source visible. The
 host caches the result until width, theme, or slot registrations change.

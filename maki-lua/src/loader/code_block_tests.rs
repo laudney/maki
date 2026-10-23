@@ -1,7 +1,7 @@
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::thread;
+use std::time::Duration;
 
-use maki_agent::cancel::CancelToken;
 use maki_agent::tools::ToolRegistry;
 #[cfg(target_os = "linux")]
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
@@ -14,7 +14,7 @@ use crate::MAX_CODE_BLOCK_SOURCE_BYTES;
 use crate::api::slot::code_block_slot;
 use crate::api::util::command::{UiAction, UiReply};
 use crate::plugin_permissions::{Permission, PluginPermissions};
-use crate::runtime::Request;
+use crate::runtime::CODE_BLOCK_DEADLINE;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 const LANGUAGE: &str = "mermaid";
@@ -282,28 +282,21 @@ fn the_watchdog_stops_a_renderer_that_does_not_yield() {
 }
 
 #[test]
-fn an_expired_queued_request_never_enters_the_callback() {
+fn queue_wait_does_not_use_the_render_deadline() {
     let host = host();
-    layer(
-        &host,
-        RENDERER,
-        "maki.notify('unexpected'); return { 'late' }",
-    );
-    let (reply, rx) = flume::bounded(1);
-    host.inner
-        .tx
-        .send(Request::RenderCodeBlock {
-            language: LANGUAGE.into(),
-            code: SOURCE.into(),
-            width: WIDTH,
-            generation: host.event_handle().code_block_generation(),
-            cancel: CancelToken::none(),
-            deadline: Instant::now(),
-            reply,
-        })
-        .unwrap();
-    assert_eq!(rx.recv_timeout(TEST_TIMEOUT).unwrap(), None);
-    assert!(host.ui_action_rx().is_empty());
+    layer(&host, RENDERER, "return { 'rendered' }");
+    let (tx, rx) = flume::bounded(1);
+    let events = EventHandle {
+        tx,
+        ..host.event_handle()
+    };
+    let request = events.render_code_block(LANGUAGE.into(), SOURCE.into(), WIDTH);
+    let queued = rx.recv_timeout(TEST_TIMEOUT).unwrap();
+
+    thread::sleep(CODE_BLOCK_DEADLINE);
+    host.inner.tx.send(queued).unwrap();
+
+    assert_eq!(answer(&request), Some(vec!["rendered".into()]));
 }
 
 #[test]
