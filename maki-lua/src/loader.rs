@@ -1110,7 +1110,6 @@ impl EventHandle {
     /// Starts a bounded, asynchronous `ui.code_block.<language>` request. The
     /// caller keeps the source visible until this request answers with text lines.
     pub fn render_code_block(&self, language: String, code: String, width: u16) -> CodeBlockRender {
-        let deadline = Instant::now() + runtime::CODE_BLOCK_DEADLINE;
         let generation = self.code_block_generation();
         let (reply, rx) = flume::bounded(1);
         let (trigger, cancel) = CancelToken::new();
@@ -1126,7 +1125,6 @@ impl EventHandle {
                 width,
                 generation,
                 cancel,
-                deadline,
                 reply,
             });
         }
