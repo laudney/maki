@@ -1,6 +1,8 @@
 local LINE_FMT = "%4d | %s"
 local LINE_PAT = "^%s*%d+ | (.*)$"
 
+local SKILL_OPEN = "<skill_content>\n"
+local SKILL_CLOSE = "\n</skill_content>"
 local MAX_NAME_LENGTH = 64
 local MAX_DESCRIPTION_LENGTH = 1024
 local MAX_COMPATIBILITY_LENGTH = 500
@@ -81,6 +83,21 @@ function M.validate_frontmatter(fm, directory)
       return nil, "compatibility exceeds " .. MAX_COMPATIBILITY_LENGTH .. " characters"
     end
   end
+  for _, field in ipairs({ "license", "allowed-tools" }) do
+    if fm[field] ~= nil and type(fm[field]) ~= "string" then
+      return nil, field .. " must be a string"
+    end
+  end
+  if fm.metadata ~= nil then
+    if type(fm.metadata) ~= "table" then
+      return nil, "metadata must be a string-to-string mapping"
+    end
+    for key, value in pairs(fm.metadata) do
+      if type(key) ~= "string" or type(value) ~= "string" then
+        return nil, "metadata must be a string-to-string mapping"
+      end
+    end
+  end
   local warnings = {}
   local name = fm.name
   if utf8.len(name) > MAX_NAME_LENGTH then
@@ -102,7 +119,7 @@ function M.scan_skill_dir(dir, skills)
       local path = maki.fs.joinpath(dir, entry[1], "SKILL.md")
       local content = maki.fs.read(path)
       if content then
-        local fm, body, err = M.parse_frontmatter(content)
+        local fm, _, err = M.parse_frontmatter(content)
         local warnings
         if fm then
           warnings, err = M.validate_frontmatter(fm, entry[1])
@@ -115,7 +132,12 @@ function M.scan_skill_dir(dir, skills)
           for _, warning in ipairs(warnings) do
             diagnostics[#diagnostics + 1] = path .. ": " .. warning
           end
-          skills[fm.name] = { name = fm.name, description = fm.description, content = body, location = path }
+          skills[fm.name] = {
+            name = fm.name,
+            description = fm.description,
+            content = content,
+            location = path,
+          }
         end
       end
     end
@@ -153,7 +175,19 @@ function M.format_output(location, content)
   return table.concat(lines, "\n")
 end
 
+function M.activation_output(skill)
+  local directory = not skill.location:match("^builtin:") and maki.fs.dirname(skill.location)
+  local content = skill.content
+  if directory then
+    content = content .. "\n\nSkill directory: " .. directory .. "\nResolve relative paths from this directory."
+  end
+  return SKILL_OPEN .. M.format_output(skill.location, content) .. SKILL_CLOSE
+end
+
 function M.parse_output(output)
+  if output:sub(1, #SKILL_OPEN) == SKILL_OPEN and output:sub(-#SKILL_CLOSE) == SKILL_CLOSE then
+    output = output:sub(#SKILL_OPEN + 1, -#SKILL_CLOSE - 1)
+  end
   local location, rest = output:match("^([^\n]*)\n(.*)$")
   if not location then
     return nil
