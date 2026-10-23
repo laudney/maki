@@ -1,7 +1,35 @@
 local LINE_FMT = "%4d | %s"
 local LINE_PAT = "^%s*%d+ | (.*)$"
 
+local MAX_NAME_LENGTH = 64
+local MAX_DESCRIPTION_LENGTH = 1024
+local MAX_COMPATIBILITY_LENGTH = 500
+local STRING_METADATA_FIELDS = {
+  name = true,
+  description = true,
+  compatibility = true,
+  license = true,
+  ["allowed-tools"] = true,
+}
+
 local M = {}
+
+local function quote_plain_metadata(yaml)
+  return yaml:gsub("[^\r\n]+", function(line)
+    local key, value = line:match("^([%a][%w%-]*):[ \t]+(.*)$")
+    if not STRING_METADATA_FIELDS[key] then
+      return line
+    end
+    value = value:gsub("[ \t]+#.*$", ""):gsub("[ \t]+$", "")
+    if value:find(":[ \t]") and not value:find("^[\"'%[%]{}>|&*!%%@`#]") then
+      local quoted = maki.json.encode(value)
+      if quoted then
+        return key .. ": " .. quoted
+      end
+    end
+    return line
+  end)
+end
 
 function M.parse_frontmatter(content)
   local rest = content:match("^%s*%-%-%-[ \t]*\r?\n(.*)")
@@ -16,6 +44,12 @@ function M.parse_frontmatter(content)
   local body = rest:sub(end_line + 1):match("^%s*(.-)%s*$")
   local fm, err = maki.yaml.decode(yaml_str)
   if err then
+    local quoted = quote_plain_metadata(yaml_str)
+    if quoted ~= yaml_str then
+      fm, err = maki.yaml.decode(quoted)
+    end
+  end
+  if err then
     return nil, nil, "invalid YAML: " .. err
   end
   if type(fm) ~= "table" then
@@ -27,6 +61,66 @@ function M.parse_frontmatter(content)
     end
   end
   return fm, body
+end
+
+function M.validate_frontmatter(fm, directory)
+  for _, field in ipairs({ "name", "description" }) do
+    if type(fm[field]) ~= "string" or not fm[field]:find("%S") then
+      return nil, field .. " must be a non-empty string"
+    end
+  end
+  if utf8.len(fm.description) > MAX_DESCRIPTION_LENGTH then
+    return nil, "description exceeds " .. MAX_DESCRIPTION_LENGTH .. " characters"
+  end
+  local compatibility: string? = fm.compatibility
+  if compatibility ~= nil then
+    if type(compatibility) ~= "string" or not compatibility:find("%S") then
+      return nil, "compatibility must be a non-empty string"
+    end
+    if utf8.len(compatibility) > MAX_COMPATIBILITY_LENGTH then
+      return nil, "compatibility exceeds " .. MAX_COMPATIBILITY_LENGTH .. " characters"
+    end
+  end
+  local warnings = {}
+  local name = fm.name
+  if utf8.len(name) > MAX_NAME_LENGTH then
+    warnings[#warnings + 1] = "name exceeds " .. MAX_NAME_LENGTH .. " characters"
+  end
+  if name:find("[^a-z0-9%-]") or name:find("^%-") or name:find("%-$") or name:find("%-%-") then
+    warnings[#warnings + 1] = "name should use lowercase letters, digits, and single hyphens"
+  end
+  if name ~= directory then
+    warnings[#warnings + 1] = "name does not match directory " .. directory
+  end
+  return warnings
+end
+
+function M.scan_skill_dir(dir, skills)
+  local diagnostics, skipped = {}, {}
+  for _, entry in ipairs(maki.fs.dir(dir) or {}) do
+    if entry[2] == "directory" then
+      local path = maki.fs.joinpath(dir, entry[1], "SKILL.md")
+      local content = maki.fs.read(path)
+      if content then
+        local fm, body, err = M.parse_frontmatter(content)
+        local warnings
+        if fm then
+          warnings, err = M.validate_frontmatter(fm, entry[1])
+        end
+        if err then
+          local diagnostic = path .. ": " .. err
+          diagnostics[#diagnostics + 1] = diagnostic
+          skipped[#skipped + 1] = diagnostic
+        else
+          for _, warning in ipairs(warnings) do
+            diagnostics[#diagnostics + 1] = path .. ": " .. warning
+          end
+          skills[fm.name] = { name = fm.name, description = fm.description, content = body, location = path }
+        end
+      end
+    end
+  end
+  return diagnostics, skipped
 end
 
 function M.build_skill_list(skills)

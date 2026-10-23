@@ -37,6 +37,30 @@ case("frontmatter_with_leading_whitespace", function()
   eq(body, "Body here")
 end)
 
+case("frontmatter_recovers_plain_metadata_with_colons", function()
+  for _, newline in ipairs({ "\n", "\r\n" }) do
+    local fm, body, err = parse_frontmatter(table.concat({
+      "---",
+      "name: portable",
+      'description: Use when: the user asks about "PDFs" # parser comment',
+      "compatibility: Requires: Python 3",
+      "license: Custom: see LICENSE",
+      "allowed-tools: Bash(command: *)",
+      "metadata:",
+      '  author: "Team: docs"',
+      "---",
+      "Body: keep this unchanged",
+    }, newline))
+    eq(err, nil)
+    eq(fm.description, 'Use when: the user asks about "PDFs"')
+    eq(fm.compatibility, "Requires: Python 3")
+    eq(fm.license, "Custom: see LICENSE")
+    eq(fm["allowed-tools"], "Bash(command: *)")
+    eq(fm.metadata.author, "Team: docs")
+    eq(body, "Body: keep this unchanged")
+  end
+end)
+
 case("invalid_frontmatter_returns_a_diagnostic", function()
   for _, input in ipairs({
     "Plain instructions",
@@ -45,6 +69,8 @@ case("invalid_frontmatter_returns_a_diagnostic", function()
     "---\n123\n---\nBody",
     "---\nname: {nested: value}\n---\nBody",
     "---\nname: valid\ndescription: [wrong]\n---\nBody",
+    "---\nname: valid\ndescription: [unclosed: value\n---\nBody",
+    "---\nname: valid\ndescription: Use when: " .. string.char(255) .. "\n---\nBody",
   }) do
     local fm, body, err = parse_frontmatter(input)
     eq(fm, nil)
@@ -86,6 +112,62 @@ case("frontmatter_closing_delimiter_at_eof", function()
   local fm, body = parse_frontmatter("---\nname: portable\ndescription: Example\n---")
   eq(fm.name, "portable")
   eq(body, "")
+end)
+
+case("required_metadata_and_character_limits", function()
+  for _, fm in ipairs({
+    {},
+    { name = "valid" },
+    { name = "", description = "Example" },
+    { name = "valid", description = "  " },
+    { name = "valid", description = string.rep("x", 1025) },
+    { name = "valid", description = "Example", compatibility = "" },
+    { name = "valid", description = "Example", compatibility = string.rep("x", 501) },
+  }) do
+    local warnings, err = helpers.validate_frontmatter(fm, "valid")
+    eq(warnings, nil)
+    assert(err and #err > 0, "invalid metadata needs an error")
+  end
+  local fm = { name = "valid", description = string.rep("é", 1024), compatibility = string.rep("é", 500) }
+  local warnings, err = helpers.validate_frontmatter(fm, "valid")
+  eq(err, nil)
+  eq(#warnings, 0)
+end)
+
+case("cosmetic_name_issues_load_with_diagnostics", function()
+  for _, name in ipairs({ "Upper", "-start", "end-", "two--hyphens", "has space", string.rep("x", 65) }) do
+    local warnings, err = helpers.validate_frontmatter({ name = name, description = "Example" }, "other")
+    eq(err, nil)
+    assert(#warnings > 0, "name violations must be reported")
+  end
+end)
+
+case("discovery_keeps_valid_empty_body_and_skips_bad_neighbors", function()
+  local th = require("maki.test_helpers")
+  local dir = th.mktmpdir("skill_discovery")
+  local ok, err = pcall(function()
+    for name, content in pairs({
+      valid = "---\nname: valid\ndescription: Example\n---\n",
+      broken = "---\n123\n---\nBody",
+      missing = "---\nname: missing\n---\nBody",
+      portable = "---\nname: portable\ndescription: Use when: testing\n---\nBody",
+    }) do
+      maki.fs.mkdir(maki.fs.joinpath(dir, name))
+      maki.fs.write(maki.fs.joinpath(dir, name, "SKILL.md"), content)
+    end
+    local skills = {}
+    local diagnostics = helpers.scan_skill_dir(dir, skills)
+    eq(skills.valid.content, "")
+    eq(skills.broken, nil)
+    eq(skills.missing, nil)
+    eq(skills.portable.description, "Use when: testing")
+    eq(#diagnostics, 2)
+    for _, message in ipairs(diagnostics) do
+      assert(message:find(dir, 1, true), "diagnostic must identify the file")
+    end
+  end)
+  th.rmtree(dir)
+  assert(ok, err)
 end)
 
 -- ── build_skill_list ──
