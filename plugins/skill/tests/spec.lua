@@ -157,7 +157,8 @@ case("discovery_keeps_valid_empty_body_and_skips_bad_neighbors", function()
     end
     local skills = {}
     local diagnostics = helpers.scan_skill_dir(dir, skills)
-    eq(skills.valid.content, "")
+    local _, body = parse_frontmatter(skills.valid.content)
+    eq(body, "")
     eq(skills.broken, nil)
     eq(skills.missing, nil)
     eq(skills.portable.description, "Use when: testing")
@@ -201,6 +202,27 @@ case("build_skill_list_sorted_alphabetically", function()
   local zebra_pos = result:find("zebra")
   assert(alpha_pos < middle_pos, "alpha should come before middle")
   assert(middle_pos < zebra_pos, "middle should come before zebra")
+end)
+
+case("optional_metadata_types_are_checked", function()
+  for field, value in pairs({ license = {}, compatibility = {}, metadata = { version = 1 }, ["allowed-tools"] = {} }) do
+    local fm = { name = "release", description = "Example" }
+    fm[field] = value
+    local warnings, err = helpers.validate_frontmatter(fm, "release")
+    eq(warnings, nil)
+    assert(err and err:find(field, 1, true), "diagnostic must name the field")
+  end
+end)
+
+case("activation_retains_metadata_and_relative_path_base", function()
+  local source =
+    "---\nname: release\ndescription: Example\nlicense: MIT\ncompatibility: Requires python3\nmetadata:\n  version: '1'\nallowed-tools: Bash(git:*) Read\n---\n# Release"
+  local output = helpers.activation_output({ location = LOCATION, content = source })
+  local location, content = parse_output(output)
+  eq(location, LOCATION)
+  assert(content:find(source, 1, true), "activation must retain all metadata")
+  assert(content:find(maki.fs.dirname(LOCATION), 1, true), "activation must identify the resource base")
+  assert(output:find("<skill_content>", 1, true), "activation needs a durable content boundary")
 end)
 
 -- ── llm text round trip ──

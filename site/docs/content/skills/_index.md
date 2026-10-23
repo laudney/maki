@@ -65,9 +65,14 @@ Before skipping invalid YAML, Maki retries plain text metadata containing
 `: ` as quoted strings, such as `description: Use when: the user asks`.
 Structured values and other YAML errors still fail validation.
 
+The optional `license`, `compatibility`, `metadata`, and `allowed-tools`
+fields are retained when the skill loads. `metadata` must map strings to
+strings. `allowed-tools` is experimental and advisory in Maki. It does not
+approve tool calls or override your permission rules.
+
 ## How it gets used
 
-The `skill` tool lists every skill it found, the agent calls it with a name and gets the body back. A wrong name errors and reprints the list so the model can pick again.
+The `skill` tool lists every skill it found, the agent calls it with a name and gets the full file and its resource directory back. A wrong name errors and reprints the list so the model can pick again.
 
 Skills are not slash commands: typing `/git-release` does nothing unless you also add a [custom command](/docs/commands/#custom-commands). Ask the agent to use a skill, or let it pick one on its own.
 
