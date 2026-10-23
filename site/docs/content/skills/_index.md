@@ -13,7 +13,8 @@ Write one for anything you keep explaining: how you cut a release, how you write
 
 ## Where skills live
 
-A skill is a directory with a `SKILL.md` inside. Maki looks for them every time the `skill` tool runs (and once at startup, to build the list). When two skills share a name, the one found last wins:
+A skill is a directory with a `SKILL.md` inside. Maki looks for them every time the `skill` tool runs (and once at startup, to build the list). When two skills share a name, the one found last wins and Maki logs both
+paths. Directory entries are sorted by name before scanning:
 
 1. The builtin `maki-plugin-dev` (if enabled)
 2. `~/.config/maki/skills/` (Windows: `%APPDATA%\maki\skills\`)
@@ -22,9 +23,10 @@ A skill is a directory with a `SKILL.md` inside. Maki looks for them every time 
 
 So project skills beat personal ones, and a skill at the repo root beats one with the same name deeper down. The `.claude`, `.opencode` and `.agents` dirs are there so skills you already wrote for other agents keep working.
 
-[Folder trust](/docs/folder-trust/) does not gate skills. Every project skill
-name and description is in the system prompt from startup, trusted or not, so
-read a repository's skills before you work in it.
+[Folder trust](/docs/folder-trust/) gates project skills in every supported
+location. Untrusted projects contribute no skill names, descriptions, or
+instructions. Trust the project and restart or use `--trust` for one run.
+Personal and builtin skills remain available without project trust.
 
 Only `SKILL.md` is read. If you want extra notes, put them in files next to it and link them from the body, like `./notes.md`.
 

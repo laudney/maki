@@ -2487,6 +2487,22 @@ Requires the `fs_read` [plugin permission](#plugin-permissions).
 
 **Returns:** (`string?`) Legacy directory path, or nil if not present.
 
+---
+
+### `maki.env.project_dirs()` {#maki-env-project_dirs}
+
+```lua
+maki.env.project_dirs()
+```
+
+Return canonical directories from the working directory to the project root,
+nearest first. Empty when project content is disabled, including an
+unconfigured host. Session-only trust grants are included.
+
+Requires the `fs_read` [plugin permission](#plugin-permissions).
+
+**Returns:** (`string[]`) Trusted project directories.
+
 
 ## maki.fn {#maki-fn}
 
