@@ -72,7 +72,8 @@ approve tool calls or override your permission rules.
 
 ## How it gets used
 
-The `skill` tool lists every skill it found, the agent calls it with a name and gets the full file and its resource directory back. A wrong name errors and reprints the list so the model can pick again.
+The `skill` tool is registered only when skills are available. Its name
+parameter is restricted to the startup catalog. It lists every skill it found, the agent calls it with a name and gets the full file and its resource directory back. A wrong name errors and reprints the list so the model can pick again.
 
 Use `/skill git-release` to load a skill directly. Add a request after its
 name, such as `/skill git-release prepare the changelog`. Maki resolves and
