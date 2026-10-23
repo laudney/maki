@@ -74,7 +74,12 @@ approve tool calls or override your permission rules.
 
 The `skill` tool lists every skill it found, the agent calls it with a name and gets the full file and its resource directory back. A wrong name errors and reprints the list so the model can pick again.
 
-Skills are not slash commands: typing `/git-release` does nothing unless you also add a [custom command](/docs/commands/#custom-commands). Ask the agent to use a skill, or let it pick one on its own.
+Use `/skill git-release` to load a skill directly. Add a request after its
+name, such as `/skill git-release prepare the changelog`. Maki resolves and
+loads the file before it sends the prompt to the model. Missing or invalid
+skills report an error without starting a model request. You can also ask the
+agent to use a skill or let it select one. The same `/skill name [request]`
+syntax works in headless and ACP user messages.
 
 Loaded skill instructions survive manual and automatic compaction. Maki
 retains the latest successful load for each requested skill name from the

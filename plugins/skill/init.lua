@@ -1,3 +1,6 @@
+local SKILL_TOOL = "skill"
+local SKILL_COMMAND = "/" .. SKILL_TOOL
+local SKILL_USAGE = "Usage: /skill name [request]"
 local NOT_FOUND = "skill not found: "
 local REFERENCE_FILE = "lua-api.md"
 local REFERENCE_UNAVAILABLE = "(unavailable; full reference inlined below)"
@@ -113,6 +116,72 @@ local function discover_skills(skipped)
   return skills
 end
 
+local function load_skill(name)
+  local skill = discover_skills()[name]
+  if not skill then
+    return nil, NOT_FOUND .. name
+  end
+  if skill.resolve then
+    skill.content = skill.resolve()
+  end
+  return helpers.activation_output(skill)
+end
+
+local function load_request(args)
+  local name, request = args:match("^%s*(%S+)%s*(.*)$")
+  if not name then
+    return nil, SKILL_USAGE
+  end
+  local output, err = load_skill(name)
+  if not output then
+    return nil, err
+  end
+  local durable = { key = SKILL_TOOL .. ":" .. name, text = output }
+  if #request > 0 then
+    output = output .. "\n\n" .. request
+  end
+  return output, nil, durable
+end
+
+maki.api.set_slot("agent.user_message", function(prev, value, ctx)
+  local updated, reason = prev(value, ctx)
+  if type(updated) ~= "table" or type(updated.text) ~= "string" then
+    return updated, reason
+  end
+  local args = updated.text == SKILL_COMMAND and "" or updated.text:match("^" .. SKILL_COMMAND .. "%s+(.*)$")
+  if args == nil then
+    return updated
+  end
+  local output, err, durable = load_request(args)
+  if not output then
+    return nil, err
+  end
+  updated.text = output
+  updated.durable = durable
+  return updated
+end)
+
+maki.api.register_command({
+  name = SKILL_COMMAND,
+  nargs = "+",
+  description = "Load a skill: /skill name [request]",
+  handler = function(command)
+    if not command.fargs[1] then
+      maki.ui.flash(SKILL_USAGE)
+      return
+    end
+    local session, err = maki.session.current()
+    if not session then
+      maki.ui.flash(err)
+      return
+    end
+    local state, prompt_error = maki.session.prompt(SKILL_COMMAND .. " " .. command.args, { session = session })
+    if not state then
+      maki.ui.flash(prompt_error)
+    end
+  end,
+})
+
 local function view_opts(ctx)
   local tol = ctx:tool_output_lines()
   return { max_lines = (tol and tol.other) or 20, keep = "head" }
@@ -148,7 +217,7 @@ local description = "Load a skill that provides instructions and workflows for s
   .. build_skill_list(boot_skills)
 
 maki.api.register_tool({
-  name = "skill",
+  name = SKILL_TOOL,
   kind = "read",
   durable = "name",
   description = description,
@@ -173,17 +242,10 @@ maki.api.register_tool({
       return { llm_output = "error: name is required", is_error = true }
     end
 
-    local skills = discover_skills()
-    local skill = skills[input.name]
-    if not skill then
-      local available = build_skill_list(skills)
-      return { llm_output = NOT_FOUND .. input.name .. available, is_error = true }
+    local llm_output, err = load_skill(input.name)
+    if not llm_output then
+      return { llm_output = err .. build_skill_list(discover_skills()), is_error = true }
     end
-    if skill.resolve then
-      skill.content = skill.resolve()
-    end
-
-    local llm_output = helpers.activation_output(skill)
     local result = skill_view(llm_output, ctx)
     result.llm_output = llm_output
     return result
