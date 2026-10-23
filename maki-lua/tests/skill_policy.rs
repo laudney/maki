@@ -56,12 +56,14 @@ fn skill_declares_core_retention_without_a_compaction_hook() {
     }
 }
 
-fn isolated_skill_host() -> (tempfile::TempDir, Arc<ToolRegistry>, PluginHost) {
+fn isolated_skill_host(has_skill: bool) -> (tempfile::TempDir, Arc<ToolRegistry>, PluginHost) {
     let dir = tempfile::tempdir().unwrap();
     let skill_dir = dir.path().join(".maki/skills/release");
     std::fs::create_dir_all(&skill_dir).unwrap();
     std::fs::create_dir(dir.path().join(".git")).unwrap();
-    std::fs::write(skill_dir.join("SKILL.md"), RELEASE_SOURCE).unwrap();
+    if has_skill {
+        std::fs::write(skill_dir.join("SKILL.md"), RELEASE_SOURCE).unwrap();
+    }
     let registry = Arc::new(ToolRegistry::new());
     let host = PluginHost::new(Arc::clone(&registry)).unwrap();
     let source = format!(
@@ -69,7 +71,12 @@ fn isolated_skill_host() -> (tempfile::TempDir, Arc<ToolRegistry>, PluginHost) {
         serde_json::to_string(dir.path()).unwrap(),
         SKILL_SOURCE,
     );
-    host.load_source("skill", &source).unwrap();
+    host.load_source_with_opts(
+        "skill",
+        &source,
+        json!({ "plugin_dev": false }).as_object().unwrap().clone(),
+    )
+    .unwrap();
     (dir, registry, host)
 }
 
@@ -78,7 +85,7 @@ fn isolated_skill_host() -> (tempfile::TempDir, Arc<ToolRegistry>, PluginHost) {
 #[test_case("", false ; "missing_name_does_not_start_a_prompt")]
 #[test_case("release", false ; "invalidated_file_does_not_reach_the_model")]
 fn direct_skill_command_uses_the_shared_loader(args: &str, loads: bool) {
-    let (dir, registry, host) = isolated_skill_host();
+    let (dir, registry, host) = isolated_skill_host(true);
     if args == "release" && !loads {
         fs::write(
             dir.path().join(".maki/skills/release/SKILL.md"),
@@ -143,6 +150,22 @@ fn direct_skill_command_uses_the_shared_loader(args: &str, loads: bool) {
     }
 }
 
+#[test_case(true ; "names_are_constrained_to_the_catalog")]
+#[test_case(false ; "empty_catalog_has_no_tool")]
+fn skill_tool_matches_the_available_catalog(has_skill: bool) {
+    let (_dir, registry, _host) = isolated_skill_host(has_skill);
+    match registry.get("skill") {
+        Some(entry) if has_skill => {
+            assert_eq!(
+                entry.tool.schema()["properties"]["name"]["enum"],
+                json!(["release"])
+            );
+        }
+        None if !has_skill => {}
+        _ => panic!("the skill tool must match the available catalog"),
+    }
+}
+
 fn user_message_verdict(
     registry: &ToolRegistry,
     text: &str,
@@ -177,7 +200,7 @@ fn skill_activation_works_through_the_shared_agent_hook(
     text: &str,
     loads: Option<bool>,
 ) {
-    let (_dir, registry, _host) = isolated_skill_host();
+    let (_dir, registry, _host) = isolated_skill_host(true);
     match (loads, user_message_verdict(&registry, text, None, source)) {
         (Some(true), Verdict::Replaced(value)) => {
             let text = value["text"].as_str().unwrap();
