@@ -76,6 +76,11 @@ The `skill` tool lists every skill it found, the agent calls it with a name and 
 
 Skills are not slash commands: typing `/git-release` does nothing unless you also add a [custom command](/docs/commands/#custom-commands). Ask the agent to use a skill, or let it pick one on its own.
 
+Loaded skill instructions survive manual and automatic compaction. Maki
+retains the latest successful load for each requested skill name from the
+current transcript. Reset and rewind follow the same history as the rest of
+the session. Extra user requests are summarized normally.
+
 ## The builtin: maki-plugin-dev
 
 Maki ships one skill, `maki-plugin-dev`. It teaches the agent how to write maki Lua plugins, and on load it writes the full Lua API reference to a file in the state dir, so the agent can read it in pieces instead of swallowing it whole. It carries the same guide you can read in [Plugins](/docs/plugins/), so "write me a plugin that ..." is usually enough. Turn it off if you never write plugins:
