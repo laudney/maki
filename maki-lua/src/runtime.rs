@@ -4094,6 +4094,7 @@ impl LuaRuntime {
                     has_start_fn: t.start_key.is_some(),
                     permission: t.permission.as_ref().map(ToolPermission::kind),
                     mutable_path_field: t.mutable_path_field.clone(),
+                    durable_field: t.durable_field.clone(),
                     timeout: t.timeout,
                     start_annotation: t.start_annotation.clone(),
                     examples: t.examples.clone(),
