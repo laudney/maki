@@ -49,7 +49,21 @@ description: Cut a tagged release and open the changelog PR
 3. Only tag after the user confirms.
 ```
 
-The frontmatter is optional. Without it, the directory name is the skill name and the whole file is the body. An empty body is skipped. The `description` is what the model reads when picking a skill, so make it specific.
+Skills follow the [Agent Skills specification](https://agentskills.io/specification).
+YAML frontmatter must contain a non-empty `name` and `description`.
+Descriptions can contain up to 1024 characters. An optional `compatibility`
+string can contain up to 500 characters. Empty instruction bodies are allowed.
+
+Use a name of 1 to 64 lowercase letters, digits, and single hyphens, with no
+hyphen at either end. Match the directory name. Maki warns about name
+violations and loads the skill when possible, as the client integration guide
+recommends. Invalid YAML, missing required fields, and incorrect field types
+skip that file and report its path and cause at startup and in the log.
+Other skills remain available.
+
+Before skipping invalid YAML, Maki retries plain text metadata containing
+`: ` as quoted strings, such as `description: Use when: the user asks`.
+Structured values and other YAML errors still fail validation.
 
 ## How it gets used
 
