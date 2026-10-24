@@ -277,9 +277,14 @@ mod tests {
     use crate::app::tests::{
         MONITOR_ID, MONITOR_PLUGIN, RESEARCH_NAME, app_with_plugin_task, app_with_subagent_id,
         cancel_app, close_subagent_transcript, done, end_turn, error_app, finish_subagent,
-        plugin_event, start_subagent, subagent_info, test_app,
+        plugin_event, start_subagent, subagent_info, tempdir_app, test_app,
     };
     use crate::chat::{DONE_TEXT, ERROR_TEXT};
+    use maki_agent::session::StoredSession;
+    use maki_agent::{
+        AgentEvent, CancelToken, DETACHED_RUN_ID, Envelope, SubagentInfo, SubagentVerdict,
+    };
+    use maki_providers::Message;
     use test_case::test_case;
 
     const TASK_ID: &str = "toolu_01";
@@ -287,6 +292,146 @@ mod tests {
     const MISSING_ID: &str = "toolu_nope";
     const BUILD_NAME: &str = "build";
     const UNCHANGED_CHAT: usize = 2;
+
+    const QUEUED_PROMPT: &str = "inspect this queued child";
+
+    fn child_event(app: &mut App, info: SubagentInfo, event: AgentEvent) {
+        app.update(Msg::Agent(Box::new(Envelope {
+            event,
+            subagent: Some(info),
+            run_id: DETACHED_RUN_ID,
+        })));
+    }
+
+    #[test_case(false; "queued_child")]
+    #[test_case(true; "existing_row_without_prompt")]
+    fn child_promoted_before_worker_start_shows_prompt_once_and_restores(existing: bool) {
+        let (_tmp, _dir, _writer, mut app) = tempdir_app();
+        if existing {
+            start_subagent(&mut app, TASK_ID, BUILD_NAME);
+        }
+        let mut info = subagent_info(TASK_ID, BUILD_NAME);
+        info.owner_cancel = Some(CancelToken::none());
+        info.detached = true;
+        info.prompt = Some(QUEUED_PROMPT.into());
+        for _ in 0..2 {
+            child_event(
+                &mut app,
+                info.clone(),
+                AgentEvent::SubagentDetached {
+                    child: Box::new(info.clone()),
+                },
+            );
+        }
+        let idx = app.chat_of_task(TASK_ID).unwrap();
+        assert!(app.chats[idx].detached);
+        let prompts = (0..app.chats[idx].message_count())
+            .filter(|&index| {
+                let message = app.chats[idx].message_at(index).unwrap();
+                matches!(message.role, DisplayRole::User) && message.text == QUEUED_PROMPT
+            })
+            .count();
+        assert_eq!(prompts, 1);
+        let mut delayed = info.clone();
+        delayed.detached = false;
+        child_event(
+            &mut app,
+            delayed,
+            AgentEvent::TextDelta {
+                text: BUILD_NAME.into(),
+            },
+        );
+        end_turn(&mut app);
+        assert!(app.chats[idx].detached);
+        assert_eq!(app.chats[idx].task_status(), TaskStatus::Working);
+        child_event(
+            &mut app,
+            info.clone(),
+            AgentEvent::SubagentHistory {
+                tool_use_id: TASK_ID.into(),
+                messages: vec![Message::user(QUEUED_PROMPT.into())],
+                status: Some(SubagentVerdict::Done),
+            },
+        );
+        let claim = app.state.claim.clone();
+        app.state.session_mut().save(&claim, &app.storage).unwrap();
+        let stored = StoredSession::load(app.state.session.id, &app.storage).unwrap();
+        assert!(stored.subagents()[0].detached);
+        assert_eq!(
+            stored.subagent_messages()[TASK_ID]
+                .iter()
+                .filter(|message| message.user_text() == Some(QUEUED_PROMPT))
+                .count(),
+            1
+        );
+        app.apply_loaded_session(
+            crate::OpenSession {
+                session: stored,
+                claim,
+            },
+            &crate::components::test_model(),
+        );
+        let idx = app.chat_of_task(TASK_ID).unwrap();
+        assert!(app.chats[idx].detached);
+        assert_eq!(app.chats[idx].task_status(), TaskStatus::Done);
+        assert_eq!(app.chats[idx].message_at(0).unwrap().text, QUEUED_PROMPT);
+        assert_eq!(app.chats[idx].message_count(), 2);
+    }
+
+    #[test_case(false; "history_completed_first")]
+    #[test_case(true; "parent_completed_first")]
+    fn late_detachment_updates_finished_metadata_without_reviving_rows(parent: bool) {
+        let mut app = app_with_subagent_id(TASK_ID);
+        if parent {
+            end_turn(&mut app);
+        } else {
+            close_subagent_transcript(&mut app, TASK_ID);
+        }
+        let status = app.chats[1].task_status();
+        let count = app.chats.len();
+        let mut info = subagent_info(TASK_ID, BUILD_NAME);
+        info.owner_cancel = Some(CancelToken::none());
+        info.detached = true;
+        child_event(
+            &mut app,
+            info.clone(),
+            AgentEvent::SubagentDetached {
+                child: Box::new(info),
+            },
+        );
+        assert_eq!(app.chats.len(), count);
+        assert!(app.chats[1].detached);
+        assert_eq!(app.chats[1].task_status(), status);
+        assert!(!app.subagent_answers.contains_key(TASK_ID));
+        assert!(app.state.session.subagents()[0].detached);
+    }
+
+    #[test_case(false; "live_generation")]
+    #[test_case(true; "ended_generation")]
+    fn child_transport_keeps_lifetime_separate_from_presentation(ended: bool) {
+        let mut app = test_app();
+        let (generation, owner) = CancelToken::new();
+        let mut info = subagent_info(TASK_ID, BUILD_NAME);
+        info.owner_cancel = Some(owner);
+        if ended {
+            generation.cancel();
+        }
+        child_event(
+            &mut app,
+            info,
+            AgentEvent::TextDelta {
+                text: BUILD_NAME.into(),
+            },
+        );
+        if ended {
+            assert_eq!(app.chats.len(), 1);
+            return;
+        }
+        assert!(!app.chats[1].detached);
+        end_turn(&mut app);
+        assert_eq!(app.chats[1].task_status(), TaskStatus::Working);
+        assert!(app.chat_index.contains_key(TASK_ID));
+    }
 
     fn app_with_two_subagents() -> App {
         let mut app = app_with_subagent_id(TASK_ID);

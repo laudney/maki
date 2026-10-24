@@ -32,9 +32,9 @@ use crate::tools::{
     Deadline, FileAccess, LocalTools, ToolAudience, ToolContext, ToolFilter, ToolOutputMode,
 };
 use crate::{
-    AgentConfig, AgentError, AgentEvent, AgentInput, AgentMode, DoneReason, EventSender,
-    ExtractedCommand, InputSource, InterruptSource, RunLedger, SessionMailbox, SteerKind,
-    TurnCompleteEvent,
+    AgentConfig, AgentError, AgentEvent, AgentInput, AgentMode, ChildPresentation, DoneReason,
+    EventSender, ExtractedCommand, InputSource, InterruptSource, RunLedger, SessionMailbox,
+    SteerKind, TurnCompleteEvent,
 };
 use maki_config::{ModelPolicy, ToolOutputLines};
 use maki_storage::id::{MakiId, SessionRef};
@@ -116,6 +116,7 @@ pub struct AgentParams {
     pub background_for: Option<MakiId>,
     pub task_id: Option<Arc<str>>,
     pub running_tool: Option<crate::RunningTool>,
+    pub child_presentation: Option<Arc<ChildPresentation>>,
     pub mailbox: Option<SessionMailbox>,
     pub timeouts: maki_providers::Timeouts,
     pub file_access: Arc<FileAccess>,
@@ -175,6 +176,7 @@ pub struct Agent<'h> {
     background_for: Option<MakiId>,
     task_id: Option<Arc<str>>,
     running_tool: Option<crate::RunningTool>,
+    child_presentation: Option<Arc<ChildPresentation>>,
     mailbox: Option<SessionMailbox>,
     timeouts: maki_providers::Timeouts,
     file_access: Arc<FileAccess>,
@@ -223,6 +225,7 @@ impl<'h> Agent<'h> {
             background_for: params.background_for,
             task_id: params.task_id,
             running_tool: params.running_tool,
+            child_presentation: params.child_presentation,
             mailbox: params.mailbox,
             file_access: params.file_access,
             prompt_slots: params.prompt_slots,
@@ -1036,6 +1039,7 @@ impl<'h> Agent<'h> {
             live_sink: None,
             result_delivery: None,
             running_tool: self.running_tool.clone(),
+            child_presentation: self.child_presentation.clone(),
             model_policy: Arc::clone(&self.model_policy),
         }
     }
@@ -1487,6 +1491,7 @@ mod tests {
                 background_for: None,
                 task_id: None,
                 running_tool: None,
+                child_presentation: None,
                 mailbox: None,
                 timeouts: maki_providers::Timeouts::default(),
                 file_access: FileAccess::fresh(),

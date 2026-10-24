@@ -1678,6 +1678,9 @@ session, so opening one fails with "session not live". The
     spawned it: it gets its own cancel token (still cancelable by id), a
     generated UI id, and events that keep routing after the parent run
     ends. Default: false.
+  - `presentation` (`string?`) `"attached"` for a ctx-opened background session
+    shown as a blocking child until promotion. Omit for the usual display.
+  - `prompt` (`string?`) initial prompt metadata, available before the first run.
 
 **Returns:** ([`Session?`](#maki-agent-Session), `string?`) Session handle, or `(nil, err)` on failure.
 

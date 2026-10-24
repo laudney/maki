@@ -266,7 +266,7 @@ fn app_with_hints() -> (App, HintWriterHandle) {
     (app, writer)
 }
 
-fn tempdir_app() -> (TempDir, StateDir, Arc<StorageWriter>, App) {
+pub(crate) fn tempdir_app() -> (TempDir, StateDir, Arc<StorageWriter>, App) {
     let tmp = TempDir::new().unwrap();
     let dir = StateDir::from_path(tmp.path().to_path_buf());
     let writer = Arc::new(test_writer(dir.clone()));
@@ -342,6 +342,7 @@ fn subagent_info_with_tx(
         owner_cancel: None,
         spawn_tool_use_id: None,
         answer_tx,
+        permission_tool_use_id: None,
         inbox: None,
     }
 }
@@ -393,6 +394,29 @@ fn detached_msg_of_kind(
         subagent: Some(info),
         run_id: DETACHED_RUN_ID,
     }))
+}
+
+/// A provider can hand out the same call id again in a later turn, so a
+/// turn-scoped child never lands in the finished chat of an earlier turn.
+#[test]
+fn a_reused_call_id_opens_a_new_child_chat() {
+    let mut app = streaming_app();
+    let delta = || AgentEvent::TextDelta {
+        text: "child".into(),
+    };
+    app.update(subagent_msg(delta(), TASK_ID, None));
+    let first = app.chat_of_task(TASK_ID).unwrap();
+    app.update(agent_msg(done()));
+    assert!(app.chats[first].is_finished());
+    let (answer_tx, _answers) = flume::unbounded();
+    app.update(Msg::Agent(Box::new(Envelope {
+        event: delta(),
+        subagent: Some(subagent_info_with_tx(TASK_ID, "Agent", Some(answer_tx))),
+        run_id: 1,
+    })));
+    let second = app.chat_index[TASK_ID];
+    assert_ne!(second, first);
+    assert!(app.subagent_answers.contains_key(TASK_ID));
 }
 
 const MOVED_COMMAND: &str = "cargo test --workspace";
@@ -2412,6 +2436,7 @@ pub(crate) fn app_with_plugin_task() -> App {
 
 fn plugin_child_event(app: &mut App, event: AgentEvent, answer_tx: Option<flume::Sender<String>>) {
     let mut info = subagent_info_with_tx(TASK_ID, TASK_ID, answer_tx);
+    info.detached = true;
     info.owner_cancel = Some(CancelToken::none());
     app.deliver(
         Envelope {

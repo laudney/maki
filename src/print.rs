@@ -308,6 +308,7 @@ pub fn run(params: PrintParams) -> Result<()> {
             | AgentEvent::ToolStart(_)
             | AgentEvent::ToolOutput { .. }
             | AgentEvent::ToolDone(_)
+            | AgentEvent::SubagentDetached { .. }
             | AgentEvent::ToolBackgrounded(_)
             | AgentEvent::QueueItemConsumed { .. }
             | AgentEvent::QueueDrained

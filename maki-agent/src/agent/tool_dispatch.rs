@@ -22,8 +22,8 @@ use crate::tools::{
     ToolLive, truncate_bytes,
 };
 use crate::{
-    AgentError, AgentEvent, AgentSeed, CallRecord, TextOutput, ToolDoneEvent, ToolOutput,
-    ToolStartEvent,
+    AgentError, AgentEvent, AgentSeed, CallRecord, ChildPresentation, TextOutput, ToolDoneEvent,
+    ToolOutput, ToolStartEvent,
 };
 use maki_config::ToolKey;
 use maki_storage::id::SessionRef;
@@ -804,11 +804,18 @@ async fn run_native_tool(
 /// that chat plans. A call can move to the background while it waits for a
 /// prompt or a file lock, so the gate runs again once the lock is held.
 fn background_write_block(ctx: &ToolContext, name: &str, key: &FileKey) -> Option<String> {
-    let chat = ctx.background_for.or_else(|| {
-        ctx.running_tool
-            .as_ref()
-            .and_then(crate::RunningTool::background_session)
-    })?;
+    let chat = ctx
+        .background_for
+        .or_else(|| {
+            ctx.child_presentation
+                .as_deref()
+                .and_then(ChildPresentation::background_session)
+        })
+        .or_else(|| {
+            ctx.running_tool
+                .as_ref()
+                .and_then(crate::RunningTool::background_session)
+        })?;
     let reason = AgentSeed::background_write_block(chat)?;
     warn!(
         tool = %name,
@@ -1331,6 +1338,7 @@ mod tests {
         ToolExecResult, ToolFilter, ToolHook, ToolReach, local_tool,
     };
     use crate::{AgentMode, Envelope, EventSender, InstructionBlock};
+    use crate::{SubagentInfo, TaskKind};
 
     const TEST_ID: &str = "t1";
     const PROBE_WIRE: &str = "srv__probe";
@@ -2080,6 +2088,55 @@ mod tests {
             )
             .await;
 
+            assert_eq!(done.output.as_text(), expected);
+        });
+    }
+
+    #[test_case(false, planning(), BACKGROUND_PLAN_WRITE_DENIED.to_owned(); "detached_plan_write")]
+    #[test_case(false, AgentMode::Build, ran(PLAN_PATH); "detached_build_write")]
+    #[test_case(true, planning(), ran(PLAN_PATH); "attached_child_in_build_mode")]
+    fn child_write_gate_uses_its_own_presentation(
+        attached: bool,
+        chat_mode: AgentMode,
+        expected: String,
+    ) {
+        smol::block_on(async {
+            let chat = MakiId::generate();
+            let mailbox = SessionMailbox::register(chat);
+            let seed = mailbox.publish_seed(stub_seed(chat));
+            seed.set_chat_settings(Default::default(), &chat_mode);
+            let mut ctx = build_ctx();
+            ctx.registry = registered(Arc::new(HookMock(None)));
+            ctx.child_presentation = Some(ChildPresentation::new(
+                Some(chat),
+                None,
+                SubagentInfo {
+                    kind: TaskKind::Agent,
+                    parent_tool_use_id: TEST_ID.into(),
+                    name: HOOK_TOOL_NAME.into(),
+                    prompt: None,
+                    model: None,
+                    detached: false,
+                    owner_cancel: None,
+                    spawn_tool_use_id: None,
+                    opts: None,
+                    answer_tx: None,
+                    permission_tool_use_id: None,
+                    inbox: None,
+                },
+                ctx.event_tx.clone(),
+            ));
+            if !attached {
+                ctx.child_presentation.as_ref().unwrap().detach();
+            }
+            let done = run(
+                TEST_ID.into(),
+                HOOK_TOOL_NAME,
+                &call_input(PLAN_PATH),
+                &ctx,
+                CallOrigin::Nested,
+            )
+            .await;
             assert_eq!(done.output.as_text(), expected);
         });
     }

@@ -17,6 +17,7 @@ use agent_client_protocol_schema::v1::{
 };
 use color_eyre::eyre::Context;
 use flume::{Sender, WeakSender};
+use maki_agent::cancel::CancelMap;
 use maki_agent::headless::{self, InteractiveHandle, InteractiveParams};
 use maki_agent::mcp::config::{RawHttpFields, RawStdioFields, RawTransport};
 use maki_agent::mcp::{self, McpHandle};
@@ -26,7 +27,7 @@ use maki_agent::tools::{LocalTool, LocalTools, QUESTION_TOOL_NAME, ToolAudience,
 use maki_agent::types::AgentEvent;
 use maki_agent::{
     AgentInput, AgentMode, AskOwner, Envelope, ImageMediaType, ImageSource, InputSource, OwnedAsks,
-    SessionEndReason, SessionEvents, SessionMailbox,
+    PermissionRoute, SessionEndReason, SessionEvents,
 };
 use maki_config::project::{self, TrustAnswer, TrustMode, policy_grant};
 use maki_config::{MAX_SERVER_NAME_LEN, ModelPolicy, ProjectConfig, SessionDefaults, TrustConfig};
@@ -449,6 +450,7 @@ fn start_session(
         session_ref.clone(),
         srv.out_tx.clone(),
         Arc::clone(&pending),
+        Arc::clone(&handle.subagent_cancels),
         cwd,
         maki_storage::paths::home(),
         project_trusted,
@@ -904,6 +906,7 @@ fn start_event_pump(
     session_id: SessionRef,
     out_tx: Sender<Value>,
     pending: PendingState,
+    cancels: Arc<CancelMap<String>>,
     cwd: PathBuf,
     home: Option<PathBuf>,
     project_trusted: bool,
@@ -919,13 +922,9 @@ fn start_event_pump(
         let mut tool_inputs: HashMap<(u64, String), Value> = HashMap::new();
         let mut stream_error = None;
 
-        while let Some(Envelope {
-            event,
-            subagent,
-            run_id,
-        }) = events.next().await
-        {
-            if subagent
+        while let Some(envelope) = events.next().await {
+            if envelope
+                .subagent
                 .as_ref()
                 .and_then(|info| info.owner_cancel.as_ref())
                 .is_some_and(|cancel| cancel.is_cancelled())
@@ -933,96 +932,85 @@ fn start_event_pump(
                 pending.lock().unwrap().asks.end_cancelled();
                 continue;
             }
+            pending.lock().unwrap().asks.observe(&envelope);
             // A subagent's turn spends session money even though its events
             // stay out of the transcript.
-            if let AgentEvent::TurnComplete(tc) = &event {
+            if let AgentEvent::TurnComplete(tc) = &envelope.event {
                 add_cost(&mut cost_total, tc.cost);
             }
+            if let AgentEvent::PermissionRequest {
+                id,
+                tool,
+                scopes,
+                reason,
+            } = &envelope.event
+            {
+                let Some(route) = PermissionRoute::of(session_id.id(), &envelope, id, &cancels)
+                else {
+                    continue;
+                };
+                let tool = tool.to_string();
+                let scope = format!("{tool}: {}", scopes.join(", "));
+                // A plugin escalated this call, and its reason is what the
+                // user most needs to read.
+                let scope = match reason {
+                    Some(reason) => format!("{reason} ({scope})"),
+                    None => scope,
+                };
+                // The cache is keyed by the call that asked for permission. A
+                // subagent is left out on purpose: nothing makes a child's ids
+                // unique against the parent's, and naming the wrong file in a
+                // security prompt is worse than naming none.
+                let raw_input = envelope
+                    .subagent
+                    .is_none()
+                    .then(|| tool_inputs.get(&(envelope.run_id, route.input_id.clone())))
+                    .flatten();
+                // A child's own tool call never reached the client, nor this
+                // cache, so its permission rides on the `task` call the client
+                // can see, and the title is all the dialog gets.
+                let (row, title) = match &envelope.subagent {
+                    Some(info) => (
+                        info.spawn_row_id().to_owned(),
+                        format!("{}: {scope}", info.name),
+                    ),
+                    None => (route.input_id, scope),
+                };
+                let request =
+                    AgentRequest::RequestPermissionRequest(RequestPermissionRequest::new(
+                        sid.clone(),
+                        translate::permission_update(
+                            row,
+                            title,
+                            &tool,
+                            raw_input,
+                            &cwd,
+                            home.as_deref(),
+                        ),
+                        permissions::permission_options(project_trusted),
+                    ));
+                ask_client(
+                    &out_tx,
+                    &pending,
+                    route.owner,
+                    Ask::Permission {
+                        request_id: id.clone(),
+                        answer_tx: route.answer_tx,
+                    },
+                    request,
+                );
+                continue;
+            }
+            let Envelope {
+                event,
+                subagent,
+                run_id,
+            } = envelope;
 
             let update = match event {
-                AgentEvent::PermissionRequest {
-                    id,
-                    tool,
-                    scopes,
-                    reason,
-                } => {
-                    let managed = SessionMailbox::tool_permission(session_id.id(), &id);
-                    let input_id = managed.as_ref().map_or(&id, |(original, _)| original);
-                    let owner = AskOwner::of(&Envelope {
-                        event: AgentEvent::StreamClosed,
-                        subagent: subagent.clone(),
-                        run_id,
-                    });
-                    let tool = tool.to_string();
-                    let scope = format!("{tool}: {}", scopes.join(", "));
-                    // A plugin escalated this call, and its reason is what the
-                    // user most needs to read.
-                    let scope = match reason {
-                        Some(reason) => format!("{reason} ({scope})"),
-                        None => scope,
-                    };
-                    // The cache is keyed by the call that asked for permission,
-                    // so look it up before the remap below. A subagent is left
-                    // out on purpose: nothing makes a child's ids unique
-                    // against the parent's, and naming the wrong file in a
-                    // security prompt is worse than naming none.
-                    let raw_input = subagent
-                        .is_none()
-                        .then(|| tool_inputs.get(&(run_id, input_id.clone())))
-                        .flatten();
-                    // A child's own tool call never reached the client, nor
-                    // this cache, so its permission rides on the `task` call
-                    // the client can see, only the child's channel may take the
-                    // answer, and the title is all the dialog gets.
-                    let request_id = id.clone();
-                    let input_id = input_id.clone();
-                    let (id, title, answer_tx) = match subagent {
-                        Some(info) => {
-                            let parent_tool_use_id = info.spawn_row_id().to_owned();
-                            let Some(answer_tx) = info.answer_tx else {
-                                warn!(
-                                    subagent = info.name,
-                                    parent_tool_use_id = info.parent_tool_use_id,
-                                    tool_use_id = id,
-                                    scope,
-                                    "dropping subagent permission with no answer channel"
-                                );
-                                continue;
-                            };
-                            let title = format!("{}: {scope}", info.name);
-                            (parent_tool_use_id, title, Some(answer_tx))
-                        }
-                        None => (input_id, scope, managed.map(|(_, tx)| tx)),
-                    };
-                    let request =
-                        AgentRequest::RequestPermissionRequest(RequestPermissionRequest::new(
-                            sid.clone(),
-                            translate::permission_update(
-                                id,
-                                title,
-                                &tool,
-                                raw_input,
-                                &cwd,
-                                home.as_deref(),
-                            ),
-                            permissions::permission_options(project_trusted),
-                        ));
-                    ask_client(
-                        &out_tx,
-                        &pending,
-                        owner,
-                        Ask::Permission {
-                            request_id,
-                            answer_tx,
-                        },
-                        request,
-                    );
-                    continue;
-                }
-                AgentEvent::SubagentHistory { tool_use_id, .. } => {
-                    pending.lock().unwrap().asks.end_child(&tool_use_id);
-                    continue;
-                }
+                AgentEvent::PermissionRequest { .. }
+                | AgentEvent::SubagentDetached { .. }
+                | AgentEvent::SubagentHistory { .. } => continue,
                 _ if subagent.is_some() => continue,
                 AgentEvent::TextDelta { text } => translate::text_delta(&text),
                 AgentEvent::ThinkingDelta { text } => translate::thinking_delta(&text),
@@ -1151,8 +1139,8 @@ mod tests {
     use maki_agent::permissions::{PermissionCheck, PermissionError, PermissionManager};
     use maki_agent::tools::PermissionScopes;
     use maki_agent::{
-        CancelToken, DoneReason, EventSender, SessionMailbox, SubagentInfo, TaskKind,
-        ToolStartEvent, TurnCompleteEvent,
+        CancelToken, DETACHED_RUN_ID, DoneReason, EventSender, SessionMailbox, SubagentInfo,
+        TaskKind, ToolStartEvent, TurnCompleteEvent,
     };
     use maki_config::project::TrustQuestion;
     use maki_config::{AgentConfig, Effect, ToolKey, TrustFileConfig};
@@ -1587,6 +1575,7 @@ mod tests {
             session.handle.session_id.clone(),
             out_tx,
             Arc::clone(&session.pending),
+            Arc::clone(&session.handle.subagent_cancels),
             PathBuf::from(PUMP_CWD),
             None,
             PUMP_TRUSTED,
@@ -1628,6 +1617,7 @@ mod tests {
             owner_cancel: None,
             spawn_tool_use_id: None,
             answer_tx,
+            permission_tool_use_id: None,
             inbox: None,
         }
     }
@@ -2244,23 +2234,41 @@ mod tests {
         assert!(pending(&srv).lock().unwrap().prompt.is_none());
     }
 
-    #[test_case(false ; "parent_completion")]
-    #[test_case(true ; "parent_cancellation")]
-    fn a_background_permission_survives_the_parent_run(cancel: bool) {
+    #[test_case(false, false, PUMP_RUN_ID; "detached_parent_completion")]
+    #[test_case(true, false, PUMP_RUN_ID; "detached_parent_cancellation")]
+    #[test_case(false, true, DETACHED_RUN_ID; "attached_generation_parent_completion")]
+    #[test_case(true, true, DETACHED_RUN_ID; "attached_generation_parent_cancellation")]
+    #[test_case(false, true, PUMP_RUN_ID; "promoted_parent_completion")]
+    #[test_case(true, true, PUMP_RUN_ID; "promoted_parent_cancellation")]
+    fn a_background_permission_survives_the_parent_run(cancel: bool, attached: bool, run_id: u64) {
         let (srv, main_rx, out_rx) = test_server();
         let (answer_tx, answer_rx) = flume::unbounded();
         pending(&srv).lock().unwrap().prompt = Some(PendingPrompt {
             request_id: RequestId::Number(PROMPT_ID),
             run_id: PUMP_RUN_ID,
         });
+        let mut info = background_subagent(answer_tx, CHILD_TOOL_USE_IDS[0]);
+        info.detached = !attached;
         run_pump(&srv, None, |sender| {
             sender
                 .send_envelope(Envelope {
                     event: permission_request(CHILD_TOOL_USE_IDS[0]),
-                    subagent: Some(background_subagent(answer_tx, CHILD_TOOL_USE_IDS[0])),
-                    run_id: PUMP_RUN_ID,
+                    subagent: Some(info.clone()),
+                    run_id,
                 })
                 .unwrap();
+            if attached && run_id == PUMP_RUN_ID {
+                info.detached = true;
+                sender
+                    .send_envelope(Envelope {
+                        event: AgentEvent::SubagentDetached {
+                            child: Box::new(info.clone()),
+                        },
+                        subagent: Some(info),
+                        run_id: DETACHED_RUN_ID,
+                    })
+                    .unwrap();
+            }
             sender.send(permission_request(PARENT_TOOL_USE_ID)).unwrap();
         });
         let requests: Vec<_> = out_rx.try_iter().collect();

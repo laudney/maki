@@ -13,9 +13,9 @@ use crate::cancel::{CancelMap, CancelSlot, CancelToken, CancelTrigger};
 use crate::permissions::TaggedAnswer;
 use crate::tools::{CallOrigin, ToolContext};
 use crate::{
-    AgentEvent, DETACHED_RUN_ID, Envelope, EventSender, Notice, ResultDelivery, SessionMailbox,
-    SubagentInfo, SubagentVerdict, TaskKind, ToolDoneEvent, ToolOutput, ToolStartEvent,
-    event_stream,
+    AgentEvent, ChildPresentation, DETACHED_RUN_ID, Envelope, EventSender, Notice, ResultDelivery,
+    SessionMailbox, SubagentInfo, SubagentVerdict, TaskKind, ToolDoneEvent, ToolOutput,
+    ToolStartEvent, event_stream,
 };
 
 const CANCELLED: &str = "cancelled";
@@ -23,15 +23,36 @@ const CANCELLED: &str = "cancelled";
 /// A nested dispatch reads the same ownership decision as its invocation.
 #[derive(Clone)]
 pub struct RunningTool {
-    batch: Weak<ForegroundTools>,
-    index: usize,
+    children: Arc<Mutex<ChildPresentations>>,
+}
+
+struct ChildPresentations {
+    session: MakiId,
+    detached: bool,
+    children: Vec<Weak<ChildPresentation>>,
 }
 
 impl RunningTool {
     pub fn background_session(&self) -> Option<MakiId> {
-        let batch = self.batch.upgrade()?;
-        let detached = batch.calls()[self.index].phase == Phase::Detached;
-        detached.then(|| batch.mailbox.session_id())
+        let children = self.children.lock().unwrap_or_else(PoisonError::into_inner);
+        children.detached.then_some(children.session)
+    }
+
+    pub(crate) fn register_child(&self, child: &Arc<ChildPresentation>) {
+        let mut children = self.children.lock().unwrap_or_else(PoisonError::into_inner);
+        if children.detached {
+            child.detach();
+        }
+        children.children.retain(|child| child.strong_count() > 0);
+        children.children.push(Arc::downgrade(child));
+    }
+
+    fn detach_children(&self) {
+        let mut children = self.children.lock().unwrap_or_else(PoisonError::into_inner);
+        children.detached = true;
+        for child in children.children.iter().filter_map(Weak::upgrade) {
+            child.detach();
+        }
     }
 }
 
@@ -58,6 +79,7 @@ struct Call {
     input: Value,
     task_id: String,
     phase: Phase,
+    running: RunningTool,
     trigger: Option<CancelTrigger>,
     cancel: CancelToken,
     slot: Option<CancelSlot>,
@@ -129,6 +151,7 @@ impl ForegroundTools {
             spawn_tool_use_id: Some(call.id.clone()),
             opts: None,
             answer_tx: call.answer_tx.clone(),
+            permission_tool_use_id: None,
             inbox: None,
         }
     }
@@ -168,6 +191,7 @@ impl ForegroundTools {
         for index in unfinished {
             let call = &mut calls[index];
             call.phase = Phase::Detached;
+            call.running.detach_children();
             call.slot = call
                 .trigger
                 .take()
@@ -388,6 +412,7 @@ impl ForegroundTools {
             self.mailbox.release_tool();
             self.send_detached(call, AgentEvent::ToolDone(Box::new(done.clone())));
             let messages = vec![
+                Message::user(call.input.to_string()),
                 Message {
                     role: Role::Assistant,
                     content: vec![ContentBlock::tool_use(
@@ -488,7 +513,7 @@ pub(super) async fn execute(
     });
     let mut receivers = Vec::with_capacity(runnable.len());
     let mut workers = Vec::with_capacity(runnable.len());
-    for (index, (id, name, input)) in runnable.iter().enumerate() {
+    for (id, name, input) in runnable {
         let (trigger, cancel) = owner.child();
         let (result_tx, result_rx) = flume::bounded(1);
         let (answer_tx, answer_rx) = flume::unbounded();
@@ -496,6 +521,13 @@ pub(super) async fn execute(
         let can_answer = ctx.user_response_rx.is_some();
         let delivery = ResultDelivery::default();
         let (stream, events) = event_stream();
+        let running = RunningTool {
+            children: Arc::new(Mutex::new(ChildPresentations {
+                session: batch.mailbox.session_id(),
+                detached: false,
+                children: Vec::new(),
+            })),
+        };
         let tool_ctx = ToolContext {
             tool_use_id: Some(id.clone()),
             call_instructions: CallInstructions::default(),
@@ -503,10 +535,7 @@ pub(super) async fn execute(
             event_tx: ctx.event_tx.tool_sender(&stream),
             user_response_rx: can_answer.then(|| Arc::new(smol::lock::Mutex::new(private_rx))),
             result_delivery: Some(delivery.clone()),
-            running_tool: Some(RunningTool {
-                batch: Arc::downgrade(&batch),
-                index,
-            }),
+            running_tool: Some(running.clone()),
             ..ctx.clone()
         };
         batch.calls().push(Call {
@@ -515,6 +544,7 @@ pub(super) async fn execute(
             input: input.clone(),
             task_id: format!("tool-{}", MakiId::generate()),
             phase: Phase::Attached,
+            running,
             trigger: Some(trigger),
             cancel,
             slot: None,
@@ -663,6 +693,7 @@ mod tests {
     const WRAPPER: &str = "wrapper";
     const REUSED_ID: &str = "reused";
     const INSTRUCTION_PATH: &str = "/repo/sub/AGENTS.md";
+    const CHILD_PROMPT: &str = "inspect the queued child";
     const INSTRUCTION_TEXT: &str = "subdirectory rule";
     const PARTIAL: &str = "partial output before the stop";
 
@@ -840,6 +871,82 @@ mod tests {
             .as_str()
             .unwrap()
             .to_owned()
+    }
+
+    #[test_case(false; "current_child")]
+    #[test_case(true; "child_after_owner_retirement")]
+    fn generic_promotion_marks_current_and_late_children(late: bool) {
+        smol::block_on(async {
+            let fixture = fixture();
+            let control = controlled(&fixture.ctx, FIRST);
+            let foreground = dispatch(fixture.ctx.clone(), vec![(FIRST, FIRST.into())]);
+            let running = control.started.recv_async().await.unwrap();
+            let (answer_tx, answer_rx) = flume::unbounded();
+            let info = SubagentInfo {
+                kind: TaskKind::Agent,
+                parent_tool_use_id: SECOND.into(),
+                name: SECOND.into(),
+                prompt: Some(CHILD_PROMPT.into()),
+                model: None,
+                detached: false,
+                owner_cancel: fixture.ctx.event_tx.owner_cancel(),
+                spawn_tool_use_id: Some(FIRST.into()),
+                opts: None,
+                answer_tx: Some(answer_tx),
+                permission_tool_use_id: None,
+                inbox: None,
+            };
+            let make_child = || {
+                ChildPresentation::new(
+                    Some(fixture.mailbox.session_id()),
+                    running.running_tool.as_ref(),
+                    info.clone(),
+                    running.event_tx.root_sender(),
+                )
+            };
+            let mut child = (!late).then(make_child);
+            assert_eq!(fixture.mailbox.background_tools(RUN), 1);
+            foreground.await;
+            control
+                .release
+                .send(Ok(ToolOutput::Plain(OUTPUT.into())))
+                .unwrap();
+            notices(&fixture.mailbox, 1).await;
+            if late {
+                child = Some(make_child());
+            }
+            let child = child.unwrap();
+            assert!(child.is_detached());
+            child.set_initial_prompt(OUTPUT);
+            child.detach();
+            let detached: Vec<_> = fixture
+                .events
+                .drain()
+                .filter_map(|envelope| match envelope.event {
+                    AgentEvent::SubagentDetached { child } => Some((envelope.run_id, child)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(detached.len(), 1);
+            assert_eq!(detached[0].0, DETACHED_RUN_ID);
+            assert_eq!(detached[0].1.prompt.as_deref(), Some(CHILD_PROMPT));
+            detached[0]
+                .1
+                .answer_tx
+                .as_ref()
+                .unwrap()
+                .send(OUTPUT.into())
+                .unwrap();
+            assert_eq!(answer_rx.try_recv().unwrap(), OUTPUT);
+            assert!(
+                running
+                    .running_tool
+                    .as_ref()
+                    .unwrap()
+                    .background_session()
+                    .is_some()
+            );
+        });
     }
 
     #[test]
@@ -1154,10 +1261,18 @@ mod tests {
             control.ended.recv_async().await.unwrap();
             assert!(running.cancel.is_cancelled());
             if generation {
-                while !matches!(
-                    fixture.events.recv_async().await.unwrap().event,
-                    AgentEvent::SubagentHistory { .. }
-                ) {}
+                let messages = loop {
+                    if let AgentEvent::SubagentHistory { messages, .. } =
+                        fixture.events.recv_async().await.unwrap().event
+                    {
+                        break messages;
+                    }
+                };
+                assert_eq!(
+                    messages[0].user_text(),
+                    Some(json!({ "index": 0 }).to_string().as_str()),
+                    "the moved call's transcript keeps the input it started with"
+                );
                 assert!(fixture.mailbox.claim_wake().is_empty());
             } else {
                 let completed = notices(&fixture.mailbox, 1).await;
@@ -1318,6 +1433,7 @@ mod tests {
                             spawn_tool_use_id: None,
                             opts: None,
                             answer_tx: Some(answer_tx),
+                            permission_tool_use_id: None,
                             inbox: None,
                         }),
                         run_id: RUN,

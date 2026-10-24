@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use futures::future::{Either, select};
 use maki_agent::agent::{LoadedInstructions, tool_dispatch};
 use maki_agent::cancel::{CancelMap, CancelSlot, CancelToken};
+use maki_agent::permissions::TaggedAnswer;
 use maki_agent::tools::interpreter_bridge;
 use maki_agent::tools::registry::ToolRegistry;
 use maki_agent::tools::schema::sanitize_tool_input_schema;
@@ -20,10 +21,10 @@ use maki_agent::tools::{
 use maki_agent::types::ALLOWED_BY;
 use maki_agent::{
     Agent, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, AgentSeed,
-    DETACHED_RUN_ID, DoneReason, EMPTY_RESPONSE_MARKER, Envelope, EventSender, EventStreamGuard,
-    History, InputSource, McpSession, RunContext, RunContextBuilder, RunLedger, SessionEvents,
-    SubagentInbox, SubagentInfo, SubagentVerdict, TaskKind, ToolDoneEvent, UNAVAILABLE_RESULT,
-    event_stream,
+    ChildPresentation, DETACHED_RUN_ID, DoneReason, EMPTY_RESPONSE_MARKER, Envelope, EventSender,
+    EventStreamGuard, History, InputSource, McpSession, RunContext, RunContextBuilder, RunLedger,
+    SessionEvents, SubagentInbox, SubagentInfo, SubagentVerdict, TaskKind, ToolDoneEvent,
+    UNAVAILABLE_RESULT, event_stream,
 };
 use maki_lua_macro::{lua_class, lua_fn, lua_table};
 use maki_providers::model::ModelTier;
@@ -56,6 +57,8 @@ use crate::runtime::{
     register_plugin_lifetime,
 };
 
+const PRESENTATION_ERR: &str =
+    "presentation requires a ctx-opened background session and must be 'attached'";
 const SESSION_CLOSED_ERR: &str = "session closed";
 /// Esc in the task's tab. Distinct from [`CANCELLED_MSG`], so a loop can tell
 /// user intent from the end of its own task and not reopen.
@@ -237,6 +240,15 @@ impl Upstream {
         }
     }
 
+    fn send_child(&self, envelope: Envelope, presentation: &ChildPresentation) {
+        presentation.publish(envelope, |mut envelope, detached| {
+            if matches!(self, Self::Parent(_)) && detached {
+                envelope.run_id = DETACHED_RUN_ID;
+            }
+            self.send(envelope);
+        });
+    }
+
     /// A parent drops every run but its own as stale, so the event has to
     /// carry its run. The tab is not bound to a run at all.
     fn send_event(&self, event: AgentEvent, subagent: Option<SubagentInfo>) {
@@ -288,6 +300,54 @@ impl Upstream {
     }
 }
 
+struct SessionPermissions {
+    answers: flume::Receiver<String>,
+    reply: flume::Sender<String>,
+    // Permission waits serialize on the child's answer receiver.
+    pending: Option<(String, String)>,
+}
+
+impl SessionPermissions {
+    async fn next(&mut self, events: &mut SessionEvents) -> Option<Envelope> {
+        loop {
+            let next = {
+                match select(pin!(events.next()), pin!(self.answers.recv_async())).await {
+                    Either::Left((event, _)) => Either::Left(event),
+                    Either::Right((answer, _)) => Either::Right(answer),
+                }
+            };
+            match next {
+                Either::Left(event) => return event,
+                Either::Right(Ok(answer)) => self.answer(&answer),
+                Either::Right(Err(_)) => return events.next().await,
+            }
+        }
+    }
+
+    fn publish(&mut self, id: &mut String, info: &mut SubagentInfo) {
+        let published = format!("{}:{}", info.parent_tool_use_id, MakiId::generate());
+        let original = std::mem::replace(id, published.clone());
+        info.permission_tool_use_id = Some(original.clone());
+        self.pending = Some((published, original));
+    }
+
+    fn answer(&mut self, raw: &str) {
+        let Some(answer) = TaggedAnswer::decode(raw) else {
+            let _ = self.reply.try_send(raw.to_owned());
+            return;
+        };
+        let Some((published, original)) = &self.pending else {
+            return;
+        };
+        if &answer.request_id == published {
+            let _ = self
+                .reply
+                .try_send(TaggedAnswer::new(original, answer.answer).encode());
+            self.pending = None;
+        }
+    }
+}
+
 /// Forwards subagent events upstream, stamped with the subagent identity.
 /// Usage goes live on the tool header while the run goes on (last turn's tokens
 /// plus the run's summed cost). `Done` pings `done_tx`, which tells `prompt`
@@ -301,14 +361,20 @@ impl Upstream {
 async fn relay_session_events(
     mut sub_events: SessionEvents,
     upstream: Upstream,
-    subagent_info: Arc<OnceLock<SubagentInfo>>,
+    presentation: Arc<ChildPresentation>,
     done_tx: flume::Sender<()>,
     live_sink: Option<flume::Sender<ToolLive>>,
     close_rx: flume::Receiver<Envelope>,
+    mut permissions: Option<SessionPermissions>,
 ) {
     let to_chat = matches!(upstream, Upstream::Chat { .. });
     let mut cost = None;
-    while let Some(mut envelope) = sub_events.next().await {
+    loop {
+        let envelope = match &mut permissions {
+            Some(route) => route.next(&mut sub_events).await,
+            None => sub_events.next().await,
+        };
+        let Some(mut envelope) = envelope else { break };
         match &envelope.event {
             AgentEvent::TurnComplete(turn) => {
                 add_cost(&mut cost, turn.cost);
@@ -332,16 +398,25 @@ async fn relay_session_events(
             _ => {}
         }
         if envelope.subagent.is_none() {
-            envelope.subagent = subagent_info.get().cloned();
+            let mut info = presentation.info();
+            if let AgentEvent::PermissionRequest { id, .. } = &mut envelope.event
+                && let Some(route) = &mut permissions
+            {
+                route.publish(id, &mut info);
+            }
+            envelope.subagent = Some(info);
         }
-        upstream.send(envelope);
+        upstream.send_child(envelope, &presentation);
     }
     drop(done_tx);
-    if let Ok(envelope) = close_rx.recv_async().await {
-        upstream.send(envelope);
+    if let Ok(mut envelope) = close_rx.recv_async().await {
+        if envelope.subagent.is_some() {
+            envelope.subagent = Some(presentation.info());
+        }
+        upstream.send_child(envelope, &presentation);
     }
     if to_chat {
-        upstream.send_event(AgentEvent::StreamClosed, subagent_info.get().cloned());
+        upstream.send_event(AgentEvent::StreamClosed, Some(presentation.info()));
     }
 }
 
@@ -772,6 +847,9 @@ async fn call_tool(
 ///     spawned it: it gets its own cancel token (still cancelable by id), a
 ///     generated UI id, and events that keep routing after the parent run
 ///     ends. Default: false.
+///   `presentation` (string?) - `"attached"` for a ctx-opened background session
+///     shown as a blocking child until promotion. Omit for the usual display.
+///   `prompt` (string?) - initial prompt metadata, available before the first run.
 /// @return (Session?, string?) Session handle, or `(nil, err)` on failure.
 /// @example
 /// local tools = maki.agent.tools(ctx, { audience = "general_sub" })
@@ -825,7 +903,17 @@ async fn session(
     let local_tools_tbl: Option<Table> = opts.opt("local_tools")?;
     let name: Option<String> = opts.opt("name")?;
     let background = opts.opt::<bool>("background")?.unwrap_or(false);
-    let detached = background || agent_ctx.event_tx.run_id() == DETACHED_RUN_ID;
+    let generation_transport = background || agent_ctx.event_tx.run_id() == DETACHED_RUN_ID;
+    let presentation: Option<String> = opts.opt("presentation")?;
+    if presentation
+        .as_deref()
+        .is_some_and(|value| value != "attached")
+        || (presentation.is_some() && (!background || owner.is_some()))
+    {
+        return Ok(err_pair(PRESENTATION_ERR));
+    }
+    let detached = generation_transport && presentation.is_none();
+    let initial_prompt: Option<String> = opts.opt("prompt")?;
     let thinking_val: Option<LuaValue> = opts.opt("thinking")?;
     let audience = match opts.opt::<String>("audience")? {
         Some(s) => {
@@ -924,7 +1012,7 @@ async fn session(
     let (stream_guard, sub_events) = event_stream();
     // A background child outlives the run whose id its events would carry, so
     // they get the detached id and the frontend keeps routing them.
-    let run_id = if detached {
+    let run_id = if generation_transport {
         DETACHED_RUN_ID
     } else {
         agent_ctx.event_tx.run_id()
@@ -933,9 +1021,7 @@ async fn session(
         .event_tx
         .owner_cancel()
         .unwrap_or_else(CancelToken::none);
-    let parent_tx = if agent_ctx.background_for.is_some()
-        || (!background && agent_ctx.running_tool.is_some())
-    {
+    let parent_tx = if agent_ctx.background_for.is_some() {
         agent_ctx.event_tx.clone()
     } else {
         agent_ctx.event_tx.root_sender()
@@ -944,17 +1030,25 @@ async fn session(
     // a background session nobody reads the subagent's chat, so a fresh
     // channel would leave every prompt waiting until cancel. Without one,
     // `enforce` denies the call right away.
-    let (answer_tx, answer_rx) = agent_ctx
-        .user_response_rx
-        .is_some()
-        .then(flume::unbounded::<String>)
-        .map(|(tx, rx)| (tx, Arc::new(AsyncMutex::new(rx))))
-        .unzip();
+    let (answer_tx, answer_rx, permissions) = if agent_ctx.user_response_rx.is_some() {
+        let (answer_tx, answers) = flume::unbounded();
+        let (reply, answer_rx) = flume::unbounded();
+        (
+            Some(answer_tx),
+            Some(Arc::new(AsyncMutex::new(answer_rx))),
+            Some(SessionPermissions {
+                answers,
+                reply,
+                pending: None,
+            }),
+        )
+    } else {
+        (None, None, None)
+    };
 
-    let subagent_info: Arc<OnceLock<SubagentInfo>> = Arc::new(OnceLock::new());
     let (done_tx, done_rx) = flume::unbounded();
     let (close_tx, close_rx) = flume::bounded(1);
-    let independent = detached || agent_ctx.event_tx.session_cancel().is_some();
+    let independent = generation_transport || agent_ctx.event_tx.session_cancel().is_some();
     let (ui_id, spawn_tool_use_id) = session_ids(agent_ctx.tool_use_id.as_deref(), independent);
     let upstream = match &owner {
         Some((session, ..)) => Upstream::Chat {
@@ -964,18 +1058,9 @@ async fn session(
             registry: BackgroundSessions::of(&lua),
             id: ui_id.clone(),
         },
-        None => Upstream::Parent(parent_tx),
+        None => Upstream::Parent(parent_tx.clone()),
     };
 
-    smol::spawn(relay_session_events(
-        sub_events,
-        upstream.clone(),
-        Arc::clone(&subagent_info),
-        done_tx,
-        agent_ctx.live_sink.clone(),
-        close_rx,
-    ))
-    .detach();
     // Registered before the session runs so the child token does not fire
     // on drop and kill the subagent at birth. A background child gets its own
     // token rather than the run's: the run ends now, the work does not.
@@ -996,6 +1081,37 @@ async fn session(
         .event_tx
         .child_sender(&stream_guard, run_id, child_cancel.clone());
 
+    let name = name.unwrap_or_default();
+    let inbox = Arc::new(SubagentInbox::default());
+    let presentation = ChildPresentation::new(
+        agent_ctx.session_id.as_ref().map(|session| session.id()),
+        agent_ctx.running_tool.as_ref(),
+        SubagentInfo {
+            kind: TaskKind::Agent,
+            parent_tool_use_id: ui_id.clone(),
+            name: name.clone(),
+            prompt: initial_prompt,
+            model: Some(model.spec()),
+            detached,
+            owner_cancel: Some(owner_cancel.clone()),
+            spawn_tool_use_id,
+            opts: Some(opts),
+            answer_tx,
+            permission_tool_use_id: None,
+            inbox: Some(Arc::clone(&inbox)),
+        },
+        parent_tx,
+    );
+    smol::spawn(relay_session_events(
+        sub_events,
+        upstream.clone(),
+        Arc::clone(&presentation),
+        done_tx,
+        agent_ctx.live_sink.clone(),
+        close_rx,
+        permissions,
+    ))
+    .detach();
     // Built before the state moves them in: stopping a session must not wait
     // for the lock `prompt` holds for its whole run.
     let cancel_handle = Arc::new(CancelHandle {
@@ -1003,13 +1119,13 @@ async fn session(
         ui_id: ui_id.clone(),
         slot: cancel_slot,
         token: child_cancel,
+        presentation: Arc::clone(&presentation),
         owner_cancel,
         background: owner.as_ref().map(|_| BackgroundSessions::of(&lua)),
         stream: Mutex::new(Some(stream_guard)),
         plugin_lifetime: Mutex::new(Some(plugin_lifetime)),
         state: OnceLock::new(),
     });
-    let name = name.unwrap_or_default();
     let background = match owner {
         Some((session, task, cancel)) => {
             let registry = BackgroundSessions::of(&lua);
@@ -1064,6 +1180,7 @@ async fn session(
             session_id: agent_ctx.session_id.clone(),
             background_for: agent_ctx.background_for,
             running_tool: agent_ctx.running_tool.clone(),
+            child_presentation: Some(Arc::clone(&presentation)),
             task_id: Some(Arc::from(ui_id.as_str())),
             mailbox: None,
             timeouts: agent_ctx.timeouts,
@@ -1092,17 +1209,14 @@ async fn session(
         sub_event_tx,
         cancel: Arc::clone(&cancel_handle),
         answer_rx,
-        answer_tx,
         reauth: agent_ctx.reauth,
-        inbox: Arc::new(SubagentInbox::default()),
+        inbox,
         upstream,
         close_tx,
         event_run_id: run_id,
-        subagent_info,
+
         local_tools: Arc::new(local_map),
         name,
-        detached,
-        spawn_tool_use_id,
         dones: RunDones::new(done_rx),
         start: Instant::now(),
         closed: false,
@@ -1110,21 +1224,7 @@ async fn session(
     };
 
     if state.background.is_some() {
-        let info = SubagentInfo {
-            kind: TaskKind::Agent,
-            parent_tool_use_id: state.cancel.ui_id.clone(),
-            name: state.name.clone(),
-            prompt: None,
-            detached: state.detached,
-            owner_cancel: Some(state.cancel.owner_cancel.clone()),
-            spawn_tool_use_id: state.spawn_tool_use_id.clone(),
-            model: Some(state.params.model.spec()),
-            opts: Some(state.opts),
-            answer_tx: None,
-            inbox: Some(Arc::clone(&state.inbox)),
-        };
-        state.upstream.open_task(info.clone());
-        let _ = state.subagent_info.set(info);
+        state.upstream.open_task(presentation.info());
     }
 
     let inner = Arc::new(AsyncMutex::new(state));
@@ -1347,7 +1447,6 @@ struct SessionState {
     sub_event_tx: EventSender,
     cancel: Arc<CancelHandle>,
     answer_rx: Option<Arc<AsyncMutex<flume::Receiver<String>>>>,
-    answer_tx: Option<flume::Sender<String>>,
     reauth: bool,
     /// Shared with the host through [`SubagentInfo`], so a user watching this
     /// session can queue messages that its next turn boundary picks up.
@@ -1357,12 +1456,8 @@ struct SessionState {
     /// The run id every event of this session is stamped with: the parent's,
     /// or [`DETACHED_RUN_ID`] for a child in a background lineage.
     event_run_id: u64,
-    subagent_info: Arc<OnceLock<SubagentInfo>>,
     local_tools: LocalTools,
     name: String,
-    detached: bool,
-    /// See [`SubagentInfo::spawn_tool_use_id`].
-    spawn_tool_use_id: Option<String>,
     dones: RunDones,
     start: Instant,
     closed: bool,
@@ -1460,20 +1555,8 @@ impl SessionState {
     }
 
     fn set_prompt_info(&mut self, message: &str) {
-        if self.subagent_info.get().is_none() {
-            let _ = self.subagent_info.set(SubagentInfo {
-                kind: TaskKind::Agent,
-                parent_tool_use_id: self.cancel.ui_id.clone(),
-                name: self.name.clone(),
-                prompt: Some(message.to_owned()),
-                model: Some(self.params.model.spec()),
-                opts: Some(self.opts),
-                detached: self.detached,
-                owner_cancel: Some(self.cancel.owner_cancel.clone()),
-                spawn_tool_use_id: self.spawn_tool_use_id.clone(),
-                answer_tx: self.answer_tx.take(),
-                inbox: Some(Arc::clone(&self.inbox)),
-            });
+        if self.background.is_none() {
+            self.cancel.presentation.set_initial_prompt(message);
         }
     }
 
@@ -1484,7 +1567,14 @@ impl SessionState {
         self.closed = true;
         self.cancel.close();
         let usage = self.params.ledger.totals().usage;
-        let messages = std::mem::replace(&mut self.history, History::new(Vec::new())).into_vec();
+        let mut messages =
+            std::mem::replace(&mut self.history, History::new(Vec::new())).into_vec();
+        // A child closed before its first prompt ran is still that prompt.
+        if messages.is_empty()
+            && let Some(prompt) = self.cancel.presentation.info().prompt
+        {
+            messages.push(Message::user(prompt));
+        }
         // The relay drains the closed stream before forwarding this terminal
         // event, so an earlier permission cannot arrive after its cleanup.
         let _ = self.close_tx.send(Envelope {
@@ -1493,7 +1583,7 @@ impl SessionState {
                 messages,
                 status,
             },
-            subagent: self.subagent_info.get().cloned(),
+            subagent: Some(self.cancel.presentation.info()),
             run_id: self.event_run_id,
         });
         info!(
@@ -1519,6 +1609,7 @@ struct CancelHandle {
     ui_id: String,
     slot: CancelSlot,
     token: CancelToken,
+    presentation: Arc<ChildPresentation>,
     owner_cancel: CancelToken,
     background: Option<BackgroundSessions>,
     stream: Mutex<Option<EventStreamGuard>>,
@@ -1762,7 +1853,7 @@ async fn prompt(
         s.upstream.send_history(
             &s.cancel.ui_id,
             s.history.as_slice().to_vec(),
-            s.subagent_info.get().cloned(),
+            Some(s.cancel.presentation.info()),
         );
     }
     // Only this call's messages count: older turns may hold stale preamble
@@ -1922,6 +2013,8 @@ fn call_local_tool(
 mod tests {
     use flume::Sender;
     use futures_lite::future::poll_once;
+    use maki_agent::ToolStartEvent;
+    use maki_agent::permissions::{PermissionAnswer, TaggedAnswer};
     use maki_agent::prompt::{PromptId, ResolvedPrompts};
     use maki_agent::tools::test_support::stub_ctx_with;
     use maki_agent::{DoneReason, TurnCompleteEvent};
@@ -2330,11 +2423,13 @@ mod tests {
         );
     }
 
+    const AUTH_RETRY: &str = "";
     const NATIVE_PLUGIN: &str = "native-session-owner";
     const NATIVE_CHILD: &str = "native-child";
     const NESTED_CHILD: &str = "nested-child";
     const NESTED_ASK: &str = "nested-ask";
     const NESTED_ANSWER: &str = "nested-answer";
+    const ROUTED_COST: f64 = 0.5;
 
     async fn native_session_events(
         lua: &Lua,
@@ -2368,6 +2463,223 @@ mod tests {
         .unwrap();
         assert!(error.is_none(), "{error:?}");
         session.unwrap()
+    }
+
+    #[test_case(false; "authentication_only")]
+    #[test_case(true; "pending_permission_is_preserved")]
+    fn child_response_relay_forwards_auth_retry_without_consuming_permission(pending: bool) {
+        let (reply, responses) = flume::unbounded();
+        let mut route = SessionPermissions {
+            answers: flume::unbounded().1,
+            reply,
+            pending: None,
+        };
+        let mut id = NESTED_ASK.to_owned();
+        if pending {
+            route.publish(&mut id, &mut subagent_info().info());
+        }
+        route.answer(AUTH_RETRY);
+        assert_eq!(responses.try_recv().as_deref(), Ok(AUTH_RETRY));
+        if pending {
+            route.answer(&TaggedAnswer::new(id, PermissionAnswer::AllowOnce).encode());
+            assert_eq!(
+                responses.try_recv().unwrap(),
+                TaggedAnswer::new(NESTED_ASK, PermissionAnswer::AllowOnce).encode()
+            );
+        }
+        assert!(responses.is_empty());
+    }
+
+    #[test_case(false; "foreground_children")]
+    #[test_case(true; "generation_children")]
+    fn concurrent_child_permissions_publish_unique_ids_and_keep_their_reply_channels(
+        background: bool,
+    ) {
+        let lua = Lua::new();
+        lua.set_app_data(SpawnedTasks::default());
+        smol::block_on(async {
+            let (root, events) = flume::unbounded();
+            let (wrapper, _) = event_stream();
+            let source =
+                EventSender::new(root, RUN_ID).child_sender(&wrapper, RUN_ID, CancelToken::none());
+            let mut sessions = Vec::new();
+            for scope in [NATIVE_CHILD, NESTED_CHILD] {
+                let mut ctx = stub_ctx_with(&AgentMode::Build, Some(&source), Some(scope));
+                ctx.subagent_cancels = Arc::new(CancelMap::new());
+                ctx.user_response_rx = Some(Arc::new(AsyncMutex::new(flume::unbounded().1)));
+                let session = session_from_context(&lua, ctx, background).await;
+                let handle = session.borrow::<LuaSession>().unwrap();
+                let state = handle.inner.lock().await;
+                state
+                    .sub_event_tx
+                    .send(AgentEvent::PermissionRequest {
+                        id: NESTED_ASK.into(),
+                        tool: ToolKey::native("bash"),
+                        scopes: vec![scope.into()],
+                        reason: None,
+                    })
+                    .unwrap();
+                drop(state);
+                drop(handle);
+                sessions.push(session);
+            }
+            let mut asks = Vec::new();
+            for _ in &sessions {
+                let envelope = events.recv_async().await.unwrap();
+                let AgentEvent::PermissionRequest { id, scopes, .. } = envelope.event else {
+                    panic!("expected child permission")
+                };
+                asks.push((id, scopes, envelope.subagent.unwrap()));
+            }
+            assert_ne!(asks[0].0, asks[1].0);
+            for (index, session) in sessions.iter().enumerate() {
+                let handle = session.borrow::<LuaSession>().unwrap();
+                let mut state = handle.inner.lock().await;
+                let own = asks
+                    .iter()
+                    .position(|(_, _, info)| info.parent_tool_use_id == handle.cancel.ui_id)
+                    .unwrap();
+                let (id, scopes, info) = &asks[own];
+                assert_eq!(scopes, &[[NATIVE_CHILD, NESTED_CHILD][index].to_owned()]);
+                let channel = info.answer_tx.as_ref().unwrap();
+                channel
+                    .send(TaggedAnswer::new(&asks[1 - own].0, PermissionAnswer::Deny).encode())
+                    .unwrap();
+                channel
+                    .send(TaggedAnswer::new(id, PermissionAnswer::AllowOnce).encode())
+                    .unwrap();
+                let answer = state
+                    .answer_rx
+                    .as_ref()
+                    .unwrap()
+                    .lock()
+                    .await
+                    .recv_async()
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    TaggedAnswer::decode(&answer),
+                    Some(TaggedAnswer::new(NESTED_ASK, PermissionAnswer::AllowOnce))
+                );
+                state.close(Some(SubagentVerdict::Done));
+            }
+        });
+    }
+
+    #[test_case(false; "attached")]
+    #[test_case(true; "promoted_before_worker_poll")]
+    fn generation_child_owns_its_prompt_and_permission_channel(promote: bool) {
+        let lua = Lua::new();
+        lua.set_app_data(SpawnedTasks::default());
+        lua.set_app_data(Arc::clone(ToolRegistry::global_arc()));
+        smol::block_on(async {
+            let (root, events) = flume::unbounded();
+            let (generation, owner) = CancelToken::new();
+            let (run, run_cancel) = owner.child();
+            let (wrapper, mut wrapper_events) = event_stream();
+            let event_tx = EventSender::new(root, RUN_ID)
+                .with_owner_cancel(owner.clone())
+                .child_sender(&wrapper, RUN_ID, owner);
+            let mut ctx = stub_ctx_with(&AgentMode::Build, Some(&event_tx), Some(NATIVE_CHILD));
+            ctx.cancel = run_cancel;
+            ctx.subagent_cancels = Arc::new(CancelMap::new());
+            ctx.user_response_rx = Some(Arc::new(AsyncMutex::new(flume::unbounded().1)));
+            let context = lua.create_userdata(LuaCtx::handler(&ctx)).unwrap();
+            let opts = lua.create_table().unwrap();
+            opts.set("background", true).unwrap();
+            opts.set("presentation", "attached").unwrap();
+            opts.set("prompt", CHILD_REQUEST).unwrap();
+            let (session, error) = session(
+                lua.clone(),
+                Arc::from(NATIVE_PLUGIN),
+                PluginPermissions::trusted(),
+                LuaEither::Left(context.borrow().unwrap()),
+                Some(opts),
+            )
+            .await
+            .unwrap();
+            assert!(error.is_none(), "{error:?}");
+            let session = session.unwrap();
+            let handle = session.borrow::<LuaSession>().unwrap();
+            let mut state = handle.inner.lock().await;
+            let native = &handle.cancel;
+            assert_eq!(
+                state
+                    .params
+                    .child_presentation
+                    .as_ref()
+                    .unwrap()
+                    .info()
+                    .prompt
+                    .as_deref(),
+                Some(CHILD_REQUEST)
+            );
+            assert!(!native.presentation.is_detached());
+            run.cancel();
+            ctx.subagent_cancels.end_foreground();
+            assert!(!native.token.is_cancelled());
+            if promote {
+                native.presentation.detach();
+                let detached = events.recv_async().await.unwrap();
+                let AgentEvent::SubagentDetached { child } = detached.event else {
+                    panic!("expected detached child")
+                };
+                assert_eq!(child.prompt.as_deref(), Some(CHILD_REQUEST));
+                assert!(child.detached);
+                assert!(child.answer_tx.is_some());
+                assert_eq!(child.parent_tool_use_id, native.ui_id);
+            }
+            state.set_prompt_info(NESTED_CHILD);
+            state
+                .sub_event_tx
+                .send(AgentEvent::PermissionRequest {
+                    id: NESTED_ASK.into(),
+                    tool: ToolKey::native("bash"),
+                    scopes: Vec::new(),
+                    reason: None,
+                })
+                .unwrap();
+            let ask = events.recv_async().await.unwrap();
+            assert_eq!(ask.run_id, DETACHED_RUN_ID);
+            let AgentEvent::PermissionRequest { id, .. } = ask.event else {
+                panic!("expected child permission")
+            };
+            let info = ask.subagent.unwrap();
+            assert_eq!(info.detached, promote);
+            assert_eq!(info.prompt.as_deref(), Some(CHILD_REQUEST));
+            assert_eq!(info.permission_tool_use_id.as_deref(), Some(NESTED_ASK));
+            info.answer_tx
+                .unwrap()
+                .send(TaggedAnswer::new(id, PermissionAnswer::AllowOnce).encode())
+                .unwrap();
+            assert_eq!(
+                state
+                    .answer_rx
+                    .as_ref()
+                    .unwrap()
+                    .lock()
+                    .await
+                    .recv_async()
+                    .await
+                    .unwrap(),
+                TaggedAnswer::new(NESTED_ASK, PermissionAnswer::AllowOnce).encode()
+            );
+            assert!(
+                ctx.user_response_rx
+                    .as_ref()
+                    .unwrap()
+                    .lock()
+                    .await
+                    .is_empty()
+            );
+            assert!(futures::FutureExt::now_or_never(wrapper_events.next()).is_none());
+            native.cancels.cancel(native.ui_id.clone());
+            assert!(native.token.is_cancelled());
+            state.close(Some(SubagentVerdict::Error));
+            drop(state);
+            drop(handle);
+            drop(generation);
+        });
     }
 
     async fn nested_session(
@@ -2413,21 +2725,26 @@ mod tests {
                     reason: None,
                 })
                 .unwrap();
-            state.close(Some(SubagentVerdict::Error));
             drop(state);
             drop(child_handle);
 
             let ask = events.recv_async().await.unwrap();
-            assert!(matches!(ask.event, AgentEvent::PermissionRequest { .. }));
+            let AgentEvent::PermissionRequest { id, .. } = ask.event else {
+                panic!("expected child permission")
+            };
             let owner = ask.subagent.unwrap();
             assert_eq!(owner.parent_tool_use_id, child_id);
             assert!(
                 owner.detached,
                 "the attached child inherits background routing"
             );
-            owner.answer_tx.unwrap().send(NESTED_ANSWER.into()).unwrap();
+            owner
+                .answer_tx
+                .unwrap()
+                .send(TaggedAnswer::new(id, PermissionAnswer::AllowOnce).encode())
+                .unwrap();
             let child_handle = child.borrow::<LuaSession>().unwrap();
-            let state = child_handle.inner.lock().await;
+            let mut state = child_handle.inner.lock().await;
             assert_eq!(
                 state
                     .answer_rx
@@ -2435,10 +2752,12 @@ mod tests {
                     .unwrap()
                     .lock()
                     .await
-                    .try_recv()
+                    .recv_async()
+                    .await
                     .unwrap(),
-                NESTED_ANSWER
+                TaggedAnswer::new(NESTED_ASK, PermissionAnswer::AllowOnce).encode()
             );
+            state.close(Some(SubagentVerdict::Error));
             drop(state);
             drop(child_handle);
             let parent_handle = parent.borrow::<LuaSession>().unwrap();
@@ -2652,20 +2971,6 @@ mod tests {
             let (session, events) = native_session_events(&lua, true, None).await;
             let handle = session.borrow::<LuaSession>().unwrap();
             let native = Arc::clone(&handle.cancel);
-            let info = SubagentInfo {
-                kind: TaskKind::Agent,
-                parent_tool_use_id: native.ui_id.clone(),
-                name: NATIVE_CHILD.into(),
-                prompt: None,
-                model: None,
-                opts: None,
-                detached: true,
-                owner_cancel: None,
-                spawn_tool_use_id: None,
-                answer_tx: None,
-                inbox: None,
-            };
-            handle.inner.lock().await.subagent_info.set(info).unwrap();
             drop(handle);
             assert!(!native.token.is_cancelled());
             lua.app_data_ref::<SpawnedTasks>()
@@ -2793,23 +3098,230 @@ mod tests {
         }))
     }
 
-    fn subagent_info() -> Arc<OnceLock<SubagentInfo>> {
-        let info = Arc::new(OnceLock::new());
-        info.set(SubagentInfo {
-            kind: TaskKind::Agent,
-            parent_tool_use_id: PARENT_ID.into(),
-            name: "research".into(),
-            prompt: None,
-            model: None,
-            opts: None,
-            detached: false,
-            owner_cancel: None,
-            spawn_tool_use_id: None,
-            answer_tx: None,
-            inbox: None,
-        })
-        .unwrap();
-        info
+    fn subagent_info() -> Arc<ChildPresentation> {
+        ChildPresentation::new(
+            None,
+            None,
+            SubagentInfo {
+                kind: TaskKind::Agent,
+                parent_tool_use_id: PARENT_ID.into(),
+                name: "research".into(),
+                prompt: None,
+                model: None,
+                opts: None,
+                detached: false,
+                owner_cancel: None,
+                spawn_tool_use_id: None,
+                answer_tx: None,
+                permission_tool_use_id: None,
+                inbox: None,
+            },
+            EventSender::new(flume::unbounded().0, RUN_ID),
+        )
+    }
+
+    #[test_case(false; "attached_nested_child")]
+    #[test_case(true; "detached_nested_child")]
+    fn native_plugin_route_keeps_nested_text_history_and_usage(detached: bool) {
+        let (unused, unused_events) = flume::unbounded();
+        let (parent_stream, parent_events) = event_stream();
+        let parent_tx = EventSender::new(unused, RUN_ID).child_sender(
+            &parent_stream,
+            DETACHED_RUN_ID,
+            CancelToken::none(),
+        );
+        let mut child_info = subagent_info().info();
+        child_info.parent_tool_use_id = NESTED_CHILD.into();
+        child_info.detached = detached;
+        let child = ChildPresentation::new(None, None, child_info.clone(), parent_tx.clone());
+        let (child_stream, child_events) = event_stream();
+        let sender = child_stream.sender(DETACHED_RUN_ID);
+        sender
+            .send(AgentEvent::TextDelta {
+                text: CHILD_REQUEST.into(),
+            })
+            .unwrap();
+        sender
+            .send(turn(NESTED_MODEL, DONE_USAGE, ROUTED_COST))
+            .unwrap();
+        let (close_tx, close_rx) = flume::bounded(1);
+        close_tx
+            .send(Envelope {
+                event: AgentEvent::SubagentHistory {
+                    tool_use_id: NESTED_CHILD.into(),
+                    messages: vec![Message::user(CHILD_REQUEST.into())],
+                    status: Some(SubagentVerdict::Done),
+                },
+                subagent: Some(child_info),
+                run_id: DETACHED_RUN_ID,
+            })
+            .unwrap();
+        drop(child_stream);
+        smol::block_on(relay_session_events(
+            child_events,
+            Upstream::Parent(parent_tx),
+            child,
+            flume::unbounded().0,
+            None,
+            close_rx,
+            None,
+        ));
+        drop(parent_stream);
+        let (ui_tx, ui_rx) = flume::unbounded();
+        let (close_tx, close_rx) = flume::bounded(1);
+        drop(close_tx);
+        smol::block_on(relay_session_events(
+            parent_events,
+            chat_upstream(MakiId::generate(), ui_tx),
+            subagent_info(),
+            flume::unbounded().0,
+            None,
+            close_rx,
+            None,
+        ));
+        let events: Vec<_> = ui_rx
+            .drain()
+            .map(|action| {
+                let UiAction::PluginTaskEvent {
+                    envelope, task_id, ..
+                } = action
+                else {
+                    panic!("expected plugin task event")
+                };
+                assert_eq!(task_id, PARENT_ID);
+                *envelope
+            })
+            .collect();
+        assert_eq!(events.len(), 4);
+        assert!(
+            matches!(&events[0].event, AgentEvent::TextDelta { text } if text == CHILD_REQUEST)
+        );
+        assert!(
+            matches!(&events[1].event, AgentEvent::TurnComplete(turn) if turn.cost == Some(ROUTED_COST))
+        );
+        assert!(
+            matches!(&events[2].event, AgentEvent::SubagentHistory { tool_use_id, messages, .. } if tool_use_id == NESTED_CHILD && messages.len() == 1)
+        );
+        assert!(
+            events[..3]
+                .iter()
+                .all(|event| event.subagent.as_ref().unwrap().parent_tool_use_id == NESTED_CHILD)
+        );
+        assert!(unused_events.is_empty());
+    }
+
+    #[test_case(RUN_ID; "foreground_transport")]
+    #[test_case(DETACHED_RUN_ID; "generation_transport")]
+    fn child_permission_stays_on_the_ordered_tool_start_route(run_id: u64) {
+        let (unused, unused_events) = flume::unbounded();
+        let (parent_stream, mut parent_events) = event_stream();
+        let parent_tx = EventSender::new(unused, run_id).child_sender(
+            &parent_stream,
+            run_id,
+            CancelToken::none(),
+        );
+        let (child_stream, child_events) = event_stream();
+        let sender = child_stream.sender(run_id);
+        sender
+            .send(AgentEvent::ToolStart(Box::new(ToolStartEvent {
+                id: NESTED_ASK.into(),
+                tool: Arc::from("bash"),
+                summary: NESTED_CHILD.into(),
+                render_header: None,
+                annotation: None,
+                input: None,
+                raw_input: Some(serde_json::json!({ "command": CHILD_REQUEST })),
+                output: None,
+            })))
+            .unwrap();
+        sender
+            .send(AgentEvent::PermissionRequest {
+                id: NESTED_ASK.into(),
+                tool: ToolKey::native("bash"),
+                scopes: vec![CHILD_REQUEST.into()],
+                reason: None,
+            })
+            .unwrap();
+        drop(child_stream);
+        let (close_tx, close_rx) = flume::bounded(1);
+        drop(close_tx);
+        smol::block_on(relay_session_events(
+            child_events,
+            Upstream::Parent(parent_tx),
+            subagent_info(),
+            flume::unbounded().0,
+            None,
+            close_rx,
+            None,
+        ));
+        drop(parent_stream);
+        let events = smol::block_on(async {
+            let mut events = Vec::new();
+            while let Some(event) = parent_events.next().await {
+                events.push(event);
+            }
+            events
+        });
+        assert_eq!(events.len(), 2);
+        assert!(
+            matches!(&events[0].event, AgentEvent::ToolStart(start) if start.raw_input == Some(serde_json::json!({ "command": CHILD_REQUEST })))
+        );
+        assert!(
+            matches!(&events[1].event, AgentEvent::PermissionRequest { id, .. } if id == NESTED_ASK)
+        );
+        assert!(unused_events.is_empty());
+    }
+
+    #[test]
+    fn queued_child_events_read_promotion_and_bypass_the_retired_wrapper() {
+        let (root, root_events) = flume::unbounded();
+        let (wrapper, mut wrapper_events) = event_stream();
+        let (generation, owner) = CancelToken::new();
+        let upstream_tx = EventSender::new(root, RUN_ID)
+            .with_owner_cancel(owner.clone())
+            .child_sender(&wrapper, RUN_ID, owner);
+        let mut info = subagent_info().info();
+        info.prompt = Some(CHILD_REQUEST.into());
+        info.owner_cancel = upstream_tx.owner_cancel();
+        let presentation = ChildPresentation::new(None, None, info, upstream_tx.root_sender());
+        let (stream, events) = event_stream();
+        stream
+            .sender(RUN_ID)
+            .send(AgentEvent::PermissionRequest {
+                id: NESTED_ASK.into(),
+                tool: ToolKey::native("bash"),
+                scopes: Vec::new(),
+                reason: None,
+            })
+            .unwrap();
+        presentation.detach();
+        drop(stream);
+        let (close_tx, close_rx) = flume::bounded(1);
+        drop(close_tx);
+        smol::block_on(relay_session_events(
+            events,
+            Upstream::Parent(upstream_tx.root_sender()),
+            presentation,
+            flume::unbounded().0,
+            None,
+            close_rx,
+            None,
+        ));
+        let detached = root_events.try_recv().unwrap();
+        assert!(matches!(
+            detached.event,
+            AgentEvent::SubagentDetached { .. }
+        ));
+        let ask = root_events.try_recv().unwrap();
+        assert_eq!(ask.run_id, DETACHED_RUN_ID);
+        assert!(matches!(ask.event, AgentEvent::PermissionRequest { id, .. } if id == NESTED_ASK));
+        let info = ask.subagent.unwrap();
+        assert_eq!(info.parent_tool_use_id, PARENT_ID);
+        assert!(info.detached);
+        assert_eq!(info.prompt.as_deref(), Some(CHILD_REQUEST));
+        assert!(futures::FutureExt::now_or_never(wrapper_events.next()).is_none());
+        assert!(root_events.is_empty());
+        drop(generation);
     }
 
     /// Two turns, an error and the run's `Done`, then the guard drops. The
@@ -2837,7 +3349,7 @@ mod tests {
         ];
         for event in events {
             if matches!(&event, AgentEvent::TurnComplete(turn) if turn.model == NESTED_MODEL) {
-                let mut nested = subagent_info().get().unwrap().clone();
+                let mut nested = subagent_info().info();
                 nested.parent_tool_use_id = NESTED_CHILD.into();
                 sub_tx
                     .send_envelope(Envelope {
@@ -2912,6 +3424,7 @@ mod tests {
             done_tx,
             Some(live_tx),
             close_rx,
+            None,
         ));
 
         let expected_live = [
@@ -2942,7 +3455,7 @@ mod tests {
     #[test]
     fn history_sent_to_the_parent_carries_its_run() {
         let (upstream, parent_rx) = parent_upstream();
-        upstream.send_history(PARENT_ID, Vec::new(), subagent_info().get().cloned());
+        upstream.send_history(PARENT_ID, Vec::new(), Some(subagent_info().info()));
         let envelope = parent_rx.try_recv().unwrap();
         assert_eq!(envelope.run_id, RUN_ID);
         assert!(matches!(
@@ -2970,6 +3483,7 @@ mod tests {
             done_tx,
             None,
             close_rx,
+            None,
         ));
 
         assert_eq!(done_rx.try_recv(), Ok(()));
@@ -3033,6 +3547,7 @@ mod tests {
             done_tx,
             None,
             close_rx,
+            None,
         ));
 
         assert!(done_rx.is_empty());
@@ -3062,12 +3577,11 @@ mod tests {
         let (close_tx, close_rx) = flume::bounded(1);
         let (nested_tx, nested_rx) = flume::unbounded();
         let (outer_tx, outer_rx) = flume::unbounded();
-        let mut outer = subagent_info().get().unwrap().clone();
+        let mut outer = subagent_info().info();
         outer.answer_tx = Some(outer_tx);
         let (owner, owner_cancel) = CancelToken::new();
         outer.owner_cancel = Some(owner_cancel);
-        let outer_info = Arc::new(OnceLock::new());
-        outer_info.set(outer.clone()).unwrap();
+        let outer_info = ChildPresentation::new(None, None, outer.clone(), sender.clone());
         let mut nested = outer.clone();
         nested.parent_tool_use_id = NESTED_CHILD.into();
         nested.answer_tx = Some(nested_tx);
@@ -3114,6 +3628,7 @@ mod tests {
             flume::unbounded().0,
             None,
             close_rx,
+            None,
         ));
 
         let mut forwarded = ui_rx.drain().map(|action| match action {
@@ -3150,7 +3665,7 @@ mod tests {
     }
 
     #[test]
-    fn a_native_session_without_a_prompt_emits_no_unowned_close() {
+    fn a_native_session_without_a_prompt_emits_only_its_owned_stream_close() {
         let (guard, events) = event_stream();
         let (close_tx, close_rx) = flume::bounded(1);
         close_tx
@@ -3170,12 +3685,18 @@ mod tests {
         smol::block_on(relay_session_events(
             events,
             chat_upstream(MakiId::generate(), ui_tx),
-            Arc::new(OnceLock::new()),
+            subagent_info(),
             flume::unbounded().0,
             None,
             close_rx,
+            None,
         ));
 
+        let UiAction::PluginTaskEvent { envelope, .. } = ui_rx.try_recv().unwrap() else {
+            panic!("expected stream close");
+        };
+        assert!(matches!(envelope.event, AgentEvent::StreamClosed));
+        assert_eq!(envelope.subagent.unwrap().parent_tool_use_id, PARENT_ID);
         assert!(ui_rx.is_empty());
     }
 }

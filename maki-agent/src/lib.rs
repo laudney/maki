@@ -2,7 +2,7 @@
 
 pub mod agent;
 pub mod asks;
-pub use asks::{AskOwner, OwnedAsks};
+pub use asks::{AskOwner, OwnedAsks, PermissionRoute};
 pub mod cancel;
 pub mod child_guard;
 pub use child_guard::ChildGuard;
@@ -53,11 +53,12 @@ pub use maki_providers::AgentError;
 use maki_providers::Message;
 pub use maki_providers::{EMPTY_RESPONSE_MARKER, ImageMediaType, ImageSource, ThinkingConfig};
 pub use types::{
-    AgentEvent, BufferSnapshot, CallRecord, DETACHED_RUN_ID, DoneReason, Envelope, EventSender,
-    EventStreamGuard, GrepFileEntry, GrepLine, GrepMatchGroup, InstructionBlock, NO_FILES_FOUND,
-    RunLedger, RunTotals, SessionEndReason, SessionEvents, SharedBuf, SnapshotLine, SnapshotSpan,
-    SpanColor, SpanStyle, SteerKind, SubagentInfo, SubagentVerdict, TextOutput, ToolDoneEvent,
-    ToolInput, ToolOutput, ToolStartEvent, TurnCompleteEvent, UiWaker, event_stream,
+    AgentEvent, BufferSnapshot, CallRecord, ChildPresentation, DETACHED_RUN_ID, DoneReason,
+    Envelope, EventSender, EventStreamGuard, GrepFileEntry, GrepLine, GrepMatchGroup,
+    InstructionBlock, NO_FILES_FOUND, RunLedger, RunTotals, SessionEndReason, SessionEvents,
+    SharedBuf, SnapshotLine, SnapshotSpan, SpanColor, SpanStyle, SteerKind, SubagentInfo,
+    SubagentVerdict, TextOutput, ToolDoneEvent, ToolInput, ToolOutput, ToolStartEvent,
+    TurnCompleteEvent, UiWaker, event_stream,
 };
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]

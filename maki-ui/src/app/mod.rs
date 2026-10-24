@@ -1549,7 +1549,7 @@ impl App {
         self.shell.cancel_all();
         for chat in self.chats.iter_mut().filter(|c| c.plugin.is_none()) {
             chat.flush();
-            if !chat.detached || chat.is_finished() {
+            if !(chat.detached || chat.generation_owned) || chat.is_finished() {
                 chat.cancel_in_progress();
             }
         }
@@ -1662,7 +1662,7 @@ impl App {
         {
             return vec![];
         }
-        let background = plugin_task.is_some() || envelope.run_id == DETACHED_RUN_ID;
+        let generation_owned = plugin_task.is_some() || envelope.run_id == DETACHED_RUN_ID;
         let task_id = match &envelope.event {
             AgentEvent::SubagentHistory { tool_use_id, .. } => Some(tool_use_id),
             _ => envelope.subagent.as_ref().map(|s| &s.parent_tool_use_id),
@@ -1675,12 +1675,20 @@ impl App {
             task_id.is_some_and(|id| id == native_id).then_some(plugin)
         });
 
+        if let AgentEvent::SubagentDetached { ref child } = envelope.event {
+            self.resolve_or_create_chat(child, &plugin, true);
+            return vec![];
+        }
+
         if let AgentEvent::SubagentHistory {
             tool_use_id,
             messages,
             status,
         } = envelope.event
         {
+            if let Some(info) = &envelope.subagent {
+                self.resolve_or_create_chat(info, &plugin, generation_owned);
+            }
             // Native prompt histories are not terminal. An explicit final
             // verdict also applies to a native task before StreamClosed.
             if plugin.is_none() || status.is_some() {
@@ -1726,7 +1734,7 @@ impl App {
 
         let is_plugin_task = plugin.is_some();
         let chat_idx = match envelope.subagent {
-            Some(ref subagent) => self.resolve_or_create_chat(subagent, &plugin, background),
+            Some(ref subagent) => self.resolve_or_create_chat(subagent, &plugin, generation_owned),
             None if is_plugin_task => return vec![],
             None => MAIN_CHAT,
         };
@@ -1942,28 +1950,34 @@ impl App {
         &mut self,
         subagent: &SubagentInfo,
         plugin: &Option<Arc<str>>,
-        background: bool,
+        generation_owned: bool,
     ) -> usize {
         let id = &subagent.parent_tool_use_id;
+        // A turn-scoped child's id is the provider's call id, which a later
+        // turn can reuse. A generation-owned child's id is unique.
         let known = match plugin {
-            None => self.chat_index.get(id.as_str()).copied(),
+            None => self
+                .chat_index
+                .get(id.as_str())
+                .copied()
+                .or_else(|| generation_owned.then(|| self.chat_of_task(id).ok())?),
             Some(_) => self.chat_of_task(id).ok(),
         };
         if let Some(idx) = known {
-            if !self.chats[idx].is_finished() {
-                let detached = plugin.is_none() && (background || subagent.detached);
-                if detached && !self.chats[idx].detached {
-                    self.chats[idx].detached = true;
-                    self.sync_subagents();
-                }
-                if let Some(ref tx) = subagent.answer_tx
-                    && !self
-                        .subagent_answers
-                        .get(id)
-                        .is_some_and(|current| current.same_channel(tx))
-                {
-                    self.subagent_answers.insert(id.clone(), tx.clone());
-                }
+            self.chats[idx].generation_owned |= generation_owned;
+            if plugin.is_none() && subagent.detached && !self.chats[idx].detached {
+                self.chats[idx].detached = true;
+                self.sync_subagents();
+            }
+            self.set_initial_child_prompt(idx, subagent);
+            if !self.chats[idx].is_finished()
+                && let Some(ref tx) = subagent.answer_tx
+                && !self
+                    .subagent_answers
+                    .get(id)
+                    .is_some_and(|current| current.same_channel(tx))
+            {
+                self.subagent_answers.insert(id.clone(), tx.clone());
             }
             return idx;
         }
@@ -1991,17 +2005,22 @@ impl App {
         );
         chat.set_restore_channel(self.restore_event_tx.clone());
         chat.plugin = plugin.clone();
+        chat.generation_owned = generation_owned;
         chat.model_id = subagent.model.clone();
         chat.opts = subagent.opts;
         chat.inbox = subagent.inbox.clone();
         chat.kind = subagent.kind;
-        chat.detached = plugin.is_none() && (background || subagent.detached);
-        if let Some(ref prompt) = subagent.prompt {
-            chat.push_user_message(prompt);
-        }
+        chat.detached = plugin.is_none() && subagent.detached;
         self.chats.push(chat);
+        self.set_initial_child_prompt(idx, subagent);
         self.sync_subagents();
         idx
+    }
+
+    fn set_initial_child_prompt(&mut self, idx: usize, info: &SubagentInfo) {
+        if let Some(prompt) = &info.prompt {
+            self.chats[idx].set_initial_prompt(prompt);
+        }
     }
 
     /// A chat this task already has, maybe one the user just stopped, stays as
@@ -2017,7 +2036,7 @@ impl App {
         {
             return;
         }
-        let idx = self.resolve_or_create_chat(info, &Some(plugin), false);
+        let idx = self.resolve_or_create_chat(info, &Some(plugin), true);
         self.chats[idx].idle = true;
     }
 
@@ -2599,19 +2618,19 @@ impl App {
     /// Detached chats are not turn-scoped: whatever ends the turn,
     /// they keep their routing and their answer channel until they end.
     fn retain_detached_tasks(&mut self) {
-        self.chat_index
-            .retain(|_, &mut sub_idx| self.chats[sub_idx].detached);
+        self.chat_index.retain(|_, &mut sub_idx| {
+            self.chats[sub_idx].detached || self.chats[sub_idx].generation_owned
+        });
         let chat_index = &self.chat_index;
         let chats = &self.chats;
         self.subagent_answers.retain(|id, _| {
-            chat_index
-                .get(id.as_str())
-                .is_some_and(|&idx| chats[idx].detached && !chats[idx].is_finished())
-                || chats.iter().any(|chat| {
-                    chat.plugin.is_some()
-                        && !chat.is_finished()
-                        && chat.task_id().is_some_and(|task_id| &**task_id == id)
-                })
+            chat_index.get(id.as_str()).is_some_and(|&idx| {
+                (chats[idx].detached || chats[idx].generation_owned) && !chats[idx].is_finished()
+            }) || chats.iter().any(|chat| {
+                chat.plugin.is_some()
+                    && !chat.is_finished()
+                    && chat.task_id().is_some_and(|task_id| &**task_id == id)
+            })
         });
         let answers = &self.subagent_answers;
         self.permission_prompt
@@ -2628,7 +2647,7 @@ impl App {
         self.retain_resolved_subagents(TaskOutcome::Error, ERROR_TEXT);
         self.chats[MAIN_CHAT].fail_in_progress_except(message.into(), self.shell.active_ids());
         for chat in self.chats.iter_mut().skip(1).filter(|c| c.plugin.is_none()) {
-            if !chat.detached || chat.is_finished() {
+            if !(chat.detached || chat.generation_owned) || chat.is_finished() {
                 chat.fail_in_progress_with_message(message.into());
             }
         }
@@ -2640,7 +2659,7 @@ impl App {
         self.chat_index.retain(|_, &mut sub_idx| {
             if self.chats[sub_idx].is_finished() {
                 true
-            } else if self.chats[sub_idx].detached {
+            } else if self.chats[sub_idx].detached || self.chats[sub_idx].generation_owned {
                 // Detached work retains its session owner across turns.
                 true
             } else {

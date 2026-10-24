@@ -798,6 +798,7 @@ maki.api.create_autocmd("SessionEnd", { callback = function() maki.ui.input() en
                 owner_cancel: Some(owner.clone()),
                 spawn_tool_use_id: None,
                 answer_tx: None,
+                permission_tool_use_id: None,
                 inbox: None,
             }),
             event: AgentEvent::TextDelta {
@@ -837,6 +838,7 @@ maki.api.create_autocmd("SessionEnd", { callback = function() maki.ui.input() en
                         owner_cancel: Some(owner.clone()),
                         spawn_tool_use_id: None,
                         answer_tx: None,
+                        permission_tool_use_id: None,
                         inbox: None,
                     }),
                     event,

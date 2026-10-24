@@ -81,7 +81,9 @@ pub struct Chat {
     pub(crate) draft: Submission,
     /// Session-owned work keeps its routing and input after the main turn ends.
     pub detached: bool,
+    pub(crate) generation_owned: bool,
     pub kind: TaskKind,
+    initial_prompt_set: bool,
     pending_turn_usage: Option<String>,
     messages_panel: MessagesPanel,
     /// The ending and the index of the bubble announcing it, so a later, better
@@ -114,7 +116,9 @@ impl Chat {
             inbox: None,
             draft: Submission::default(),
             detached: false,
+            generation_owned: false,
             kind: TaskKind::Agent,
+            initial_prompt_set: false,
             pending_turn_usage: None,
             messages_panel,
             finish: None,
@@ -289,7 +293,9 @@ impl Chat {
                 self.messages_panel
                     .push(DisplayMessage::new(DisplayRole::Notice, text));
             }
-            AgentEvent::SubagentHistory { .. } | AgentEvent::StreamClosed => {}
+            AgentEvent::SubagentHistory { .. }
+            | AgentEvent::SubagentDetached { .. }
+            | AgentEvent::StreamClosed => {}
             AgentEvent::LiveToolBuf { id, body } => {
                 self.messages_panel.register_live_buf(id, body);
             }
@@ -489,10 +495,18 @@ impl Chat {
     }
 
     pub fn load_messages(&mut self, msgs: Vec<DisplayMessage>) {
+        self.initial_prompt_set = msgs.iter().any(|msg| matches!(msg.role, DisplayRole::User));
         self.messages_panel.load_messages(msgs);
     }
 
+    pub(crate) fn set_initial_prompt(&mut self, prompt: &str) {
+        if !self.initial_prompt_set {
+            self.push_user_message(prompt);
+        }
+    }
+
     pub fn push_user_message(&mut self, text: impl Into<String>) {
+        self.initial_prompt_set = true;
         self.messages_panel
             .push(DisplayMessage::new(DisplayRole::User, text.into()));
     }
@@ -500,6 +514,7 @@ impl Chat {
     /// Flush, push, and re-pin scroll in one shot to avoid
     /// the one-frame hop where the bubble briefly lands in the wrong row.
     pub fn show_user_message(&mut self, text: impl Into<String>, images: Vec<ImageSource>) {
+        self.initial_prompt_set = true;
         self.flush();
         self.messages_panel.push(DisplayMessage::with_images(
             DisplayRole::User,

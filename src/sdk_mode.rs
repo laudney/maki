@@ -26,8 +26,8 @@ use maki_agent::session::Resumed;
 use maki_agent::tools::QUESTION_TOOL_NAME;
 use maki_agent::{
     AgentConfig, AgentEvent, AgentInput, AgentMode, AskOwner, DETACHED_RUN_ID, DoneReason,
-    Envelope, InputSource, OwnedAsks, PermissionsConfig, SessionEndReason, SessionEvents,
-    SessionMailbox, SteerKind,
+    Envelope, InputSource, OwnedAsks, PermissionRoute, PermissionsConfig, SessionEndReason,
+    SessionEvents, SteerKind,
 };
 use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
 use maki_lua::session_snapshot::{HeadlessMeta, HeadlessSnapshot, MODE_BUILD, MODE_PLAN};
@@ -1064,6 +1064,12 @@ impl EventPump {
                 return Ok(());
             }
         }
+        self.shared
+            .lock()
+            .unwrap()
+            .permissions
+            .outstanding
+            .observe(&envelope);
         // Plugins handling TurnEnd must read the totals from that event.
         self.snapshot.observe(&envelope);
         maki_lua::agent_autocmd::dispatch(
@@ -1185,21 +1191,17 @@ impl EventPump {
                 }))?;
             }
             AgentEvent::PermissionRequest { id, tool, .. } => {
-                let managed = SessionMailbox::tool_permission(self.writer.session_id.id(), id);
-                let input_id = managed.as_ref().map_or(id, |(original, _)| original);
-                let answer_tx = managed.as_ref().map(|(_, tx)| tx.clone()).or_else(|| {
-                    match &envelope.subagent {
-                        Some(child) => child.answer_tx.clone(),
-                        None => Some(self.shared.lock().unwrap().permissions.answer_tx.clone()),
-                    }
-                });
-                let Some(answer_tx) = answer_tx else {
-                    warn!(ask_id = %id, "subagent permission request has no answer channel");
-                    if let Some(child) = &parent_tool_use_id {
-                        self.subagent_cancels.cancel(child.clone());
-                    }
+                let Some(route) = PermissionRoute::of(
+                    self.writer.session_id.id(),
+                    &envelope,
+                    id,
+                    &self.subagent_cancels,
+                ) else {
                     return Ok(());
                 };
+                let answer_tx = route
+                    .answer_tx
+                    .unwrap_or_else(|| self.shared.lock().unwrap().permissions.answer_tx.clone());
                 let ask = PendingAsk {
                     ask_id: id.clone(),
                     answer_tx,
@@ -1214,17 +1216,19 @@ impl EventPump {
 
                 let (tool_name, input) = self
                     .tool_inputs
-                    .get(&(owner.clone(), input_id.clone()))
+                    .get(&(owner.clone(), route.input_id.clone()))
                     .cloned()
                     .unwrap_or_else(|| (tool.to_string(), Value::Null));
 
                 self.request_counter += 1;
                 let req_id = format!("req_{}", self.request_counter);
-                if !self.shared.lock().unwrap().permissions.ask(
-                    req_id.clone(),
-                    AskOwner::of(&envelope),
-                    ask,
-                ) {
+                if !self
+                    .shared
+                    .lock()
+                    .unwrap()
+                    .permissions
+                    .ask(req_id.clone(), route.owner, ask)
+                {
                     return Ok(());
                 }
 
@@ -1235,7 +1239,7 @@ impl EventPump {
                             subtype: "can_use_tool",
                             tool_name: Some(maki_to_claude_tool_name(&tool_name).into()),
                             input: Some(input),
-                            tool_use_id: Some(input_id.clone()),
+                            tool_use_id: Some(route.input_id),
                         },
                     }))?;
             }
@@ -1274,6 +1278,8 @@ impl EventPump {
                     self.retire(&owner);
                 }
             }
+            AgentEvent::SubagentDetached { .. } => {}
+            // The asks went with `observe`, the inputs cached for them go here.
             AgentEvent::SubagentHistory { tool_use_id, .. } => {
                 self.retire(&InputOwner::Child(tool_use_id.clone()));
             }
@@ -1719,6 +1725,8 @@ mod tests {
     const TEST_CHILD_ID: &str = "child-1";
     const OTHER_CHILD_ID: &str = "child-2";
     const MAIN_TEXT: &str = "main result";
+    const CHILD_PERMISSION_ID: &str = "child-permission-1";
+    const CHILD_INPUT: &str = "child tool input";
     const CHILD_TEXT: &str = "child result";
     const MAIN_COST: f64 = 0.25;
     const CHILD_COST: f64 = 2.0;
@@ -1805,6 +1813,7 @@ mod tests {
                 spawn_tool_use_id: None,
                 opts: None,
                 answer_tx,
+                permission_tool_use_id: None,
                 inbox: None,
             }),
         }
@@ -1919,6 +1928,85 @@ mod tests {
         .unwrap();
         assert_eq!(other_rx.try_recv(), Ok(tagged(PermissionAnswer::Deny)));
         assert!(out_rx.is_empty());
+    }
+
+    #[test_case(DETACHED_RUN_ID; "generation_owned")]
+    #[test_case(0; "promoted_foreground")]
+    fn attached_generation_permission_survives_parent_completion_and_presentation_change(
+        run_id: u64,
+    ) {
+        let (main_tx, main_rx) = flume::unbounded();
+        let (child_tx, child_rx) = flume::unbounded();
+        let (mut pump, out_rx) = test_pump(PermissionMode::Default, main_tx);
+        let mut envelope = child_event_in_run(
+            permission_request().event,
+            TEST_CHILD_ID,
+            Some(child_tx),
+            run_id,
+        );
+        let info = envelope.subagent.as_mut().unwrap();
+        info.detached = false;
+        let mut detached = info.clone();
+        detached.detached = true;
+        pump.handle(envelope).unwrap();
+        let request = wire(&out_rx);
+        pump.handle(child_event(
+            AgentEvent::SubagentDetached {
+                child: Box::new(detached),
+            },
+            TEST_CHILD_ID,
+            None,
+        ))
+        .unwrap();
+        pump.handle(top_level(done(DoneReason::EndTurn))).unwrap();
+        assert_eq!(wire(&out_rx)["type"], "result");
+        pump.shared.lock().unwrap().permissions.resolve(
+            request["request_id"].as_str().unwrap(),
+            PermissionAnswer::AllowOnce,
+        );
+        assert_eq!(child_rx.try_recv(), Ok(tagged(PermissionAnswer::AllowOnce)));
+        assert!(main_rx.is_empty());
+        assert!(out_rx.is_empty());
+    }
+
+    #[test_case(false; "generation_owned")]
+    #[test_case(true; "promoted_after_tool_start")]
+    fn child_permission_keeps_tool_input_after_publication_and_parent_completion(promote: bool) {
+        let (main_tx, _) = flume::unbounded();
+        let (child_tx, _) = flume::unbounded();
+        let (mut pump, out_rx) = test_pump(PermissionMode::Default, main_tx);
+        pump.handle(child_event_in_run(
+            tool_start(CHILD_INPUT),
+            TEST_CHILD_ID,
+            None,
+            if promote { 0 } else { DETACHED_RUN_ID },
+        ))
+        .unwrap();
+        if promote {
+            let info = child_event(permission_request().event, TEST_CHILD_ID, None)
+                .subagent
+                .unwrap();
+            pump.handle(child_event(
+                AgentEvent::SubagentDetached {
+                    child: Box::new(info),
+                },
+                TEST_CHILD_ID,
+                None,
+            ))
+            .unwrap();
+        }
+        pump.handle(top_level(done(DoneReason::EndTurn))).unwrap();
+        assert_eq!(wire(&out_rx)["type"], "result");
+        let mut ask = child_event(permission_request().event, TEST_CHILD_ID, Some(child_tx));
+        let AgentEvent::PermissionRequest { id, .. } = &mut ask.event else {
+            unreachable!()
+        };
+        *id = CHILD_PERMISSION_ID.into();
+        ask.subagent.as_mut().unwrap().permission_tool_use_id = Some(TEST_TOOL_USE_ID.into());
+        pump.handle(ask).unwrap();
+        let request = wire(&out_rx);
+        assert_eq!(request["request"]["input"], CHILD_INPUT);
+        assert_eq!(request["request"]["tool_use_id"], TEST_TOOL_USE_ID);
     }
 
     #[test_case(0; "attached")]
@@ -2101,6 +2189,26 @@ mod tests {
         assert_eq!(result["total_cost_usd"], MAIN_COST + 2.0 * CHILD_COST);
         assert_eq!(result["is_error"], false);
         assert!(out_rx.is_empty());
+    }
+
+    #[test_case(false ; "attached_child")]
+    #[test_case(true ; "detached_child")]
+    fn a_generation_routed_child_counts_whatever_its_presentation(detached: bool) {
+        let (mut pump, out_rx) = test_pump(PermissionMode::Default, flume::unbounded().0);
+        let mut child = child_event(turn_complete(CHILD_TEXT, CHILD_COST), TEST_CHILD_ID, None);
+        child.subagent.as_mut().unwrap().detached = detached;
+
+        pump.handle(child).unwrap();
+        pump.handle(top_level(turn_complete(MAIN_TEXT, MAIN_COST)))
+            .unwrap();
+        pump.handle(top_level(done(DoneReason::EndTurn))).unwrap();
+
+        let result = out_rx
+            .try_iter()
+            .map(|line| serde_json::from_str::<Value>(&line).unwrap())
+            .find(|event| event["type"] == "result")
+            .unwrap();
+        assert_eq!(result["total_cost_usd"], MAIN_COST + CHILD_COST);
     }
 
     #[test]

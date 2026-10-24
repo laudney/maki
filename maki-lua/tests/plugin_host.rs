@@ -8464,6 +8464,7 @@ fn promotion_params(
         session_id: Some(mailbox.session_id().into()),
         background_for: None,
         running_tool: None,
+        child_presentation: None,
         task_id: None,
         mailbox: Some(mailbox.clone()),
         timeouts: ctx.timeouts,
@@ -8896,12 +8897,14 @@ fn promoted_lua_sessions_keep_nested_events_and_permission_replies(background: b
             unreachable!()
         };
         assert_eq!(scopes, vec![PROMOTED_SESSION_SCOPE]);
+        assert_ne!(id, PROMOTED_SESSION_GUARD);
+        assert_eq!(
+            info.permission_tool_use_id.as_deref(),
+            Some(PROMOTED_SESSION_GUARD)
+        );
         let reply = TaggedAnswer::new(&id, PermissionAnswer::AllowOnce).encode();
-        if background {
-            info.answer_tx.as_ref().unwrap().send(reply).unwrap();
-        } else {
-            assert!(SessionMailbox::reply_tool(mailbox.session_id(), &reply));
-        }
+        assert!(SessionMailbox::tool_permission(mailbox.session_id(), &id).is_none());
+        info.answer_tx.as_ref().unwrap().send(reply).unwrap();
         let mut saw_result = false;
         loop {
             let envelope = events.recv_async().await.unwrap();

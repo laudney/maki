@@ -2,7 +2,7 @@ use std::any::Any;
 use std::fmt::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Duration;
 
 use flume::{Receiver, Sender};
@@ -15,7 +15,8 @@ use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
 use strum::Display;
 
-use crate::CancelToken;
+use crate::{CancelToken, RunningTool};
+use maki_storage::id::MakiId;
 
 pub const NO_FILES_FOUND: &str = "No files found";
 
@@ -746,6 +747,9 @@ pub enum AgentEvent {
         kind: SteerKind,
         text: String,
     },
+    SubagentDetached {
+        child: Box<SubagentInfo>,
+    },
     SubagentHistory {
         tool_use_id: String,
         messages: Vec<Message>,
@@ -1147,6 +1151,95 @@ pub enum SubagentVerdict {
 /// them as stale: the parent run may have ended long ago.
 pub const DETACHED_RUN_ID: u64 = u64::MAX - 1;
 
+/// Child-owned presentation, independent of the worker and its caller's lifetime.
+pub struct ChildPresentation {
+    pub parent_session: Option<MakiId>,
+    detached: AtomicBool,
+    publication: Mutex<()>,
+    initial_prompt: OnceLock<String>,
+    info: SubagentInfo,
+    event_tx: EventSender,
+}
+
+impl ChildPresentation {
+    pub fn new(
+        parent_session: Option<MakiId>,
+        creator: Option<&RunningTool>,
+        mut info: SubagentInfo,
+        event_tx: EventSender,
+    ) -> Arc<Self> {
+        let initial_prompt = OnceLock::new();
+        if let Some(prompt) = info.prompt.take() {
+            let _ = initial_prompt.set(prompt);
+        }
+        let child = Arc::new(Self {
+            parent_session,
+            detached: AtomicBool::new(info.detached),
+            publication: Mutex::new(()),
+            initial_prompt,
+            info,
+            event_tx,
+        });
+        if let Some(creator) = creator {
+            creator.register_child(&child);
+        }
+        child
+    }
+
+    pub fn is_detached(&self) -> bool {
+        self.detached.load(Ordering::Acquire)
+    }
+
+    pub fn background_session(&self) -> Option<MakiId> {
+        self.parent_session.filter(|_| self.is_detached())
+    }
+
+    pub fn set_initial_prompt(&self, prompt: &str) {
+        self.initial_prompt.get_or_init(|| prompt.to_owned());
+    }
+
+    pub fn info(&self) -> SubagentInfo {
+        SubagentInfo {
+            detached: self.is_detached(),
+            prompt: self.initial_prompt.get().cloned(),
+            ..self.info.clone()
+        }
+    }
+
+    /// Serialize event metadata and enqueueing with detachment. The callback
+    /// must not block or reenter this child.
+    pub fn publish(&self, mut envelope: Envelope, publish: impl FnOnce(Envelope, bool)) {
+        let _publication = self
+            .publication
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let detached = self.is_detached();
+        if let Some(info) = &mut envelope.subagent
+            && info.parent_tool_use_id == self.info.parent_tool_use_id
+        {
+            info.detached = detached;
+        }
+        publish(envelope, detached);
+    }
+
+    pub fn detach(&self) {
+        let _publication = self
+            .publication
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if !self.detached.swap(true, Ordering::AcqRel) {
+            let info = self.info();
+            let _ = self.event_tx.send_envelope(Envelope {
+                event: AgentEvent::SubagentDetached {
+                    child: Box::new(info.clone()),
+                },
+                subagent: Some(info),
+                run_id: DETACHED_RUN_ID,
+            });
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SubagentInfo {
     #[serde(default, skip_serializing_if = "crate::TaskKind::is_agent")]
@@ -1158,8 +1251,7 @@ pub struct SubagentInfo {
     pub prompt: Option<String>,
     #[serde(rename = "parent_model", skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-    /// True when the child outlives the tool call that spawned it, which makes
-    /// its chat outlive the turn too.
+    /// Monotonic presentation state, independent of event transport.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub detached: bool,
     /// Teardown of the generation that owns this live child.
@@ -1177,6 +1269,9 @@ pub struct SubagentInfo {
     pub opts: Option<RequestOptions>,
     #[serde(skip)]
     pub answer_tx: Option<flume::Sender<String>>,
+    /// The child-local tool id behind a uniquely published permission request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_tool_use_id: Option<String>,
     /// Where a host queues messages for this subagent. Its loop drains the
     /// queue between turns, so a message lands as a user interrupt.
     #[serde(skip)]
@@ -1384,9 +1479,114 @@ impl SessionEvents {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::TaskKind;
     use futures_lite::future::poll_once;
     use std::pin::pin;
+    use std::sync::{Barrier, TryLockError};
+    use std::thread;
     use test_case::test_case;
+
+    const CHILD_ID: &str = "publication-child";
+    const CHILD_PERMISSION_ID: &str = "publication-permission";
+    const CHILD_RUN_ID: u64 = 31;
+
+    #[test_case(false; "publication_in_progress")]
+    #[test_case(true; "detached_before_publication")]
+    fn child_publication_cannot_follow_detachment_with_attached_routing(detach_first: bool) {
+        let (tx, events) = flume::unbounded();
+        let sender = EventSender::new(tx, CHILD_RUN_ID);
+        let child = ChildPresentation::new(
+            None,
+            None,
+            SubagentInfo {
+                kind: TaskKind::Agent,
+                parent_tool_use_id: CHILD_ID.into(),
+                name: CHILD_ID.into(),
+                prompt: None,
+                model: None,
+                detached: false,
+                owner_cancel: Some(CancelToken::none()),
+                spawn_tool_use_id: None,
+                opts: None,
+                answer_tx: None,
+                permission_tool_use_id: Some(CHILD_PERMISSION_ID.into()),
+                inbox: None,
+            },
+            sender.clone(),
+        );
+        let envelope = Envelope {
+            event: AgentEvent::PermissionRequest {
+                id: CHILD_PERMISSION_ID.into(),
+                tool: ToolKey::native(CHILD_ID),
+                scopes: Vec::new(),
+                reason: None,
+            },
+            subagent: Some(child.info()),
+            run_id: CHILD_RUN_ID,
+        };
+        let stamped = Barrier::new(2);
+        let resume = Barrier::new(2);
+        thread::scope(|threads| {
+            if detach_first {
+                child.detach();
+            }
+            let publisher = threads.spawn(|| {
+                child.publish(envelope, |mut envelope, detached| {
+                    if detached {
+                        envelope.run_id = DETACHED_RUN_ID;
+                    }
+                    stamped.wait();
+                    resume.wait();
+                    sender.send_envelope(envelope).unwrap();
+                });
+            });
+            stamped.wait();
+            if detach_first {
+                resume.wait();
+            } else {
+                let publication_in_progress = match child.publication.try_lock() {
+                    Ok(guard) => {
+                        drop(guard);
+                        false
+                    }
+                    Err(TryLockError::WouldBlock) => true,
+                    Err(TryLockError::Poisoned(error)) => panic!("{error}"),
+                };
+                if publication_in_progress {
+                    resume.wait();
+                    child.detach();
+                } else {
+                    child.detach();
+                    resume.wait();
+                }
+            }
+            publisher.join().unwrap();
+        });
+        let events: Vec<_> = events.drain().collect();
+        assert_eq!(events.len(), 2);
+        let detached = events
+            .iter()
+            .position(|event| matches!(event.event, AgentEvent::SubagentDetached { .. }))
+            .unwrap();
+        let permission = events
+            .iter()
+            .position(|event| matches!(event.event, AgentEvent::PermissionRequest { .. }))
+            .unwrap();
+        let event = &events[permission];
+        let info = event.subagent.as_ref().unwrap();
+        assert_eq!(info.parent_tool_use_id, CHILD_ID);
+        assert_eq!(
+            info.permission_tool_use_id.as_deref(),
+            Some(CHILD_PERMISSION_ID)
+        );
+        if permission > detached {
+            assert_eq!(event.run_id, DETACHED_RUN_ID);
+            assert!(info.detached);
+        } else {
+            assert_eq!(event.run_id, CHILD_RUN_ID);
+            assert!(!info.detached);
+        }
+    }
 
     #[test_case(ToolOutput::Plain("ok".into()),                      Some("1 lines")     ; "plain_short_annotates")]
     #[test_case(ToolOutput::Plain((0..20).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n").into()), Some("20 lines") ; "plain_long_annotates")]

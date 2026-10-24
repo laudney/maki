@@ -39,7 +39,7 @@ use crate::cancel::{CancelMap, CancelToken};
 use crate::mcp::McpSession;
 use crate::permissions::PermissionManager;
 use crate::prompt::ResolvedPrompts;
-use crate::{AgentConfig, AgentMode, EventSender, RunLedger, SharedBuf};
+use crate::{AgentConfig, AgentMode, ChildPresentation, EventSender, RunLedger, SharedBuf};
 use maki_config::{ModelPolicy, ToolOutputLines};
 use maki_providers::Model;
 use maki_providers::RequestOptions;
@@ -371,6 +371,7 @@ pub struct ToolContext {
     pub live_sink: Option<flume::Sender<ToolLive>>,
     pub result_delivery: Option<crate::ResultDelivery>,
     pub running_tool: Option<crate::RunningTool>,
+    pub child_presentation: Option<Arc<ChildPresentation>>,
     pub model_policy: Arc<ModelPolicy>,
 }
 
@@ -598,6 +599,7 @@ pub fn interpreter_ctx(
         subagent_cancels: Arc::new(CancelMap::new()),
         result_delivery: None,
         running_tool: None,
+        child_presentation: None,
         ledger: Arc::default(),
         registry,
         workflow: false,
