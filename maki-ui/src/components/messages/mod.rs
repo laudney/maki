@@ -303,8 +303,26 @@ impl MessagesPanel {
         self.rebuild_tool_segment(tool_id);
     }
 
+    pub fn tool_backgrounded(&mut self, event: ToolDoneEvent) {
+        self.live_bufs.remove(&event.id);
+        self.stop_watching(&event.id);
+        self.lua_clicks.remove(&event.id);
+        self.expanded_tools.remove(&event.id);
+        self.rebake_requested.remove(&event.id);
+        if let Some(msg) = self.find_tool_msg_mut(&event.id) {
+            msg.render_snapshot = None;
+            msg.render_header = None;
+            msg.snapshot_theme_gen = 0;
+        }
+        self.finish_tool(event, false);
+    }
+
     pub fn tool_done(&mut self, event: ToolDoneEvent) {
         let had_live_buf = self.retire_live_buf(&event.id);
+        self.finish_tool(event, had_live_buf);
+    }
+
+    fn finish_tool(&mut self, event: ToolDoneEvent, had_live_buf: bool) {
         let Some(msg) = self
             .messages
             .iter_mut()

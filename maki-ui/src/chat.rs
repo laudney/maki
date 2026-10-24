@@ -23,6 +23,7 @@ use maki_config::{ToolKey, ToolOutputLines, UiConfig};
 use maki_lua::{LuaCommandInfo, WinView};
 use maki_providers::{ContentBlock, ImageSource, Message, RequestOptions, Role};
 use maki_storage::id::MakiId;
+use maki_storage::sessions::task_tool_output_key;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Color;
@@ -178,7 +179,7 @@ impl Chat {
             AgentEvent::ToolOutput { id, content } => {
                 self.messages_panel.tool_output(&id, &content)
             }
-            AgentEvent::ToolBackgrounded(e) => self.messages_panel.tool_done(*e),
+            AgentEvent::ToolBackgrounded(e) => self.messages_panel.tool_backgrounded(*e),
             AgentEvent::ToolDone(e) => {
                 let plan_write = plan_path.filter(|pp| e.wrote_to(pp));
                 let is_full_write = &*e.tool == WRITE_TOOL_NAME;
@@ -588,6 +589,15 @@ pub fn history_to_display(
     tool_outputs: &HashMap<String, Arc<ToolOutput>>,
     tool_output_lines: &ToolOutputLines,
 ) -> (Vec<DisplayMessage>, Vec<maki_lua::RestoreItem>) {
+    history_to_display_for_task(messages, tool_outputs, tool_output_lines, None)
+}
+
+pub(crate) fn history_to_display_for_task(
+    messages: &[Message],
+    tool_outputs: &HashMap<String, Arc<ToolOutput>>,
+    tool_output_lines: &ToolOutputLines,
+    task_id: Option<&str>,
+) -> (Vec<DisplayMessage>, Vec<maki_lua::RestoreItem>) {
     let results = build_tool_results_map(messages);
     let mut display = Vec::new();
     let mut restore_items: Vec<maki_lua::RestoreItem> = Vec::new();
@@ -655,7 +665,11 @@ pub fn history_to_display(
                                     (s, Some(&**text))
                                 })
                                 .unwrap_or((ToolStatus::Success, None));
-                            let stored = tool_outputs.get(id.as_str());
+                            let stored = task_id
+                                .and_then(|task_id| {
+                                    tool_outputs.get(&task_tool_output_key(task_id, id))
+                                })
+                                .or_else(|| tool_outputs.get(id.as_str()));
                             let (text, truncated_lines, tool_output, mut annotation) =
                                 build_loaded_tool(
                                     static_name,
@@ -842,7 +856,10 @@ fn build_tool_results_map(messages: &[Message]) -> HashMap<&str, (bool, &str)> {
 mod tests {
     use super::*;
     use crate::components::IMAGE_PLACEHOLDER;
-    use maki_agent::{AgentEvent, ToolDoneEvent, ToolOutput, ToolStartEvent, TurnCompleteEvent};
+    use maki_agent::{
+        AgentEvent, TextOutput, ToolDoneEvent, ToolOutput, ToolStartEvent, TurnCompleteEvent,
+        UNAVAILABLE_RESULT, close_dangling_tool_calls,
+    };
     use maki_config::UiConfig;
     use maki_providers::ImageMediaType;
     use test_case::test_case;
@@ -1298,7 +1315,7 @@ mod tests {
         ];
         for (tool_name, input_json, output) in variants {
             let discriminant = std::mem::discriminant(&output);
-            let msgs = tool_use_pair(tool_name, input_json, "ok", false);
+            let msgs = tool_use_pair(tool_name, input_json, &output.as_text(), false);
             let outputs = HashMap::from([("t1".into(), Arc::new(output))]);
             let display = history_to_display(&msgs, &outputs, &ToolOutputLines::default()).0;
             assert_eq!(
@@ -1319,7 +1336,7 @@ mod tests {
         let msgs = tool_use_pair(
             "write",
             serde_json::json!({"path": "/src/main.rs", "content": "fn main() {}"}),
-            "wrote 12 bytes",
+            &write_output.as_text(),
             false,
         );
         let outputs = HashMap::from([("t1".into(), Arc::new(write_output))]);
@@ -1382,6 +1399,7 @@ mod tests {
     }
 
     const RESTORE_OUTPUT: &str = "rendered output";
+    const CANCELLED_GROUP_RESULT: &str = "[Cancelled by user]";
 
     fn tool_msg_with_input(tool: &str) -> DisplayMessage {
         let mut msg = DisplayMessage::new(DisplayRole::User, String::new());
@@ -1418,19 +1436,77 @@ mod tests {
     }
 
     #[test]
-    fn history_structured_output_produces_no_restore_item() {
+    fn history_structured_output_is_preferred_to_transcript_text() {
+        let output = Arc::new(edit_output("a"));
         let msgs = tool_use_pair(
             "edit",
             serde_json::json!({"path": "a", "old_string": "x", "new_string": "y"}),
-            "edited a",
+            &output.as_text(),
             false,
         );
-        let outputs = HashMap::from([("t1".to_owned(), Arc::new(edit_output("a")))]);
+        let outputs = HashMap::from([("t1".to_owned(), output)]);
         let (_, items) = history_to_display(&msgs, &outputs, &ToolOutputLines::default());
         assert!(items.is_empty(), "Rust owns Diff rendering on restore");
 
-        let (_, items) = history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default());
+        let (display, items) =
+            history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default());
         assert_eq!(items.len(), 1, "text-only history still restores via Lua");
+        assert!(display[0].tool_output.is_none());
+
+        let msgs = tool_use_pair("edit", serde_json::json!({}), RESTORE_OUTPUT, false);
+        let (display, items) = history_to_display(&msgs, &outputs, &ToolOutputLines::default());
+        assert!(items.is_empty());
+        assert!(Arc::ptr_eq(
+            display[0].tool_output.as_ref().unwrap(),
+            &outputs["t1"]
+        ));
+    }
+
+    /// A call that finished before its group's results were submitted has a
+    /// saved output and no result in the transcript yet.
+    #[test]
+    fn a_saved_output_without_a_transcript_result_still_restores() {
+        let mut msgs = tool_use_pair("bash", serde_json::json!({}), RESTORE_OUTPUT, false);
+        msgs.truncate(1);
+        let outputs = HashMap::from([(
+            "t1".to_owned(),
+            Arc::new(ToolOutput::Plain(RESTORE_OUTPUT.into())),
+        )]);
+
+        let (_, items) = history_to_display(&msgs, &outputs, &ToolOutputLines::default());
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].output, RESTORE_OUTPUT);
+    }
+
+    #[test_case(CANCELLED_GROUP_RESULT; "cancelled_group")]
+    #[test_case(UNAVAILABLE_RESULT; "unavailable_results")]
+    fn a_finished_call_keeps_its_saved_output_when_the_group_is_interrupted(marker: &str) {
+        let mut messages = vec![Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::tool_use("t1", "bash", serde_json::json!({})),
+                ContentBlock::tool_use("t2", "bash", serde_json::json!({})),
+            ],
+            ..Default::default()
+        }];
+        close_dangling_tool_calls(&mut messages, marker);
+        let saved = Arc::new(ToolOutput::Plain(TextOutput {
+            state: Some(serde_json::json!({"finished": true})),
+            ..RESTORE_OUTPUT.into()
+        }));
+        let outputs = HashMap::from([("t1".into(), Arc::clone(&saved))]);
+
+        let (display, items) = history_to_display(&messages, &outputs, &ToolOutputLines::default());
+
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].output, RESTORE_OUTPUT);
+        assert_eq!(items[0].state, saved.state().cloned());
+        assert!(Arc::ptr_eq(
+            display[0].tool_output.as_ref().unwrap(),
+            &saved
+        ));
+        assert_eq!(items[1].output, marker);
     }
 
     #[test]

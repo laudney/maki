@@ -3,7 +3,7 @@ use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 use crate::app::tasks::TaskOutcome;
-use crate::chat::{Chat, DONE_TEXT, history_to_display};
+use crate::chat::{Chat, DONE_TEXT, history_to_display, history_to_display_for_task};
 use crate::components::Action;
 use crate::components::rewind_picker::RewindEntry;
 use maki_agent::Transcript;
@@ -271,10 +271,11 @@ impl App {
             if self.chat_of_task(&sa.tool_use_id).is_ok() {
                 continue;
             }
-            let (display, items) = history_to_display(
+            let (display, items) = history_to_display_for_task(
                 messages,
                 self.state.session.tool_outputs(),
                 &self.ui_config.tool_output_lines,
+                Some(&sa.tool_use_id),
             );
             // Plugin tasks are never routed through `chat_index`.
             if sa.plugin.is_none() {

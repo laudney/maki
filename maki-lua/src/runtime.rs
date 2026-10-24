@@ -26,7 +26,8 @@ use maki_agent::tools::{
 };
 use maki_agent::{BACKGROUND_STOP_REASON, InvocationStop};
 use maki_agent::{
-    BufferSnapshot, SessionEndReason, SharedBuf, SnapshotLine, SnapshotSpan, SpanStyle, UiWaker,
+    BufferSnapshot, Envelope, SessionEndReason, SharedBuf, SnapshotLine, SnapshotSpan, SpanStyle,
+    SubagentInfo, TaskKind, UiWaker,
 };
 use mlua::chunk::{Chunk, ChunkMode, Compiler};
 use mlua::{Function, Lua, MultiValue, RegistryKey, Table, Value as LuaValue, ffi};
@@ -630,10 +631,48 @@ impl RestoreReply {
         theme_gen: Option<u64>,
         event_tx: &maki_agent::EventSender,
     ) {
+        self.emit_for_task(tool_use_id, theme_gen, None, event_tx);
+    }
+
+    pub(crate) fn emit_for_task(
+        self,
+        tool_use_id: &str,
+        theme_gen: Option<u64>,
+        task_id: Option<&str>,
+        event_tx: &maki_agent::EventSender,
+    ) {
+        let emit = |what, event| {
+            let subagent = task_id.map(|task_id| SubagentInfo {
+                parent_tool_use_id: task_id.to_owned(),
+                name: String::new(),
+                prompt: None,
+                model: None,
+                opts: None,
+                detached: false,
+                kind: TaskKind::Agent,
+                owner_cancel: None,
+                spawn_tool_use_id: None,
+                answer_tx: None,
+                permission_tool_use_id: None,
+                inbox: None,
+            });
+            if event_tx
+                .send_envelope(Envelope {
+                    event,
+                    subagent,
+                    run_id: event_tx.run_id(),
+                })
+                .is_err()
+            {
+                tracing::warn!(
+                    tool_id = tool_use_id,
+                    what,
+                    "tool render event dropped: channel closed"
+                );
+            }
+        };
         if let Some(snapshot) = self.body {
-            send_render_event(
-                event_tx,
-                tool_use_id,
+            emit(
                 "body_snapshot",
                 maki_agent::AgentEvent::ToolSnapshot {
                     id: tool_use_id.to_owned(),
@@ -643,9 +682,7 @@ impl RestoreReply {
             );
         }
         if let Some(snapshot) = self.header {
-            send_render_event(
-                event_tx,
-                tool_use_id,
+            emit(
                 "header_snapshot",
                 maki_agent::AgentEvent::ToolHeaderSnapshot {
                     id: tool_use_id.to_owned(),
@@ -3734,6 +3771,7 @@ fn spawn_restore(
         let slot = Some(g.acquire().await);
         let id = item.tool_use_id.clone();
         let theme_gen = item.theme_gen;
+        let task_id = item.task_id.clone();
         let tool = Arc::clone(&item.tool);
         let res = covered(
             slot,
@@ -3745,7 +3783,7 @@ fn spawn_restore(
         )
         .await;
         if let Some(reply) = res {
-            reply.emit(&id, theme_gen, &event_tx);
+            reply.emit_for_task(&id, theme_gen, task_id.as_deref(), &event_tx);
         }
     })
     .detach();

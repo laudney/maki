@@ -8,10 +8,12 @@ use crate::selection::{DocPos, Selection, SelectionZone};
 use crate::wrap;
 use maki_agent::tools::{BASH_TOOL_NAME, GREP_TOOL_NAME, WRITE_TOOL_NAME};
 use maki_agent::{
-    GrepFileEntry, GrepMatchGroup, SnapshotLine, SnapshotSpan, SpanStyle, ToolInput, ToolOutput,
+    GrepFileEntry, GrepMatchGroup, SnapshotLine, SnapshotSpan, SpanStyle, TextOutput, ToolInput,
+    ToolOutput,
 };
 use maki_config::DEFAULT_THINKING_LINES;
-use maki_providers::ImageMediaType;
+use maki_providers::{ContentBlock, ImageMediaType, Message, Role};
+use maki_storage::sessions::task_tool_output_key;
 use ratatui::backend::TestBackend;
 use std::collections::HashSet;
 use std::ops::Range;
@@ -1884,6 +1886,74 @@ fn rebake_request_stops_watching_buf() {
 }
 
 const REBAKE_TASK_ID: &str = "toolu_sub";
+const MOVED_RECEIPT: &str = "continues in the background";
+const MOVED_FINAL_OUTPUT: &str = "moved-ok";
+
+#[test_case("bash"; "bash")]
+#[test_case("batch"; "batch")]
+fn restored_moved_receipt_remains_available_for_rerenders(tool: &str) {
+    let messages = vec![
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::tool_use("t1", tool, serde_json::json!({}))],
+            ..Default::default()
+        },
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::tool_result("t1", MOVED_RECEIPT, false)],
+            ..Default::default()
+        },
+    ];
+    let outputs = HashMap::from([
+        (
+            "t1".into(),
+            Arc::new(ToolOutput::Plain(MOVED_RECEIPT.into())),
+        ),
+        (
+            task_tool_output_key(REBAKE_TASK_ID, "t1"),
+            Arc::new(ToolOutput::Plain(TextOutput {
+                state: Some(serde_json::json!({"final_output": MOVED_FINAL_OUTPUT})),
+                ..MOVED_FINAL_OUTPUT.into()
+            })),
+        ),
+    ]);
+    let (display, _) =
+        crate::chat::history_to_display(&messages, &outputs, &ToolOutputLines::default());
+    let (eh, probe) = maki_lua::test_support::probed_event_handle();
+    let mut panel = MessagesPanel::new(UiConfig::default(), eh);
+    panel.set_restore_channel(Some(test_event_sender()));
+    panel.load_messages(display);
+    panel.tool_snapshot("t1", BufferSnapshot::plain_text(MOVED_RECEIPT.into()), None);
+
+    let item = crate::chat::restore_item_for(
+        &panel.messages[0],
+        ToolOutputLines::default(),
+        panel.theme_generation,
+    )
+    .expect("a restored receipt must retain its output for rerenders");
+    assert_eq!(item.output, MOVED_RECEIPT);
+    assert!(item.state.is_none());
+
+    render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+    assert!(panel.handle_click(0, Rect::new(0, 0, VIEW_WIDTH, VIEW_HEIGHT)));
+    let clicked = probe
+        .try_recv_restore_item()
+        .expect("a restored receipt click must request a rerender");
+    assert_eq!(clicked.output, MOVED_RECEIPT);
+    assert!(clicked.state.is_none());
+    assert_eq!(clicked.clicks.len(), 1);
+
+    let next_gen = panel.theme_generation + 1;
+    panel.rebake_stale_snapshots(next_gen);
+    let item = probe
+        .try_recv_restore_item()
+        .expect("a theme change must rerender the restored receipt");
+    assert_eq!(item.output, MOVED_RECEIPT);
+    assert!(item.state.is_none());
+    assert_eq!(item.theme_gen, Some(next_gen));
+    assert_eq!(item.reason, maki_lua::RestoreReason::Rerender);
+    assert_eq!(item.clicks, clicked.clicks);
+}
 
 /// A rebake replays one call for its colors. The plugin behind it only sees
 /// the item, so the item has to say which chat it is and that nothing but

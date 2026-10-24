@@ -22,10 +22,10 @@ use maki_agent::command::{CommandScope, CustomCommand};
 use maki_agent::permissions::{PermissionAnswer, PermissionManager};
 use maki_agent::session::NOTHING_TO_STORE;
 use maki_agent::{
-    AgentMode, CancelToken, DoneReason, HistorySnapshot, ImageMediaType, McpConfigErrors,
-    McpServerInfo, McpServerStatus, McpSnapshot, McpSnapshotReader, Notice, SharedBuf, SteerKind,
-    SubagentInbox, TaskKind, ToolDoneEvent, ToolOutput, ToolStartEvent, Transcript,
-    TurnCompleteEvent,
+    AgentMode, BufferSnapshot, CancelToken, DoneReason, HistorySnapshot, ImageMediaType,
+    McpConfigErrors, McpServerInfo, McpServerStatus, McpSnapshot, McpSnapshotReader, Notice,
+    SharedBuf, SteerKind, SubagentInbox, TaskKind, TextOutput, ToolDoneEvent, ToolOutput,
+    ToolStartEvent, Transcript, TurnCompleteEvent,
 };
 use maki_config::{Effect, PermissionRule, PermissionsConfig, ProjectConfig, ToolKey, UiConfig};
 use maki_lua::test_support::{HintWriterHandle, hint_writer_pair};
@@ -42,7 +42,7 @@ use maki_storage::id::MakiId;
 use maki_storage::model::read_thinking;
 use maki_storage::sessions::{
     SessionClaim, SessionMeta, StoredMode, StoredThinking, StoredTokenUsage, THINKING_ADAPTIVE,
-    ThinkingParseError,
+    ThinkingParseError, task_tool_output_key,
 };
 use maki_storage::trusted_folders::{CanonicalFolder, TrustedFolders};
 use ratatui::Terminal;
@@ -3069,6 +3069,263 @@ fn promotion_moves_a_pending_permission_to_its_task_owner() {
     assert!(!app.permission_prompt.is_open());
 }
 
+const MOVED_RECEIPT: &str = "moved-receipt: continues in /tasks";
+const MOVED_OUTPUT: &str = "moved-ok";
+const RUNNING_BODY: &str = "running-body";
+const RUNNING_HEADER: &str = "running-header";
+const MOVED_HEADER: &str = "moved-header";
+const RECEIPT_HEADER: &str = "receipt-header";
+const ORDINARY_OUTPUT: &str = "ordinary-output";
+const ORDINARY_BODY: &str = "ordinary-body";
+const ORDINARY_HEADER: &str = "ordinary-header";
+const CLICKED_BODY: &str = "ordinary-clicked";
+
+fn text_snapshot(text: &str) -> BufferSnapshot {
+    BufferSnapshot::from_arc(Arc::new(vec![maki_agent::SnapshotLine::plain(text.into())]))
+}
+
+fn display_tool_start(id: &str, tool: &str) -> AgentEvent {
+    let AgentEvent::ToolStart(mut start) = tool_start(id, tool) else {
+        unreachable!();
+    };
+    start.raw_input = Some(serde_json::json!({}));
+    AgentEvent::ToolStart(start)
+}
+
+fn display_tool_done(id: &str, tool: &str, text: &str) -> ToolDoneEvent {
+    ToolDoneEvent {
+        call: None,
+        id: id.into(),
+        tool: tool.into(),
+        output: Arc::new(ToolOutput::Plain(text.into())),
+        is_error: false,
+        annotation: None,
+        written_path: None,
+    }
+}
+
+fn display_history(id: &str, tool: &str, output: &str) -> Vec<Message> {
+    vec![
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::tool_use(id, tool, serde_json::json!({}))],
+            ..Default::default()
+        },
+        tool_result_msg(id, output),
+    ]
+}
+
+fn assert_moved_views(app: &mut App) {
+    app.set_active_chat(MAIN_CHAT);
+    let main = rendered(app);
+    assert!(main.contains(MOVED_RECEIPT), "{main}");
+    assert!(!main.contains(MOVED_OUTPUT), "{main}");
+    assert!(!main.contains(MOVED_HEADER), "{main}");
+    assert!(!main.contains(RUNNING_BODY), "{main}");
+    let task = app.chat_of_task(TASK_ID).unwrap();
+    app.set_active_chat(task);
+    let task = rendered(app);
+    assert!(task.contains(MOVED_OUTPUT), "{task}");
+    assert!(!task.contains(MOVED_RECEIPT), "{task}");
+    assert!(!task.contains(RECEIPT_HEADER), "{task}");
+    assert!(!task.contains(ORDINARY_BODY), "{task}");
+    app.set_active_chat(MAIN_CHAT);
+}
+
+#[test_case("bash", false, false; "bash_main_restore_first")]
+#[test_case("bash", true, false; "bash_task_restore_first")]
+#[test_case("batch", false, false; "batch_main_restore_first")]
+#[test_case("batch", true, false; "batch_task_restore_first")]
+#[test_case("bash", false, true; "bash_watched_main_restore_first")]
+#[test_case("bash", true, true; "bash_watched_task_restore_first")]
+#[test_case("batch", false, true; "batch_watched_main_restore_first")]
+#[test_case("batch", true, true; "batch_watched_task_restore_first")]
+fn moved_tool_display_stays_with_its_task(tool: &str, task_first: bool, watched: bool) {
+    let mut app = streaming_app();
+    let (handle, probe) = maki_lua::test_support::probed_event_handle();
+    app.lua_event_handle = handle;
+    let (restore_tx, restore_rx) = flume::unbounded();
+    app.restore_event_tx = Some(maki_agent::EventSender::new(restore_tx, RESTORE_RUN_ID));
+    app.reset_ui_chrome();
+    let body = Arc::new(SharedBuf::new());
+    app.update(agent_msg(display_tool_start(SPAWN_ID, tool)));
+    app.update(agent_msg(AgentEvent::LiveToolBuf {
+        id: SPAWN_ID.into(),
+        body: Arc::clone(&body),
+    }));
+    app.update(agent_msg(AgentEvent::ToolSnapshot {
+        id: SPAWN_ID.into(),
+        snapshot: text_snapshot(RUNNING_BODY),
+        theme_gen: None,
+    }));
+    app.update(agent_msg(AgentEvent::ToolHeaderSnapshot {
+        id: SPAWN_ID.into(),
+        snapshot: text_snapshot(RUNNING_HEADER),
+        theme_gen: None,
+    }));
+    if watched {
+        app.update(agent_msg(AgentEvent::ToolDone(Box::new(
+            display_tool_done(SPAWN_ID, tool, RUNNING_BODY),
+        ))));
+    }
+    app.update(detached_msg_of_kind(
+        display_tool_start(SPAWN_ID, tool),
+        TASK_ID,
+        None,
+        TaskKind::Tool,
+    ));
+    app.update(detached_msg_of_kind(
+        AgentEvent::LiveToolBuf {
+            id: SPAWN_ID.into(),
+            body: Arc::clone(&body),
+        },
+        TASK_ID,
+        None,
+        TaskKind::Tool,
+    ));
+    body.append(maki_agent::SnapshotLine::plain(RUNNING_BODY.into()));
+    app.update(agent_msg(AgentEvent::ToolBackgrounded(Box::new(
+        display_tool_done(SPAWN_ID, tool, MOVED_RECEIPT),
+    ))));
+    assert!(
+        body.read_if_dirty().is_some(),
+        "promotion must not read the task buffer"
+    );
+    body.set_lines(vec![maki_agent::SnapshotLine::plain(MOVED_OUTPUT.into())]);
+    let _ = app.tick();
+    assert_moved_views(&mut app);
+
+    let mut completed = display_tool_done(SPAWN_ID, tool, MOVED_OUTPUT);
+    completed.output = Arc::new(ToolOutput::Plain(TextOutput {
+        state: Some(serde_json::json!({"result": MOVED_OUTPUT})),
+        ..MOVED_OUTPUT.into()
+    }));
+    for event in [
+        AgentEvent::ToolSnapshot {
+            id: SPAWN_ID.into(),
+            snapshot: text_snapshot(MOVED_OUTPUT),
+            theme_gen: None,
+        },
+        AgentEvent::ToolHeaderSnapshot {
+            id: SPAWN_ID.into(),
+            snapshot: text_snapshot(MOVED_HEADER),
+            theme_gen: None,
+        },
+        AgentEvent::ToolDone(Box::new(completed)),
+    ] {
+        app.update(detached_msg_of_kind(event, TASK_ID, None, TaskKind::Tool));
+    }
+    assert_moved_views(&mut app);
+    let outputs = app.state.session.tool_outputs();
+    assert_eq!(outputs[SPAWN_ID].as_text(), MOVED_RECEIPT);
+    assert_eq!(
+        outputs[&task_tool_output_key(TASK_ID, SPAWN_ID)].as_text(),
+        MOVED_OUTPUT
+    );
+
+    app.update(agent_msg(display_tool_start(FIRST_ASK, "example")));
+    let ordinary = Arc::new(SharedBuf::new());
+    ordinary.append(maki_agent::SnapshotLine::plain(ORDINARY_BODY.into()));
+    app.update(agent_msg(AgentEvent::LiveToolBuf {
+        id: FIRST_ASK.into(),
+        body: Arc::clone(&ordinary),
+    }));
+    app.update(agent_msg(AgentEvent::ToolHeaderSnapshot {
+        id: FIRST_ASK.into(),
+        snapshot: text_snapshot(ORDINARY_HEADER),
+        theme_gen: None,
+    }));
+    app.update(agent_msg(AgentEvent::ToolDone(Box::new(
+        display_tool_done(FIRST_ASK, "example", ORDINARY_OUTPUT),
+    ))));
+    assert!(rendered(&mut app).contains(ORDINARY_BODY));
+    ordinary.set_lines(vec![maki_agent::SnapshotLine::plain(CLICKED_BODY.into())]);
+    let _ = app.tick();
+    assert!(rendered(&mut app).contains(CLICKED_BODY));
+
+    for msg in display_history(SPAWN_ID, tool, MOVED_RECEIPT)
+        .into_iter()
+        .chain(display_history(FIRST_ASK, "example", ORDINARY_OUTPUT))
+    {
+        app.state.session_mut().push_message(msg);
+    }
+    app.update(detached_msg_of_kind(
+        AgentEvent::SubagentHistory {
+            tool_use_id: TASK_ID.into(),
+            messages: display_history(SPAWN_ID, tool, MOVED_OUTPUT),
+            status: Some(SubagentVerdict::Done),
+        },
+        TASK_ID,
+        None,
+        TaskKind::Tool,
+    ));
+    app.sync_subagents();
+    app.reset_ui_chrome();
+    app.restore_display();
+    assert_moved_views(&mut app);
+
+    let mut requests = Vec::new();
+    while let Some(request) = probe.try_recv_restore_request() {
+        requests.push(request);
+    }
+    assert_eq!(requests.len(), 3);
+    app.run_id += 1;
+    requests.sort_by_key(|request| request.item.task_id.is_some() != task_first);
+    for request in requests {
+        let item = &request.item;
+        let (body, header) = if item.tool_use_id == FIRST_ASK {
+            assert_eq!(item.output, ORDINARY_OUTPUT);
+            assert!(item.task_id.is_none());
+            (ORDINARY_BODY, ORDINARY_HEADER)
+        } else if item.task_id.is_some() {
+            assert_eq!(item.task_id.as_deref(), Some(TASK_ID));
+            assert_eq!(item.output, MOVED_OUTPUT);
+            assert_eq!(
+                item.state,
+                Some(serde_json::json!({"result": MOVED_OUTPUT}))
+            );
+            (MOVED_OUTPUT, MOVED_HEADER)
+        } else {
+            assert_eq!(item.output, MOVED_RECEIPT);
+            assert!(item.state.is_none());
+            (MOVED_RECEIPT, RECEIPT_HEADER)
+        };
+        request.reply(Some(text_snapshot(body)), Some(text_snapshot(header)));
+        for envelope in restore_rx.try_iter() {
+            app.update(Msg::Agent(Box::new(envelope)));
+        }
+        assert_moved_views(&mut app);
+    }
+    let main = rendered(&mut app);
+    assert!(main.contains(ORDINARY_BODY), "{main}");
+    assert!(main.contains(ORDINARY_HEADER), "{main}");
+    let (_, buffer) = draw_sized(&mut app, 80, 24);
+    let row = buffer
+        .content()
+        .chunks(80)
+        .position(|cells| {
+            cells
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>()
+                .contains(ORDINARY_BODY)
+        })
+        .unwrap() as u16;
+    let area = app.msg_area();
+    app.chats[MAIN_CHAT].handle_click(row, area);
+    let clicked = probe
+        .try_recv_restore_request()
+        .expect("a restored tool remains clickable");
+    assert_eq!(clicked.item.tool_use_id, FIRST_ASK);
+    assert_eq!(clicked.item.clicks.len(), 1);
+    clicked.reply(Some(text_snapshot(CLICKED_BODY)), None);
+    for envelope in restore_rx.try_iter() {
+        app.update(Msg::Agent(Box::new(envelope)));
+    }
+    assert!(rendered(&mut app).contains(CLICKED_BODY));
+    assert_moved_views(&mut app);
+}
+
 #[test]
 fn promoted_tool_tab_has_no_agent_input_and_cancels_its_owner() {
     let mut app = streaming_app();
@@ -3462,8 +3719,26 @@ fn scroll_outside_msg_area_ignored() {
     assert!(app.chats[0].auto_scroll());
 }
 
+const NOTE_NOT_STORED: &str = "the move note is drawn, never stored";
+
 fn background_key(code: char, modifiers: KeyModifiers) -> Msg {
     Msg::Key(KeyEvent::new(KeyCode::Char(code), modifiers))
+}
+
+fn move_settled(count: usize, owner_cancel: CancelToken) -> AgentEvent {
+    AgentEvent::BackgroundMoveSettled {
+        count,
+        owner_cancel,
+    }
+}
+
+fn move_notes(app: &mut App) -> Vec<String> {
+    let chat = app.main_chat();
+    (0..chat.message_count())
+        .filter_map(|index| chat.message_at(index))
+        .filter(|message| message.role == DisplayRole::Note)
+        .map(|message| message.text.clone())
+        .collect()
 }
 
 #[test]
@@ -3566,6 +3841,40 @@ fn background_key_keeps_override_precedence() {
             .is_empty()
     );
     assert!(probe.try_recv_keybind().is_some(), "{OVERRIDE_DISPATCHED}");
+}
+
+/// Each case is the settlement sequence the dispatcher emits for that press
+/// history. `managed_tools` proves those counts against real calls.
+#[test_case(&[2], &[2] ; "receipt_and_generic_moves")]
+#[test_case(&[1], &[1] ; "a_result_won_one_race")]
+#[test_case(&[0], &[] ; "nothing_moved")]
+#[test_case(&[0, 1], &[1] ; "repeated_press")]
+#[test_case(&[2, 1], &[2, 1] ; "one_note_per_press")]
+fn background_move_note_counts_committed_calls(counts: &[usize], noted: &[usize]) {
+    let mut app = streaming_app();
+    for &count in counts {
+        app.update(agent_msg(move_settled(count, CancelToken::none())));
+    }
+    let expected: Vec<_> = noted.iter().map(|&count| moved_note(count)).collect();
+    assert_eq!(move_notes(&mut app), expected);
+    assert!(app.state.session.messages().is_empty(), "{NOTE_NOT_STORED}");
+}
+
+#[test_case(true ; "stale_run")]
+#[test_case(false ; "stale_generation")]
+fn stale_background_move_settlement_adds_no_note(stale_run: bool) {
+    let mut app = streaming_app();
+    let (generation, owner) = CancelToken::new();
+    if stale_run {
+        app.update(agent_msg_with_run_id(
+            move_settled(1, owner),
+            app.run_id + 1,
+        ));
+    } else {
+        generation.cancel();
+        app.update(agent_msg(move_settled(1, owner)));
+    }
+    assert!(move_notes(&mut app).is_empty());
 }
 
 #[test]

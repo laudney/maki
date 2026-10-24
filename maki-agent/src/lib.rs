@@ -26,7 +26,8 @@ pub mod session;
 pub use inbox::SubagentInbox;
 pub(crate) mod task_set;
 pub use agent::managed_tools::{
-    BACKGROUND_STOP_REASON, InvocationStop, MOVED_CALL_NO_RECEIPT, RunningTool,
+    BACKGROUND_STOP_REASON, InvocationStop, MOVED_CALL_NO_RECEIPT, MOVED_CALL_NOTIFICATION,
+    RunningTool,
 };
 pub use agent::{
     Agent, AgentParams, AgentRunParams, DisplayItem, History, HistorySnapshot, Instructions,

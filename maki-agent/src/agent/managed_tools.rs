@@ -22,6 +22,8 @@ use crate::{
 
 const CANCELLED: &str = "cancelled";
 pub const BACKGROUND_STOP_REASON: &str = "background";
+const MOVED_CALL_ID_PREFIX: &str = "tool-";
+pub const MOVED_CALL_NOTIFICATION: &str = "The user moved this call to the background, where it keeps running. Its result arrives as a notification; do not wait for it. Continue with other work, or end your turn.";
 pub const MOVED_CALL_NO_RECEIPT: &str = "The user moved this call to the background, and it gave no receipt, so its result may never arrive. Do not wait for it. Continue with other work, or end your turn.";
 
 /// Why an invocation stopped, read by the invocation itself after the
@@ -365,7 +367,7 @@ impl ForegroundTools {
                         "task_id": call.task_id,
                         "status": "running",
                         "tool": call.name,
-                        "notification": "The existing invocation continues in the background. Its final result will arrive as a completion notification.",
+                        "notification": MOVED_CALL_NOTIFICATION,
                     })
                     .to_string()
                     .into(),
@@ -697,7 +699,7 @@ pub(super) async fn execute(
             id: id.clone(),
             name: name.clone(),
             input: input.clone(),
-            task_id: format!("tool-{}", MakiId::generate()),
+            task_id: format!("{MOVED_CALL_ID_PREFIX}{}", MakiId::generate()),
             phase: Phase::Attached,
             running,
             execution_deadline: ctx.deadline.at(),
@@ -1032,11 +1034,15 @@ mod tests {
         notices
     }
 
-    fn task_id(history: &History, index: usize) -> String {
+    fn receipt(history: &History, index: usize) -> Value {
         let ContentBlock::ToolResult { content, .. } = &history.as_slice()[1].content[index] else {
             panic!("expected receipt");
         };
-        serde_json::from_str::<Value>(content).unwrap()["task_id"]
+        serde_json::from_str(content).unwrap()
+    }
+
+    fn task_id(history: &History, index: usize) -> String {
+        receipt(history, index)["task_id"]
             .as_str()
             .unwrap()
             .to_owned()
@@ -1552,6 +1558,16 @@ mod tests {
             let history = foreground.await;
             assert_eq!(history.as_slice().len(), 2);
             assert_ne!(task_id(&history, 0), task_id(&history, 1));
+            for index in 0..3 {
+                let receipt = receipt(&history, index);
+                assert_eq!(receipt["notification"], MOVED_CALL_NOTIFICATION);
+                assert!(
+                    receipt["task_id"]
+                        .as_str()
+                        .unwrap()
+                        .starts_with(MOVED_CALL_ID_PREFIX)
+                );
+            }
             assert!(delivery.is_empty());
             let events: Vec<_> = fixture.events.drain().collect();
             assert!(

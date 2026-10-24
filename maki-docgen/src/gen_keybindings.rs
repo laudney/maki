@@ -216,6 +216,14 @@ fn write_overrides(out: &mut String) {
          still apply.\n\n",
     );
     out.push_str(
+        "A blocking `task` instead becomes an ordinary background task with \
+         its one row in `/tasks`, and it moves even while its agent is still \
+         starting. A call whose result is already in hand completes as usual. \
+         A note such as `Moved 2 running calls to the background` counts the \
+         calls that moved, and a repeated press does not move a call \
+         twice.\n\n",
+    );
+    out.push_str(
         "The key does nothing in a task chat, in an idle chat, or while a \
          permission prompt is open. To use another key, bind it to \
          `maki.ui.action(\"background_tools\")`.\n\n",

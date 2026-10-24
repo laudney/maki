@@ -41,6 +41,7 @@ const OLDEST_LOG_FORMAT_VERSION: u32 = 2;
 /// The refusal is all a user who rolled back across a format bump gets, so
 /// it says which way to go and which format it found.
 const NEWER_LOG_FORMAT: &str = "written by a newer maki, log format";
+const TASK_TOOL_OUTPUT_PREFIX: &str = "task:";
 pub const SESSIONS_DIR: &str = "sessions";
 const CWD_INDEX_FILE: &str = "cwd_latest.json";
 const CWD_INDEX_STEM: &str = "cwd_latest";
@@ -87,6 +88,15 @@ static EPOCH: AtomicU64 = AtomicU64::new(1);
 
 pub fn next_epoch() -> u64 {
     EPOCH.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Task rows can share a call id with a receipt in the main transcript.
+/// Length-prefixing the task id keeps the pair unambiguous.
+pub fn task_tool_output_key(task_id: &str, tool_id: &str) -> String {
+    format!(
+        "{TASK_TOOL_OUTPUT_PREFIX}{}:{task_id}{tool_id}",
+        task_id.len()
+    )
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -2094,14 +2104,28 @@ where
     /// most of its weight, so they go too.
     pub fn remove_subagent(&mut self, id: &str, tool_ids: impl Fn(&M) -> Vec<String>) {
         let removed = self.subagent_messages.remove(id);
-        if let Some(msgs) = &removed {
-            let stale: HashSet<String> = msgs.iter().flat_map(&tool_ids).collect();
-            self.tool_outputs
-                .retain(|tool_id, _| !stale.contains(tool_id));
-        }
+        let stale: HashSet<String> = removed
+            .iter()
+            .flat_map(|msgs| msgs.iter())
+            .flat_map(&tool_ids)
+            .collect();
+        let referenced: HashSet<String> = self
+            .messages
+            .iter()
+            .chain(self.subagent_messages.values().flat_map(|msgs| msgs.iter()))
+            .flat_map(&tool_ids)
+            .collect();
+        let task_prefix = task_tool_output_key(id, "");
+        let outputs_len = self.tool_outputs.len();
+        self.tool_outputs.retain(|key, _| {
+            !key.starts_with(&task_prefix) && (!stale.contains(key) || referenced.contains(key))
+        });
         let len = self.subagents.len();
         self.subagents.retain(|sa| sa.tool_use_id != id);
-        if removed.is_some() || self.subagents.len() != len {
+        if removed.is_some()
+            || self.subagents.len() != len
+            || self.tool_outputs.len() != outputs_len
+        {
             self.rewrite();
         }
     }
@@ -2167,13 +2191,13 @@ where
         self.subagent_messages.retain(|id, _| kept.contains(id));
         self.subagents.retain(|sa| kept.contains(&sa.tool_use_id));
 
-        let live: HashSet<String> = self
-            .subagent_messages
-            .values()
-            .flat_map(|msgs| msgs.iter())
-            .flat_map(&tool_ids)
-            .chain(kept)
-            .collect();
+        let mut live = kept;
+        for (task_id, messages) in &self.subagent_messages {
+            for tool_id in messages.iter().flat_map(&tool_ids) {
+                live.insert(task_tool_output_key(task_id, &tool_id));
+                live.insert(tool_id);
+            }
+        }
         self.tool_outputs.retain(|id, _| live.contains(id));
         self.rewrite();
     }
@@ -2356,7 +2380,7 @@ mod tests {
         ARCHIVE_DIR, ARCHIVE_KEEP, ARCHIVE_MAX_BYTES, CWD_INDEX_FILE, DEFAULT_TITLE, LOG_BLOATED,
         MAX_APPENDS, MAX_TITLE_LEN, MSG_PREFIX, SESSION_VERSION, SESSIONS_DIR, StoredSubagent,
         TAIL_BUF, TaskKind, generate_title, json_path, jsonl_path, load_cwd_index, lock_path,
-        locks_dir, next_epoch, update_cwd_index, write_full_session,
+        locks_dir, next_epoch, task_tool_output_key, update_cwd_index, write_full_session,
     };
     use super::{
         HistorySnapshot, LOG_FORMAT_VERSION, NEWER_LOG_FORMAT, OLDEST_LOG_FORMAT_VERSION,
@@ -2512,6 +2536,76 @@ mod tests {
         let mut outputs: Vec<_> = session.tool_outputs().keys().cloned().collect();
         outputs.sort();
         assert_eq!(outputs, ["monitor-tool", "sub-tool", "task-live"]);
+    }
+
+    #[test_case(false; "without_transcript")]
+    #[test_case(true; "with_transcript")]
+    fn removing_task_outputs_keeps_the_main_receipt_and_other_tasks(with_transcript: bool) {
+        const CALL: &str = "shared-call";
+        const TASK: &str = "task-a";
+        const OTHER_TASK: &str = "task-b";
+        let mut session: TestSession = Session::new("m", "/project");
+        session.push_message(Value::from(CALL));
+        if with_transcript {
+            session.set_subagent_messages(TASK.into(), vec![Value::from(CALL)]);
+        }
+        session.set_subagent_messages(OTHER_TASK.into(), vec![Value::from(CALL)]);
+        let task_key = task_tool_output_key(TASK, CALL);
+        let other_key = task_tool_output_key(OTHER_TASK, CALL);
+        for key in [CALL.to_owned(), task_key.clone(), other_key.clone()] {
+            session.insert_tool_output(key, Arc::new(Value::Null));
+        }
+
+        session.remove_subagent(TASK, |m| vec![m.as_str().unwrap().to_owned()]);
+
+        assert!(session.tool_outputs().contains_key(CALL));
+        assert!(!session.tool_outputs().contains_key(&task_key));
+        assert!(session.tool_outputs().contains_key(&other_key));
+    }
+
+    #[test]
+    fn pruning_task_outputs_keeps_reachable_scoped_entries() {
+        const CALL: &str = "shared-call";
+        const TASK: &str = "task-live";
+        const STALE_TASK: &str = "task-stale";
+        let mut session: TestSession = Session::new("m", "/project");
+        session.push_message(Value::from(TASK));
+        for task in [TASK, STALE_TASK] {
+            session.set_subagent_messages(task.into(), vec![Value::from(CALL)]);
+            session.insert_tool_output(task_tool_output_key(task, CALL), Arc::new(Value::Null));
+        }
+        session.insert_tool_output(TASK.into(), Arc::new(Value::Null));
+
+        session.prune_orphans(|m| vec![m.as_str().unwrap().to_owned()]);
+
+        assert_eq!(session.tool_outputs().len(), 2);
+        assert!(session.tool_outputs().contains_key(TASK));
+        assert!(
+            session
+                .tool_outputs()
+                .contains_key(&task_tool_output_key(TASK, CALL))
+        );
+        assert!(!session.subagent_messages().contains_key(STALE_TASK));
+    }
+
+    #[test]
+    fn main_and_task_outputs_with_the_same_call_id_survive_save_and_load() {
+        const CALL: &str = "shared-call";
+        const TASK: &str = "task-a";
+        let tmp = TempDir::new().unwrap();
+        let mut session: TestSession = Session::new("m", "/project");
+        session.push_message(Value::from(CALL));
+        let claim = claim_for(tmp.path(), &session);
+        session.insert_tool_output(CALL.into(), Arc::new(Value::from("receipt")));
+        session.save_to(&claim, tmp.path()).unwrap();
+        let task_key = task_tool_output_key(TASK, CALL);
+        session.insert_tool_output(task_key.clone(), Arc::new(Value::from("final")));
+        session.save_to(&claim, tmp.path()).unwrap();
+
+        let loaded = TestSession::load_from(session.id, tmp.path()).unwrap();
+
+        assert_eq!(loaded.tool_outputs()[CALL].as_str(), Some("receipt"));
+        assert_eq!(loaded.tool_outputs()[&task_key].as_str(), Some("final"));
     }
 
     #[test]

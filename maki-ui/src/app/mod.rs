@@ -77,7 +77,7 @@ use maki_providers::{ContentBlock, Message, Model, ThinkingConfig, TokenUsage, a
 use maki_storage::StateDir;
 use maki_storage::input_history::InputHistory;
 use maki_storage::model::persist_thinking;
-use maki_storage::sessions::StoredTokenUsage;
+use maki_storage::sessions::{StoredTokenUsage, task_tool_output_key};
 
 use crate::storage_writer::StorageWriter;
 use ratatui::layout::{Position, Rect};
@@ -137,6 +137,9 @@ const TRUSTED_PREFIX: &str = "Trusted this folder: ";
 const PROVIDER_FOLDED_SUFFIX: &str = ": folded away";
 const PROVIDER_UNFOLDED_SUFFIX: &str = ": unfolded";
 const PACK_CHANGES_DECLINED: &str = "Package changes declined";
+const MOVED_ONE_CALL: &str = "Moved 1 running call to the background";
+const MOVED_CALLS_PREFIX: &str = "Moved ";
+const MOVED_CALLS_SUFFIX: &str = " running calls to the background";
 const IMPLEMENT_MSG_PREFIX: &str = "Implement the plan";
 const IMPLEMENT_PARALLEL_HINT: &str = "Use batch+task to parallelize, assign each subagent a separate module and restrict its tests to that module to avoid interference.";
 
@@ -278,6 +281,13 @@ fn cap_error_text(message: &str) -> String {
     match message.char_indices().nth(ERROR_BUBBLE_MAX_CHARS) {
         Some((end, _)) => format!("{}{TRUNCATION_PREFIX}", &message[..end]),
         None => message.to_owned(),
+    }
+}
+
+pub(crate) fn moved_note(count: usize) -> String {
+    match count {
+        1 => MOVED_ONE_CALL.to_owned(),
+        _ => format!("{MOVED_CALLS_PREFIX}{count}{MOVED_CALLS_SUFFIX}"),
     }
 }
 
@@ -1576,30 +1586,24 @@ impl App {
         }
     }
 
-    /// Run-scoped delivery for the tab's own agent: restore snapshots fan out
-    /// to every chat, stale runs are dropped, the rest goes to [`Self::deliver`].
+    /// Restore snapshots go to the requesting chat independently of its run.
+    /// Other stale runs are dropped before [`Self::deliver`].
     fn handle_agent_event(&mut self, envelope: Envelope) -> Vec<Action> {
         if envelope.run_id == RESTORE_RUN_ID {
-            let (id, snapshot, theme_gen, is_header) = match envelope.event {
-                AgentEvent::ToolSnapshot {
-                    id,
-                    snapshot,
-                    theme_gen,
-                } => (id, snapshot, theme_gen, false),
-                AgentEvent::ToolHeaderSnapshot {
-                    id,
-                    snapshot,
-                    theme_gen,
-                } => (id, snapshot, theme_gen, true),
-                _ => return vec![],
-            };
-            for chat in &mut self.chats {
-                if is_header {
-                    chat.tool_header_snapshot(&id, snapshot.clone(), theme_gen);
-                } else {
-                    chat.tool_snapshot(&id, snapshot.clone(), theme_gen);
-                }
+            if !matches!(
+                envelope.event,
+                AgentEvent::ToolSnapshot { .. } | AgentEvent::ToolHeaderSnapshot { .. }
+            ) {
+                return vec![];
             }
+            let chat_idx = match envelope.subagent {
+                Some(ref info) => match self.chat_of_task(&info.parent_tool_use_id) {
+                    Ok(idx) => idx,
+                    Err(_) => return vec![],
+                },
+                None => MAIN_CHAT,
+            };
+            self.chats[chat_idx].handle_event(envelope.event, None);
             return vec![];
         }
         let detached = envelope.run_id == DETACHED_RUN_ID;
@@ -1696,7 +1700,16 @@ impl App {
             return vec![];
         }
 
-        if let AgentEvent::BackgroundMoveSettled { .. } = envelope.event {
+        if let AgentEvent::BackgroundMoveSettled {
+            count,
+            ref owner_cancel,
+        } = envelope.event
+        {
+            if count > 0 && !owner_cancel.is_cancelled() {
+                let chat = self.main_chat();
+                chat.flush();
+                chat.push(DisplayMessage::new(DisplayRole::Note, moved_note(count)));
+            }
             return vec![];
         }
 
@@ -1747,9 +1760,13 @@ impl App {
             {
                 self.transition_plan(PlanTrigger::WriteDone);
             }
+            let output_id = subagent_id.as_deref().map_or_else(
+                || e.id.clone(),
+                |task_id| task_tool_output_key(task_id, &e.id),
+            );
             self.state
                 .session_mut()
-                .insert_tool_output(e.id.clone(), e.output.clone());
+                .insert_tool_output(output_id, e.output.clone());
             if let Some(&sub_idx) = self.chat_index.get(&e.id) {
                 let (outcome, text) = if e.is_error {
                     (TaskOutcome::Error, ERROR_TEXT)

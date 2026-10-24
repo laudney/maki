@@ -307,6 +307,8 @@ fn spawn_agent_internal(
 
 #[cfg(test)]
 mod tests {
+    mod delegation_e2e;
+
     use std::path::{Path, PathBuf};
     use std::time::Instant;
 
@@ -400,6 +402,21 @@ maki.api.create_autocmd("SessionEnd", { callback = function() maki.ui.input() en
         model_slot: &Arc<ArcSwap<ModelSlot>>,
         initial_history: Vec<Message>,
     ) -> (AgentHandles, Arc<PermissionManager>) {
+        spawn_with_lua(
+            model_slot,
+            Resumed {
+                history: initial_history,
+                ..Resumed::fresh()
+            },
+            EventHandle::disconnected_for_test(),
+        )
+    }
+
+    fn spawn_with_lua(
+        model_slot: &Arc<ArcSwap<ModelSlot>>,
+        resumed: Resumed,
+        lua_handle: EventHandle,
+    ) -> (AgentHandles, Arc<PermissionManager>) {
         let permissions = Arc::new(PermissionManager::new(
             PermissionsConfig::default(),
             PathBuf::from("/tmp"),
@@ -408,15 +425,12 @@ maki.api.create_autocmd("SessionEnd", { callback = function() maki.ui.input() en
         ));
         let handles = AgentHandles::spawn(
             model_slot,
-            Resumed {
-                history: initial_history,
-                ..Resumed::fresh()
-            },
+            resumed,
             AgentConfig::default(),
             ToolOutputLines::default(),
             &permissions,
             maki_providers::Timeouts::default(),
-            EventHandle::disconnected_for_test(),
+            lua_handle,
             None,
             McpConfigErrors::new(PathBuf::new()),
             Arc::new(ModelPolicy::default()),

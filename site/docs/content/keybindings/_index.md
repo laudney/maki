@@ -130,6 +130,8 @@ The `/help` modal and the splash show default labels, not live overrides, but pr
 
 `Ctrl+B` moves the unfinished tool calls of the current main-agent turn to the background. Nothing restarts, and the agent continues with a receipt in place of each moved call. Each moved call keeps running as a `tool-` task in `/tasks`, its result arrives as a notification, and `Ctrl+S` in `/tasks` stops it. Its foreground timeout, such as the `timeout` of a `bash` call, no longer applies, so a long build or test run goes on until it ends. Limits a tool puts on its own work, such as the `code_execution` script budget, still apply.
 
+A blocking `task` instead becomes an ordinary background task with its one row in `/tasks`, and it moves even while its agent is still starting. A call whose result is already in hand completes as usual. A note such as `Moved 2 running calls to the background` counts the calls that moved, and a repeated press does not move a call twice.
+
 The key does nothing in a task chat, in an idle chat, or while a permission prompt is open. To use another key, bind it to `maki.ui.action("background_tools")`.
 
 ### Recovering from a bad keymap

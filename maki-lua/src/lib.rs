@@ -96,6 +96,26 @@ pub mod test_support {
     /// running plugin host.
     pub struct RequestProbe(flume::Receiver<crate::runtime::Request>);
 
+    pub struct RestoreRequest {
+        pub item: crate::RestoreItem,
+        event_tx: maki_agent::EventSender,
+    }
+
+    impl RestoreRequest {
+        pub fn reply(
+            self,
+            body: Option<maki_agent::BufferSnapshot>,
+            header: Option<maki_agent::BufferSnapshot>,
+        ) {
+            crate::runtime::RestoreReply { body, header }.emit_for_task(
+                &self.item.tool_use_id,
+                self.item.theme_gen,
+                self.item.task_id.as_deref(),
+                &self.event_tx,
+            );
+        }
+    }
+
     impl RequestProbe {
         /// Next request as `(kind, clicks)`: `"click"` carries no clicks,
         /// `"click_fallback"` and `"restore"` carry their restore item's.
@@ -145,10 +165,17 @@ pub mod test_support {
 
         /// Next queued restore item, skipping other requests.
         pub fn try_recv_restore_item(&self) -> Option<crate::RestoreItem> {
+            self.try_recv_restore_request().map(|request| request.item)
+        }
+
+        pub fn try_recv_restore_request(&self) -> Option<RestoreRequest> {
             use crate::runtime::Request;
             while let Ok(req) = self.0.try_recv() {
-                if let Request::RestoreToolAsync { item, .. } = req {
-                    return Some(*item);
+                if let Request::RestoreToolAsync { item, event_tx } = req {
+                    return Some(RestoreRequest {
+                        item: *item,
+                        event_tx,
+                    });
                 }
             }
             None

@@ -1235,6 +1235,7 @@ fn interrupt_message(message: String, images: Vec<ImageSource>) -> Message {
 #[cfg(test)]
 mod tests {
     use crate::Notice;
+    use std::borrow::Cow;
     use std::collections::{BTreeMap, VecDeque};
     use std::path::Path;
     use std::sync::{Arc, Mutex};
@@ -1255,14 +1256,19 @@ mod tests {
     use crate::agent::Transcript;
     use crate::agent::frame::RunContext;
     use crate::agent::hook::testing::{Seen, script};
+    use crate::cancel::CancelTrigger;
     use crate::mcp::test_support::stub_session;
     use crate::mcp::tool_names;
     use crate::permissions::PermissionManager;
     use crate::prompt::{PromptId, Slot, SlotEntry};
     use crate::session::StoredSession;
     use crate::template::Vars;
-    use crate::tools::RequestTools;
-    use crate::{EarlierInput, Envelope};
+    use crate::tools::registry::{
+        ExecFuture, HeaderFuture, HeaderResult, ParseError, Tool, ToolInvocation, ToolSource,
+    };
+    use crate::tools::{DescriptionContext, RequestTools, ToolRegistry};
+    use crate::{EarlierInput, Envelope, MOVED_CALL_NOTIFICATION, SessionMailbox, ToolOutput};
+    use futures_lite::future::zip;
 
     const QUEUED_MESSAGES: [&str; 3] = ["first", "second", "third"];
     const RESPONSE_TEXT: &str = "response";
@@ -1279,6 +1285,11 @@ mod tests {
     const NOTICE_LINE: &str = "Background agent finished: find auth";
     const LARGE_NOTICE: &str = "a long background result ";
     const LARGE_NOTICE_REPEAT: usize = 2_000;
+    const GATED_TOOL: &str = "gated";
+    const QUICK_TOOL: &str = "quick";
+    const GATED_OUTPUT: &str = "gated output";
+    const QUICK_OUTPUT: &str = "quick output";
+    const MOVE_RUN: u64 = 0;
 
     struct MockInterruptSource {
         commands: Mutex<VecDeque<ExtractedCommand>>,
@@ -2176,6 +2187,202 @@ mod tests {
 
             assert!(requests.lock().unwrap().is_empty());
             assert!(history.as_slice().is_empty());
+        });
+    }
+
+    /// Runs until released, so a test can move it while it is in flight.
+    #[derive(Clone)]
+    struct GatedTool {
+        name: &'static str,
+        output: &'static str,
+        started: flume::Sender<()>,
+        release: flume::Receiver<()>,
+    }
+
+    impl ToolInvocation for GatedTool {
+        fn start_header(&self) -> HeaderFuture {
+            HeaderFuture::Ready(HeaderResult::plain(self.name.into()))
+        }
+        fn execute<'a>(self: Box<Self>, _: &'a ToolContext) -> ExecFuture<'a> {
+            Box::pin(async move {
+                self.started.send(()).unwrap();
+                self.release.recv_async().await.unwrap();
+                Ok::<_, String>(ToolOutput::Plain(self.output.into())).into()
+            })
+        }
+    }
+
+    impl Tool for GatedTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn description(&self, _: &DescriptionContext) -> Cow<'_, str> {
+            self.name.into()
+        }
+        fn schema(&self) -> Value {
+            json!({ "type": "object" })
+        }
+        fn parse(&self, _: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
+            Ok(Box::new(self.clone()))
+        }
+    }
+
+    struct Gate {
+        started: flume::Receiver<()>,
+        release: flume::Sender<()>,
+    }
+
+    fn gated(registry: &ToolRegistry, name: &'static str, output: &'static str) -> Gate {
+        let (started, started_rx) = flume::unbounded();
+        let (release, release_rx) = flume::unbounded();
+        registry
+            .register(
+                Arc::new(GatedTool {
+                    name,
+                    output,
+                    started,
+                    release: release_rx,
+                }),
+                ToolSource::Lua {
+                    plugin: "fixture".into(),
+                },
+            )
+            .unwrap();
+        Gate {
+            started: started_rx,
+            release,
+        }
+    }
+
+    fn tool_calls_response(names: &[&str]) -> StreamResponse {
+        StreamResponse {
+            stop_reason: Some(StopReason::ToolUse),
+            ..assistant_response(
+                names
+                    .iter()
+                    .map(|name| ContentBlock::tool_use(*name, *name, json!({})))
+                    .collect(),
+            )
+        }
+    }
+
+    /// An agent that owns a live session, so its calls can move.
+    fn movable_agent<'a>(
+        provider: MockProvider,
+        history: &'a mut History,
+        mailbox: &SessionMailbox,
+    ) -> (Agent<'a>, flume::Receiver<Envelope>, CancelTrigger) {
+        let (generation, owner) = CancelToken::new();
+        mailbox.publish_generation(owner.clone());
+        let (mut agent, event_rx) = make_agent(provider, history);
+        agent.session_id = Some(SessionRef::from(mailbox.session_id()));
+        agent.mailbox = Some(mailbox.clone());
+        agent.event_tx = agent.event_tx.clone().with_owner_cancel(owner);
+        (agent, event_rx, generation)
+    }
+
+    /// Moves the gated call once it runs, after `finished` calls have
+    /// reported their results.
+    async fn move_when_running(
+        mailbox: &SessionMailbox,
+        gate: &Gate,
+        event_rx: &flume::Receiver<Envelope>,
+        finished: usize,
+    ) {
+        gate.started.recv_async().await.unwrap();
+        let mut done = 0;
+        while done < finished {
+            if matches!(
+                event_rx.recv_async().await.unwrap().event,
+                AgentEvent::ToolDone(_)
+            ) {
+                done += 1;
+            }
+        }
+        assert_eq!(mailbox.background_tools(MOVE_RUN), 1);
+    }
+
+    fn tool_result_texts(message: &Message) -> Vec<(&str, &str)> {
+        message
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    ..
+                } => Some((tool_use_id.as_str(), content.as_str())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The model reads the receipts in the same turn, after the calls that
+    /// stayed in the foreground settle, and the moved call's notice later
+    /// starts a run of its own.
+    #[test_case(&[GATED_TOOL] ; "every_call_moved")]
+    #[test_case(&[GATED_TOOL, QUICK_TOOL] ; "one_moved_one_finished")]
+    fn a_moved_turn_continues_and_its_notice_starts_the_next_run(calls: &[&str]) {
+        smol::block_on(async {
+            let mailbox = SessionMailbox::register(MakiId::generate());
+            let provider = MockProvider::new(vec![
+                tool_calls_response(calls),
+                text_response(StopReason::EndTurn),
+                text_response(StopReason::EndTurn),
+            ]);
+            let requests = Arc::clone(&provider.requests);
+            let mut history = History::new(Vec::new());
+            let (mut agent, event_rx, _generation) =
+                movable_agent(provider, &mut history, &mailbox);
+            let gate = gated(&agent.registry, GATED_TOOL, GATED_OUTPUT);
+            let quick = gated(&agent.registry, QUICK_TOOL, QUICK_OUTPUT);
+            quick.release.send(()).unwrap();
+
+            let (reason, ()) = zip(
+                agent.run(default_input()),
+                move_when_running(&mailbox, &gate, &event_rx, calls.len() - 1),
+            )
+            .await;
+
+            assert_eq!(reason.unwrap(), DoneReason::EndTurn);
+            assert_eq!(requests.lock().unwrap().len(), 2);
+            let results = tool_result_texts(&agent.history.as_slice()[2]);
+            assert_eq!(results.len(), calls.len());
+            let receipt: Value = serde_json::from_str(results[0].1).unwrap();
+            assert_eq!(results[0].0, GATED_TOOL);
+            assert_eq!(receipt["notification"], MOVED_CALL_NOTIFICATION);
+            if let Some(&(id, output)) = results.get(1) {
+                assert_eq!((id, output), (QUICK_TOOL, QUICK_OUTPUT));
+            }
+
+            let wake = mailbox.wake_listener();
+            gate.release.send(()).unwrap();
+            wake.await;
+            let mut input = default_input();
+            input.message.clear();
+            input.preamble = mailbox
+                .claim_wake()
+                .into_iter()
+                .map(|notice| notice.message)
+                .collect();
+            assert_eq!(input.preamble.len(), 1);
+            agent.run(input).await.unwrap();
+            drop(agent);
+
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len(), 3);
+            for pair in requests.windows(2) {
+                assert_append_only(&pair[0], &pair[1]);
+            }
+            assert!(
+                requests[2]
+                    .messages
+                    .last()
+                    .unwrap()
+                    .to_string()
+                    .contains(GATED_OUTPUT),
+                "the next run must carry the moved call's result"
+            );
         });
     }
 
