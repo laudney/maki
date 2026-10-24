@@ -7,7 +7,7 @@ local output_limits = require("maki.output_limits")
 require("picker")
 
 local Runner = require("runner")
-local Background = Runner.allow_background and require("background")
+local Background = require("background")
 
 local DEFAULT_OUTPUT_LINES = 5
 
@@ -38,11 +38,15 @@ local function handler(input, ctx)
     return { llm_output = prepare_err, is_error = true }
   end
 
-  if Background and input.background then
+  if Runner.allow_background and input.background then
     local result = Background.start(prepared, ctx)
     if result then
       return result
     end
+  end
+
+  if ctx:session_id() then
+    return Background.blocking(prepared, ctx)
   end
 
   local permit = Runner.semaphore:acquire()
@@ -92,6 +96,7 @@ maki.api.register_tool({
   audiences = { "main", "workflow" },
   examples = examples,
   schema = Runner.schema,
+  background_receipt = true,
   handler = handler,
   header = header,
   restore = restore,

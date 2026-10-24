@@ -209,6 +209,8 @@ maki.agent.session = function(ctx, opts)
     self.closed = true
     recorder.closed = recorder.closed + 1
   end
+  function sess:cancel() self.was_cancelled = true end
+  function sess:cancelled() return self.was_cancelled == true end
   if opts.name == "@OPEN_PARKED_SCENARIO@" then
     park(opts.name)
   end
