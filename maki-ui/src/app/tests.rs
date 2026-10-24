@@ -24,7 +24,8 @@ use maki_agent::session::NOTHING_TO_STORE;
 use maki_agent::{
     AgentMode, CancelToken, DoneReason, HistorySnapshot, ImageMediaType, McpConfigErrors,
     McpServerInfo, McpServerStatus, McpSnapshot, McpSnapshotReader, Notice, SharedBuf, SteerKind,
-    SubagentInbox, ToolDoneEvent, ToolOutput, ToolStartEvent, Transcript, TurnCompleteEvent,
+    SubagentInbox, TaskKind, ToolDoneEvent, ToolOutput, ToolStartEvent, Transcript,
+    TurnCompleteEvent,
 };
 use maki_config::{Effect, PermissionRule, PermissionsConfig, ProjectConfig, ToolKey, UiConfig};
 use maki_lua::test_support::{HintWriterHandle, hint_writer_pair};
@@ -140,6 +141,7 @@ const CUSTOM_COMMAND_NAME: &str = "fix";
 const CUSTOM_COMMAND_CONTENT: &str = "Fix $ARGUMENTS";
 const RUNNING_PLUGIN: &str = "runner";
 const RUNNING_PLUGIN_COMMAND: &str = "/runit";
+const PROMOTION_RUN_ID: u64 = 42;
 
 fn set_zone(app: &mut App, zone: SelectionZone, area: Rect) {
     app.zones.push(SelectableZone { area, zone });
@@ -336,6 +338,7 @@ fn subagent_info_with_tx(
         model: None,
         opts: None,
         detached: false,
+        kind: TaskKind::Agent,
         owner_cancel: None,
         spawn_tool_use_id: None,
         answer_tx,
@@ -371,8 +374,18 @@ fn detached_msg_with_tx(
     parent_id: &str,
     answer_tx: Option<flume::Sender<String>>,
 ) -> Msg {
+    detached_msg_of_kind(event, parent_id, answer_tx, TaskKind::Agent)
+}
+
+fn detached_msg_of_kind(
+    event: AgentEvent,
+    parent_id: &str,
+    answer_tx: Option<flume::Sender<String>>,
+    kind: TaskKind,
+) -> Msg {
     let mut info = subagent_info_with_tx(parent_id, "Agent", answer_tx);
     info.detached = true;
+    info.kind = kind;
     info.owner_cancel = Some(CancelToken::none());
     info.spawn_tool_use_id = Some(SPAWN_ID.into());
     Msg::Agent(Box::new(Envelope {
@@ -380,6 +393,34 @@ fn detached_msg_with_tx(
         subagent: Some(info),
         run_id: DETACHED_RUN_ID,
     }))
+}
+
+const MOVED_COMMAND: &str = "cargo test --workspace";
+const SPAWNED_NAME: &str = "spawned child name";
+
+/// A moved call's task carries the tool's name, so its row keeps the
+/// command it shows, while an agent child names the row that spawned it.
+#[test_case(TaskKind::Tool, MOVED_COMMAND, SPAWNED_NAME; "moved_tool_keeps_its_command")]
+#[test_case(TaskKind::Agent, SPAWNED_NAME, MOVED_COMMAND; "agent_child_names_its_row")]
+fn only_an_agent_child_renames_its_spawning_row(kind: TaskKind, shown: &str, hidden: &str) {
+    let mut app = streaming_app();
+    let start = || {
+        let AgentEvent::ToolStart(mut start) = tool_start(SPAWN_ID, "bash") else {
+            unreachable!();
+        };
+        start.summary = MOVED_COMMAND.into();
+        AgentEvent::ToolStart(start)
+    };
+    app.update(agent_msg(start()));
+    let mut msg = detached_msg_of_kind(start(), TASK_ID, None, kind);
+    if let Msg::Agent(envelope) = &mut msg {
+        envelope.subagent.as_mut().unwrap().name = SPAWNED_NAME.into();
+    }
+    app.update(msg);
+    app.set_active_chat(MAIN_CHAT);
+    let main = rendered(&mut app);
+    assert!(main.contains(shown), "{main}");
+    assert!(!main.contains(hidden), "{main}");
 }
 
 fn subagent_msg_with_prompt(
@@ -2405,7 +2446,7 @@ fn nested_plugin_child_outlives_foreground_and_closes_on_history(end: fn(&mut Ap
     );
     end(&mut app);
     assert_eq!(app.chats[2].task_status(), TaskStatus::Working);
-    assert!(app.chats[2].agent);
+    assert!(app.chats[2].detached);
     assert!(app.permission_prompt.is_open());
     plugin_child_event(
         &mut app,
@@ -2544,7 +2585,7 @@ fn plugin_task_opens_a_chat_by_id_with_its_first_prompt() {
     assert_eq!(chat.last_message_text(), MONITOR_PROMPT);
     let tasks = serde_json::to_value(app.tasks()).unwrap();
     assert_eq!(tasks[1]["plugin"], MONITOR_PLUGIN);
-    assert!(!chat.agent);
+    assert!(!chat.detached);
     assert_eq!(tasks[0].get("plugin"), None);
 }
 
@@ -2830,17 +2871,23 @@ fn cancel_resets_all_chats_and_indices() {
     assert_eq!(app.cadence(), Cadence::IDLE);
 }
 
-#[test_case(end_turn; "turn_end")]
-#[test_case(cancel_foreground; "foreground_cancel")]
-fn foreground_end_keeps_a_background_childs_tools_and_permission(end: fn(&mut App)) {
+#[test_case(end_turn, TaskKind::Agent; "agent_turn_end")]
+#[test_case(cancel_foreground, TaskKind::Agent; "agent_foreground_cancel")]
+#[test_case(end_turn, TaskKind::Tool; "tool_turn_end")]
+#[test_case(cancel_foreground, TaskKind::Tool; "tool_foreground_cancel")]
+fn foreground_end_keeps_a_background_childs_tools_and_permission(
+    end: fn(&mut App),
+    kind: TaskKind,
+) {
     let mut app = streaming_app();
     let (answer_tx, answer_rx) = flume::unbounded();
-    app.update(detached_msg_with_tx(
+    app.update(detached_msg_of_kind(
         tool_start(FIRST_ASK, "bash"),
         AGENT_ID,
         Some(answer_tx),
+        kind,
     ));
-    app.update(detached_msg(
+    app.update(detached_msg_of_kind(
         AgentEvent::PermissionRequest {
             id: FIRST_ASK.into(),
             tool: ToolKey::native("bash"),
@@ -2848,6 +2895,8 @@ fn foreground_end_keeps_a_background_childs_tools_and_permission(end: fn(&mut Ap
             reason: None,
         },
         AGENT_ID,
+        None,
+        kind,
     ));
 
     end(&mut app);
@@ -2855,11 +2904,202 @@ fn foreground_end_keeps_a_background_childs_tools_and_permission(end: fn(&mut Ap
     assert_eq!(app.chats[1].in_progress_count(), 1);
     assert_eq!(app.chats[1].task_status(), TaskStatus::Working);
     assert!(app.chat_index.contains_key(AGENT_ID));
-    assert!(app.chats[1].agent);
+    assert!(app.chats[1].detached);
+    assert_eq!(app.chats[1].kind, kind);
     assert!(app.permission_prompt.is_open());
     app.update(Msg::Key(key(KeyCode::Char('y'))));
     assert_eq!(answer_rx.try_recv().unwrap(), allow_once(FIRST_ASK));
     assert!(!app.permission_prompt.is_open());
+}
+
+#[test_case(end_turn, true, false; "turn_end_without_another_child_event")]
+#[test_case(cancel_foreground, true, false; "cancel_without_another_child_event")]
+#[test_case(end_turn, true, true; "detached_child_event_precedes_receipt")]
+#[test_case(cancel_foreground, false, false; "cancel_precedes_receipt")]
+fn promotion_preserves_an_already_running_blocking_child(
+    end: fn(&mut App),
+    receipt_before_end: bool,
+    metadata_before_receipt: bool,
+) {
+    const RECEIPT: &str = "continues in the background";
+    let mut app = streaming_app();
+    app.update(agent_msg(tool_start(TASK_ID, "task")));
+    app.update(subagent_msg(
+        tool_start(SUB_TOOL_ID, "example"),
+        TASK_ID,
+        None,
+    ));
+    let (handle, probe) = maki_lua::test_support::probed_event_handle();
+    app.lua_event_handle = handle;
+    let mut receipt = Some(agent_msg(AgentEvent::ToolBackgrounded(Box::new(
+        ToolDoneEvent {
+            call: None,
+            id: TASK_ID.into(),
+            tool: "task".into(),
+            output: Arc::new(ToolOutput::Plain(RECEIPT.into())),
+            is_error: false,
+            annotation: None,
+            written_path: None,
+        },
+    ))));
+    let (answer_tx, answer_rx) = flume::unbounded();
+    let mut detached_event = Some(detached_msg_with_tx(
+        AgentEvent::PermissionRequest {
+            id: FIRST_ASK.into(),
+            tool: ToolKey::native("example"),
+            scopes: vec![],
+            reason: None,
+        },
+        TASK_ID,
+        Some(answer_tx),
+    ));
+    if metadata_before_receipt {
+        app.update(detached_event.take().unwrap());
+        assert!(app.chats[1].detached);
+    }
+    if receipt_before_end {
+        app.update(receipt.take().unwrap());
+    } else {
+        app.background_tools_accepted(app.run_id);
+    }
+    assert!(probe.try_recv_autocmd().is_none());
+    assert_eq!(
+        app.chats[0].in_progress_count(),
+        usize::from(!receipt_before_end)
+    );
+    assert_eq!(app.chats[1].task_status(), TaskStatus::Working);
+    end(&mut app);
+    if let Some(event) = receipt {
+        app.update(event);
+    }
+    if let Some(event) = detached_event {
+        app.update(event);
+    }
+    assert_eq!(app.chats.len(), 2);
+    assert_eq!(app.chats[1].task_status(), TaskStatus::Working);
+    assert_eq!(app.chats[1].in_progress_count(), 1);
+    assert_eq!(app.chat_index[TASK_ID], 1);
+    app.update(Msg::Key(key(KeyCode::Char('y'))));
+    assert_eq!(answer_rx.try_recv().unwrap(), allow_once(FIRST_ASK));
+    app.update(detached_msg(
+        AgentEvent::SubagentHistory {
+            tool_use_id: TASK_ID.into(),
+            messages: vec![],
+            status: Some(SubagentVerdict::Done),
+        },
+        TASK_ID,
+    ));
+    assert_eq!(app.chats[1].task_status(), TaskStatus::Done);
+    assert!(!app.subagent_answers.contains_key(TASK_ID));
+}
+
+#[test]
+fn promotion_moves_a_pending_permission_to_its_task_owner() {
+    const GUIDANCE: &str = "use the cached result";
+    let mut app = streaming_app();
+    let (foreground_tx, foreground_rx) = flume::unbounded();
+    let (task_tx, task_rx) = flume::unbounded();
+    app.answer_tx = Some(foreground_tx);
+    app.update(agent_msg(AgentEvent::PermissionRequest {
+        id: FIRST_ASK.into(),
+        tool: ToolKey::native("bash"),
+        scopes: vec!["ls".into()],
+        reason: None,
+    }));
+    app.update(Msg::Key(key(KeyCode::Char('n'))));
+    app.update(Msg::Paste(GUIDANCE.into()));
+    app.update(detached_msg_of_kind(
+        AgentEvent::PermissionRequest {
+            id: FIRST_ASK.into(),
+            tool: ToolKey::native("bash"),
+            scopes: vec!["ls".into()],
+            reason: None,
+        },
+        TASK_ID,
+        Some(task_tx),
+        TaskKind::Tool,
+    ));
+    app.update(agent_msg(AgentEvent::PermissionRequest {
+        id: FIRST_ASK.into(),
+        tool: ToolKey::native("bash"),
+        scopes: vec!["ls".into()],
+        reason: None,
+    }));
+    end_turn(&mut app);
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert_eq!(
+        task_rx.try_recv().unwrap(),
+        TaggedAnswer::new(
+            FIRST_ASK,
+            PermissionAnswer::DenyWithGuidance(GUIDANCE.into())
+        )
+        .encode()
+    );
+    assert!(foreground_rx.is_empty());
+    assert!(!app.permission_prompt.is_open());
+}
+
+#[test]
+fn promoted_tool_tab_has_no_agent_input_and_cancels_its_owner() {
+    let mut app = streaming_app();
+    app.update(detached_msg_of_kind(
+        tool_start(SUB_TOOL_ID, "example"),
+        TASK_ID,
+        None,
+        TaskKind::Tool,
+    ));
+    app.run_builtin(BuiltinAction::NextChat);
+    assert!(!app.chat_accepts_input());
+    let run_id = app.run_id;
+    app.update(Msg::Key(key(KeyCode::Char('x'))));
+    assert!(app.input_box.is_empty());
+    app.update(Msg::Key(key(KeyCode::Esc)));
+    let actions = app.update(Msg::Key(key(KeyCode::Esc)));
+    assert!(
+        matches!(actions.as_slice(), [Action::CancelSubagent { tool_use_id }] if tool_use_id == TASK_ID)
+    );
+    assert!(app.chats[1].is_finished());
+    assert_eq!(app.run_id, run_id);
+    assert_eq!(app.status, Status::Streaming);
+}
+
+#[test_case(TaskKind::Tool; "promoted_tool")]
+#[test_case(TaskKind::Agent; "legacy_agent")]
+fn detached_task_kind_survives_finished_chat_restore(kind: TaskKind) {
+    const PROMOTED_RESULT: &str = "tool finished";
+    let mut app = streaming_app();
+    app.update(detached_msg_of_kind(
+        tool_start(SUB_TOOL_ID, "example"),
+        TASK_ID,
+        None,
+        kind,
+    ));
+    app.update(detached_msg_of_kind(
+        AgentEvent::SubagentHistory {
+            tool_use_id: TASK_ID.into(),
+            messages: vec![Message::user(PROMOTED_RESULT.into())],
+            status: Some(SubagentVerdict::Done),
+        },
+        TASK_ID,
+        None,
+        kind,
+    ));
+    app.sync_subagents();
+    let saved = serde_json::to_value(&app.state.session.subagents()[0]).unwrap();
+    if kind == TaskKind::Agent {
+        assert!(saved.get("kind").is_none());
+    }
+    app.state
+        .session_mut()
+        .set_subagents(vec![serde_json::from_value(saved).unwrap()]);
+    app.reset_ui_chrome();
+    app.restore_display();
+    assert_eq!(app.chats[1].task_status(), TaskStatus::Done);
+    assert_eq!(app.chats[1].kind, kind);
+    assert_eq!(
+        app.state.session.subagent_messages()[TASK_ID][0].user_text(),
+        Some(PROMOTED_RESULT)
+    );
 }
 
 #[test]
@@ -3190,6 +3430,112 @@ fn scroll_outside_msg_area_ignored() {
         delta: 3,
     });
     assert!(app.chats[0].auto_scroll());
+}
+
+fn background_key(code: char, modifiers: KeyModifiers) -> Msg {
+    Msg::Key(KeyEvent::new(KeyCode::Char(code), modifiers))
+}
+
+#[test]
+fn ctrl_b_moves_the_current_main_run() {
+    let mut app = streaming_app();
+    app.run_id = PROMOTION_RUN_ID;
+    app.active_chat().scroll_to_top();
+    let actions = app.update(background_key('b', KeyModifiers::CONTROL));
+    assert!(
+        matches!(actions.as_slice(), [Action::BackgroundTools { run_id }] if *run_id == PROMOTION_RUN_ID)
+    );
+    assert!(!app.chats[0].auto_scroll());
+    assert_eq!(app.status, Status::Streaming);
+    assert_eq!(app.chats.len(), 1);
+}
+
+#[test_case('b' ; "lowercase")]
+#[test_case('B' ; "uppercase")]
+fn ctrl_shift_b_has_no_binding(letter: char) {
+    let mut app = streaming_app();
+    let actions = app.update(background_key(
+        letter,
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    ));
+    assert!(actions.is_empty());
+    assert!(app.input_box.is_empty());
+}
+
+#[test]
+fn ctrl_alt_g_scrolls_to_the_bottom_while_streaming() {
+    let mut app = streaming_app();
+    app.active_chat().scroll_to_top();
+    assert!(
+        app.update(Msg::Key(kb::SCROLL_BOTTOM.to_key_event()))
+            .is_empty()
+    );
+    assert!(app.chats[0].auto_scroll());
+}
+
+fn idle_main_chat() -> App {
+    let mut app = streaming_app();
+    end_turn(&mut app);
+    app
+}
+
+#[test_case(idle_main_chat ; "idle_main_chat")]
+#[test_case(app_with_active_subagent ; "subagent_chat")]
+fn background_key_ignores_ineligible_chats(setup: fn() -> App) {
+    let mut app = setup();
+    assert!(
+        app.update(Msg::Key(kb::BACKGROUND_TOOLS.to_key_event()))
+            .is_empty()
+    );
+    assert!(app.run_builtin(BuiltinAction::BackgroundTools).is_empty());
+}
+
+fn open_permission_prompt(app: &mut App) {
+    app.permission_prompt.push(
+        TASK_ID.into(),
+        ToolKey::native("bash"),
+        vec!["execute".into()],
+        None,
+        true,
+        None,
+    );
+}
+
+#[test_case(open_help ; "help_modal")]
+#[test_case(open_permission_prompt ; "permission_prompt")]
+fn background_key_yields_to_open_overlays(setup: fn(&mut App)) {
+    let mut app = streaming_app();
+    setup(&mut app);
+    assert!(
+        app.update(Msg::Key(kb::BACKGROUND_TOOLS.to_key_event()))
+            .is_empty()
+    );
+    assert!(app.help_modal.is_open() || app.permission_prompt.is_open());
+}
+
+#[test]
+fn background_key_keeps_override_precedence() {
+    let mut app = streaming_app();
+    let probe = install_override(
+        &mut app,
+        kb::BACKGROUND_TOOLS.code,
+        kb::BACKGROUND_TOOLS.modifiers,
+    );
+    app.help_modal.toggle();
+    assert!(
+        app.update(Msg::Key(kb::BACKGROUND_TOOLS.to_key_event()))
+            .is_empty()
+    );
+    assert!(
+        probe.try_recv_keybind().is_none(),
+        "{OVERRIDE_NOT_DISPATCHED}"
+    );
+    app.help_modal.toggle();
+    assert!(
+        app.update(Msg::Key(kb::BACKGROUND_TOOLS.to_key_event()))
+            .is_empty()
+    );
+    assert!(probe.try_recv_keybind().is_some(), "{OVERRIDE_DISPATCHED}");
 }
 
 #[test]

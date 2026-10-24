@@ -61,7 +61,8 @@ use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use maki_agent::permissions::{PermissionManager, TaggedAnswer};
 use maki_agent::{
     AgentEvent, CancelToken, DETACHED_RUN_ID, Envelope, ImageSource, McpConfigErrors,
-    McpPromptInfo, McpSnapshotReader, SharedMessages, SubagentInfo, SubagentVerdict,
+    McpPromptInfo, McpSnapshotReader, SessionMailbox, SharedMessages, SubagentInfo,
+    SubagentVerdict, TaskKind,
 };
 use maki_config::project::{self, GatedFile, TrustQuestion};
 use maki_config::{ModelPolicy, UiConfig};
@@ -574,7 +575,9 @@ impl App {
     /// chat does, so a message can be queued for that subagent while it is
     /// watched. A finished one is a transcript, so it does not.
     pub(super) fn chat_accepts_input(&self) -> bool {
-        self.is_main_chat() || !self.chats[self.active_chat].is_finished()
+        self.is_main_chat()
+            || (self.chats[self.active_chat].kind == TaskKind::Agent
+                && !self.chats[self.active_chat].is_finished())
     }
 
     /// One input box serves every chat, so the draft in it moves to the chat
@@ -882,6 +885,9 @@ impl App {
     }
 
     fn send_to_agent(&self, subagent_id: Option<&str>, answer: String) {
+        if subagent_id.is_none() && SessionMailbox::reply_tool(self.state.session.id, &answer) {
+            return;
+        }
         let target = match subagent_id {
             Some(id) => self.subagent_answers.get(id),
             None => self.answer_tx.as_ref(),
@@ -959,6 +965,9 @@ impl App {
         if key::SCROLL_TOP.matches(key) {
             self.active_chat().scroll_to_top();
             return Some(vec![]);
+        }
+        if key::BACKGROUND_TOOLS.matches(key) {
+            return Some(self.run_builtin(BuiltinAction::BackgroundTools));
         }
         None
     }
@@ -1199,6 +1208,18 @@ impl App {
         self.state.mode == Mode::Plan && self.state.plan.is_ready()
     }
 
+    pub(crate) fn background_tools_accepted(&mut self, run_id: u64) {
+        if run_id != self.run_id {
+            return;
+        }
+        for chat in self.chats.iter_mut().skip(1) {
+            if chat.plugin.is_none() && !chat.is_finished() {
+                chat.detached = true;
+            }
+        }
+        self.sync_subagents();
+    }
+
     /// Single implementation behind both the default keybindings and
     /// `maki.ui.action`, so a Lua rebind can never drift from the
     /// original key's behavior.
@@ -1225,6 +1246,15 @@ impl App {
                         self.flash(FLASH_NO_PLAN.into());
                         vec![]
                     }
+                };
+            }
+            BuiltinAction::BackgroundTools => {
+                return if self.is_main_chat() && self.status == Status::Streaming {
+                    vec![Action::BackgroundTools {
+                        run_id: self.run_id,
+                    }]
+                } else {
+                    vec![]
                 };
             }
             BuiltinAction::EditInput => return vec![Action::EditInputInEditor],
@@ -1349,6 +1379,9 @@ impl App {
         if !self.chat_accepts_input() {
             return match key.code {
                 KeyCode::Tab if !self.is_bash_input() => self.toggle_mode(),
+                KeyCode::Esc if !self.chats[self.active_chat].is_finished() => {
+                    self.handle_esc(self.status == Status::Streaming)
+                }
                 _ => vec![],
             };
         }
@@ -1516,7 +1549,7 @@ impl App {
         self.shell.cancel_all();
         for chat in self.chats.iter_mut().filter(|c| c.plugin.is_none()) {
             chat.flush();
-            if !chat.agent || chat.is_finished() {
+            if !chat.detached || chat.is_finished() {
                 chat.cancel_in_progress();
             }
         }
@@ -1664,6 +1697,15 @@ impl App {
             self.state
                 .session_mut()
                 .set_subagent_messages(tool_use_id, messages);
+            return vec![];
+        }
+
+        if let AgentEvent::ToolBackgrounded(ref result) = envelope.event {
+            self.state
+                .session_mut()
+                .insert_tool_output(result.id.clone(), result.output.clone());
+            self.background_tools_accepted(envelope.run_id);
+            self.main_chat().handle_event(envelope.event, None);
             return vec![];
         }
 
@@ -1855,7 +1897,7 @@ impl App {
                 ChatEventResult::Done => {
                     self.status_bar.clear_flash();
                     self.terminalize_turn(MISSING_TOOL_COMPLETION);
-                    self.retain_agents();
+                    self.retain_detached_tasks();
                     self.status = Status::Idle;
                     if self.exit_on_done {
                         self.exit_request = ExitRequest::Success;
@@ -1871,7 +1913,7 @@ impl App {
                     self.terminalize_turn(&message);
                     self.recoverable_queue = self.queue.text_messages();
                     self.queue.clear();
-                    self.retain_agents();
+                    self.retain_detached_tasks();
                     if self.exit_on_done {
                         self.exit_request = ExitRequest::Error;
                     }
@@ -1908,15 +1950,33 @@ impl App {
             Some(_) => self.chat_of_task(id).ok(),
         };
         if let Some(idx) = known {
+            if !self.chats[idx].is_finished() {
+                let detached = plugin.is_none() && (background || subagent.detached);
+                if detached && !self.chats[idx].detached {
+                    self.chats[idx].detached = true;
+                    self.sync_subagents();
+                }
+                if let Some(ref tx) = subagent.answer_tx
+                    && !self
+                        .subagent_answers
+                        .get(id)
+                        .is_some_and(|current| current.same_channel(tx))
+                {
+                    self.subagent_answers.insert(id.clone(), tx.clone());
+                }
+            }
             return idx;
         }
         let idx = self.chats.len();
         if plugin.is_none() {
             self.chat_index.insert(id.clone(), idx);
-            let row = subagent.spawn_row_id();
-            self.chats[MAIN_CHAT].update_tool_summary(row, &subagent.name);
-            if let Some(ref model) = subagent.model {
-                self.chats[MAIN_CHAT].update_tool_model(row, model);
+            // A moved tool call's row already shows what the call runs.
+            if subagent.kind == TaskKind::Agent {
+                let row = subagent.spawn_row_id();
+                self.chats[MAIN_CHAT].update_tool_summary(row, &subagent.name);
+                if let Some(ref model) = subagent.model {
+                    self.chats[MAIN_CHAT].update_tool_model(row, model);
+                }
             }
         }
         if let Some(ref tx) = subagent.answer_tx {
@@ -1934,7 +1994,8 @@ impl App {
         chat.model_id = subagent.model.clone();
         chat.opts = subagent.opts;
         chat.inbox = subagent.inbox.clone();
-        chat.agent = plugin.is_none() && (background || subagent.detached);
+        chat.kind = subagent.kind;
+        chat.detached = plugin.is_none() && (background || subagent.detached);
         if let Some(ref prompt) = subagent.prompt {
             chat.push_user_message(prompt);
         }
@@ -2532,20 +2593,20 @@ impl App {
 
     fn finish_subagents(&mut self, outcome: TaskOutcome, text: &str) {
         self.retain_resolved_subagents(outcome, text);
-        self.retain_agents();
+        self.retain_detached_tasks();
     }
 
-    /// Background agent chats are not turn-scoped: whatever ends the turn,
+    /// Detached chats are not turn-scoped: whatever ends the turn,
     /// they keep their routing and their answer channel until they end.
-    fn retain_agents(&mut self) {
+    fn retain_detached_tasks(&mut self) {
         self.chat_index
-            .retain(|_, &mut sub_idx| self.chats[sub_idx].agent);
+            .retain(|_, &mut sub_idx| self.chats[sub_idx].detached);
         let chat_index = &self.chat_index;
         let chats = &self.chats;
         self.subagent_answers.retain(|id, _| {
             chat_index
                 .get(id.as_str())
-                .is_some_and(|&idx| chats[idx].agent && !chats[idx].is_finished())
+                .is_some_and(|&idx| chats[idx].detached && !chats[idx].is_finished())
                 || chats.iter().any(|chat| {
                     chat.plugin.is_some()
                         && !chat.is_finished()
@@ -2567,7 +2628,7 @@ impl App {
         self.retain_resolved_subagents(TaskOutcome::Error, ERROR_TEXT);
         self.chats[MAIN_CHAT].fail_in_progress_except(message.into(), self.shell.active_ids());
         for chat in self.chats.iter_mut().skip(1).filter(|c| c.plugin.is_none()) {
-            if !chat.agent || chat.is_finished() {
+            if !chat.detached || chat.is_finished() {
                 chat.fail_in_progress_with_message(message.into());
             }
         }
@@ -2579,8 +2640,8 @@ impl App {
         self.chat_index.retain(|_, &mut sub_idx| {
             if self.chats[sub_idx].is_finished() {
                 true
-            } else if self.chats[sub_idx].agent {
-                // A background agent is nobody's child turn: leave it running.
+            } else if self.chats[sub_idx].detached {
+                // Detached work retains its session owner across turns.
                 true
             } else {
                 self.chats[sub_idx].mark_finished(outcome, text);

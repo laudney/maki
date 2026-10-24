@@ -6883,7 +6883,9 @@ and call this from it.
 
 Valid names: `"file_picker"`, `"search"`, `"help"`,
 `"plan_toggle"`, `"plan_editor"`, `"edit_input"`, `"pop_queue"`,
-`"prev_chat"`, `"next_chat"`, `"model_picker"`.
+`"prev_chat"`, `"next_chat"`, `"model_picker"`, `"background_tools"`.
+`"background_tools"` moves unfinished calls of the current main-agent
+turn to the background. It does nothing from a task chat or an idle chat.
 
 Most actions are free, since they open something the user then sees and
 drives. `"pop_queue"` needs `session_write`, because it throws away a

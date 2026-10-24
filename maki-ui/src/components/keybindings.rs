@@ -150,6 +150,7 @@ pub mod key {
         modifiers: KeyModifiers::CONTROL.union(KeyModifiers::ALT),
         label: mod_key!("Alt+G"),
     };
+    pub const BACKGROUND_TOOLS: Bind = ctrl_bind!('b');
     pub const POP_QUEUE: Bind = ctrl_bind!('q');
     pub const DELETE_WORD: Bind = ctrl_bind!('w');
     pub const SEARCH: Bind = ctrl_bind!('f');
@@ -487,6 +488,12 @@ pub const KEYBINDS: &[Keybind] = &[
     Keybind {
         label: KeyLabel::Alt("↑", "↓"),
         description: "Navigate input history",
+        context: KeybindContext::Streaming,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(key::BACKGROUND_TOOLS.label),
+        description: "Move running tools to background",
         context: KeybindContext::Streaming,
         platform: Platform::All,
     },

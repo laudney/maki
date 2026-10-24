@@ -1,16 +1,18 @@
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError, Weak};
 
 use arc_swap::ArcSwap;
 use event_listener::{Event, EventListener};
 use maki_config::ModelPolicy;
-use maki_providers::{Message, RequestOptions, Timeouts};
+use maki_providers::{DeliveryReceipt, Message, RequestOptions, ResultDelivery, Timeouts};
 use maki_storage::id::{MakiId, SessionRef};
 use thiserror::Error;
 
+use crate::agent::managed_tools::ForegroundTools;
 use crate::cancel::{CancelMap, CancelToken};
 use crate::mcp::McpSession;
-use crate::permissions::PermissionManager;
+use crate::permissions::{PermissionManager, TaggedAnswer};
 use crate::tools::{FileAccess, ToolContext, ToolRegistry, interpreter_ctx};
 use crate::{AgentConfig, AgentMode, EventSender, ModelSlot, ToolOutputLines};
 
@@ -18,6 +20,7 @@ pub const BACKGROUND_PLAN_WRITE_DENIED: &str =
     "the chat is in plan mode, so background sessions can't change files";
 const MAILBOX_CAPACITY: usize = 100;
 const NOTICE_DISPLAY_MAX_BYTES: usize = 256;
+const PROMOTED_TOOL_CAPACITY: usize = 64;
 /// Nobody listens on an unattended context's events, so its run id is never read.
 const UNATTENDED_RUN_ID: u64 = 0;
 
@@ -32,6 +35,9 @@ static LIVE_SESSIONS: LazyLock<Mutex<HashMap<MakiId, Weak<LiveSession>>>> =
 struct LiveSession {
     mailbox: Mutex<Mailbox>,
     seed: Mutex<SeedRegistration>,
+    foreground_tools: Mutex<Weak<ForegroundTools>>,
+    tool_replies: Mutex<HashMap<String, (Weak<ForegroundTools>, usize)>>,
+    promoted_tools: AtomicUsize,
 }
 
 #[derive(Default)]
@@ -120,6 +126,113 @@ fn notice_label(text: &str) -> Option<String> {
 }
 
 impl SessionMailbox {
+    pub(crate) fn current(session_id: MakiId, owner: &CancelToken) -> Option<Self> {
+        let live = lock(&LIVE_SESSIONS).get(&session_id)?.upgrade()?;
+        let mailbox = Self { session_id, live };
+        mailbox.owns_generation(owner).then_some(mailbox)
+    }
+
+    pub(crate) fn owns_generation(&self, owner: &CancelToken) -> bool {
+        !owner.is_cancelled()
+            && lock(&self.live.seed)
+                .generation
+                .as_ref()
+                .is_some_and(|current| current.same_token(owner))
+    }
+
+    pub(crate) fn publish_tools(&self, tools: &Arc<ForegroundTools>) {
+        let generation = lock(&self.live.seed);
+        if !generation
+            .generation
+            .as_ref()
+            .is_some_and(|current| tools.owned_by(current))
+        {
+            return;
+        }
+        *lock(&self.live.foreground_tools) = Arc::downgrade(tools);
+    }
+
+    /// Moves the unfinished tools of this exact main-agent run together.
+    /// Capacity exhaustion leaves all of them in the foreground.
+    pub fn background_tools(&self, run_id: u64) -> usize {
+        let tools = lock(&self.live.foreground_tools).upgrade();
+        tools
+            .filter(|tools| tools.run_id() == run_id)
+            .map_or(0, |tools| tools.promote())
+    }
+
+    pub(crate) fn reserve_tools(&self, count: usize) -> bool {
+        self.live
+            .promoted_tools
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |live| {
+                (live + count <= PROMOTED_TOOL_CAPACITY).then_some(live + count)
+            })
+            .is_ok()
+    }
+
+    pub(crate) fn release_tool(&self) {
+        self.live.promoted_tools.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    pub(crate) fn route_tool_reply(&self, id: String, tools: &Arc<ForegroundTools>, index: usize) {
+        lock(&self.live.tool_replies).insert(id, (Arc::downgrade(tools), index));
+    }
+
+    pub(crate) fn retire_tool_replies(&self, tools: &Arc<ForegroundTools>, index: usize) {
+        let tools = Arc::downgrade(tools);
+        lock(&self.live.tool_replies)
+            .retain(|_, (owner, call)| !owner.ptr_eq(&tools) || *call != index);
+    }
+
+    pub(crate) fn remove_tool_reply(&self, id: &str) {
+        lock(&self.live.tool_replies).remove(id);
+    }
+
+    /// Sends a tagged permission reply to the invocation that asked for it.
+    pub fn reply_tool(session_id: MakiId, raw_answer: &str) -> bool {
+        let Some(answer) = TaggedAnswer::decode(raw_answer) else {
+            return false;
+        };
+        let Some(live) = lock(&LIVE_SESSIONS)
+            .get(&session_id)
+            .and_then(Weak::upgrade)
+        else {
+            return false;
+        };
+        let route = lock(&live.tool_replies).get(&answer.request_id).cloned();
+        route
+            .and_then(|(owner, index)| owner.upgrade().map(|owner| (owner, index)))
+            .is_some_and(|(owner, index)| owner.reply(index, &answer.request_id, raw_answer))
+    }
+
+    /// The original permission id and invocation-private input route for a
+    /// frontend that presents permission requests outside the terminal UI.
+    pub fn tool_permission(
+        session_id: MakiId,
+        request_id: &str,
+    ) -> Option<(String, flume::Sender<String>)> {
+        let live = lock(&LIVE_SESSIONS).get(&session_id)?.upgrade()?;
+        let (owner, index) = lock(&live.tool_replies).get(request_id)?.clone();
+        owner.upgrade()?.permission(index, request_id)
+    }
+
+    pub(crate) fn delivery_receipt(
+        &self,
+        delivery: ResultDelivery,
+        owner: CancelToken,
+    ) -> Arc<DeliveryReceipt> {
+        let live = Arc::downgrade(&self.live);
+        Arc::new(DeliveryReceipt::new(delivery, move || {
+            !owner.is_cancelled()
+                && live.upgrade().is_some_and(|live| {
+                    lock(&live.seed)
+                        .generation
+                        .as_ref()
+                        .is_some_and(|current| current.same_token(&owner))
+                })
+        }))
+    }
+
     pub fn session_id(&self) -> MakiId {
         self.session_id
     }
@@ -137,6 +250,9 @@ impl SessionMailbox {
 
     /// The notice's `display_text` becomes its transcript line, shown and
     /// saved once an agent run accepts it. The model only ever reads its body.
+    /// The owner guard rides on the message as a receipt, so it survives a
+    /// frontend turning the notice into a run preamble. It only watches the
+    /// owner: a plugin may report into another session than its owner's.
     pub fn notify(session_id: MakiId, mut notice: Notice, wake: bool) -> Result<(), MailboxError> {
         if !notice.is_live() {
             return Err(MailboxError::OwnerEnded);
@@ -151,6 +267,15 @@ impl SessionMailbox {
         };
         let label = notice.message.display_text.take();
         notice.message.display_text = label.as_deref().and_then(notice_label);
+        if let Some(owner) = &notice.owner_cancel
+            && notice.message.delivery.is_none()
+        {
+            let owner = owner.clone();
+            notice.message.delivery = Some(Arc::new(DeliveryReceipt::new(
+                ResultDelivery::default(),
+                move || !owner.is_cancelled(),
+            )));
+        }
         let mut state = lock(&live.mailbox);
         if state.pending.len() == MAILBOX_CAPACITY {
             state.pending.pop_front();
@@ -483,6 +608,57 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["current child finished"]
         );
+    }
+
+    #[test]
+    fn admission_guards_owned_notices_and_keeps_existing_receipts() {
+        let id = MakiId::generate();
+        let mailbox = SessionMailbox::register(id);
+        let (_owner, generation) = CancelToken::new();
+        mailbox.publish_generation(generation.clone());
+        let delivery = ResultDelivery::default();
+        let (rejected_tx, rejected_rx) = flume::bounded(1);
+        delivery.on_reject(move || {
+            let _ = rejected_tx.try_send(());
+        });
+        let receipt = mailbox.delivery_receipt(delivery, generation.clone());
+        let mut receipted = Notice::text(NOTICE_BODY.into());
+        receipted.message.delivery = Some(Arc::clone(&receipt));
+        receipted.owner_cancel = Some(generation.clone());
+        let mut owned = Notice::text(NOTICE_BODY.into());
+        owned.owner_cancel = Some(generation);
+
+        for notice in [receipted, owned, Notice::text(NOTICE_BODY.into())] {
+            SessionMailbox::notify(id, notice, false).unwrap();
+        }
+
+        let notices = mailbox.drain();
+        let kept = notices[0].message.delivery.as_ref().unwrap();
+        assert!(Arc::ptr_eq(kept, &receipt));
+        assert!(notices[1].message.delivery.as_ref().unwrap().is_live());
+        assert!(notices[2].message.delivery.is_none());
+        kept.accept();
+        drop(notices);
+        assert!(rejected_rx.is_empty());
+    }
+
+    #[test]
+    fn a_notice_owned_by_another_session_stays_live_until_its_owner_ends() {
+        let id = MakiId::generate();
+        let mailbox = SessionMailbox::register(id);
+        let (_generation, current) = CancelToken::new();
+        mailbox.publish_generation(current);
+        let (other_trigger, other_owner) = CancelToken::new();
+        let mut notice = Notice::text(NOTICE_BODY.into());
+        notice.owner_cancel = Some(other_owner);
+
+        SessionMailbox::notify(id, notice, false).unwrap();
+
+        let notices = mailbox.drain();
+        let receipt = notices[0].message.delivery.as_ref().unwrap();
+        assert!(receipt.is_live());
+        drop(other_trigger);
+        assert!(!receipt.is_live());
     }
 
     #[test]

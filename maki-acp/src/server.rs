@@ -26,7 +26,7 @@ use maki_agent::tools::{LocalTool, LocalTools, QUESTION_TOOL_NAME, ToolAudience,
 use maki_agent::types::AgentEvent;
 use maki_agent::{
     AgentInput, AgentMode, AskOwner, Envelope, ImageMediaType, ImageSource, InputSource, OwnedAsks,
-    SessionEndReason, SessionEvents,
+    SessionEndReason, SessionEvents, SessionMailbox,
 };
 use maki_config::project::{self, TrustAnswer, TrustMode, policy_grant};
 use maki_config::{MAX_SERVER_NAME_LEN, ModelPolicy, ProjectConfig, SessionDefaults, TrustConfig};
@@ -72,8 +72,7 @@ struct PendingPrompt {
     run_id: u64,
 }
 
-/// How to read the answer and who gets it. A subagent's permission carries the
-/// channel its own agent waits on, everything else answers the main agent.
+/// Each request retains the channel of the invocation that waits for it.
 enum Ask {
     /// `request_id` is the agent-side id of the ask the tool is parked on, not
     /// the JSON-RPC id and not the client-facing tool call: the answer is
@@ -82,7 +81,9 @@ enum Ask {
         request_id: String,
         answer_tx: Option<Sender<String>>,
     },
-    Elicitation,
+    Elicitation {
+        answer_tx: Sender<String>,
+    },
 }
 
 type PendingState = Arc<Mutex<Pending>>;
@@ -487,8 +488,7 @@ fn ask_client(
 }
 
 /// Shadows the Lua `question` tool: sends `elicitation/create` to the client
-/// and blocks the tool call until the form comes back. Serializes on the same
-/// answer channel as main-agent permissions.
+/// and blocks the tool call until the form comes back.
 /// Weak, because `LocalTools` is captured verbatim by every `LuaCtx` a tool
 /// call parks and an idle VM never collects it. A strong clone here outlives
 /// `serve()` and leaves `writer_task` waiting on a sender nobody will drop.
@@ -510,17 +510,17 @@ fn question_tool(out_tx: WeakSender<Value>, pending: PendingState) -> LocalTool 
             let tool_call_id = ctx.tool_use_id.filter(|id| !id.is_empty());
             let out_tx = out_tx.upgrade().ok_or("connection closed")?;
             let request = elicitation::form_request(&session_id, tool_call_id, &input)?;
-            let rx = ctx.user_response_rx.as_ref().ok_or("no answer channel")?;
-
-            let guard = rx.lock().await;
+            let (answer_tx, answer_rx) = flume::bounded(1);
             let request = AgentRequest::CreateElicitationRequest(request);
-            let owner = AskOwner::run(ctx.event_tx.run_id());
-            let id = ask_client(&out_tx, &pending, owner, Ask::Elicitation, request);
-            let response = ctx.cancel.race(guard.recv_async()).await;
-            // Cleared while still holding the channel, so a stale id cannot
-            // clobber whatever ask comes next.
+            let id = ask_client(
+                &out_tx,
+                &pending,
+                AskOwner::run(ctx.event_tx.run_id()),
+                Ask::Elicitation { answer_tx },
+                request,
+            );
+            let response = ctx.cancel.race(answer_rx.recv_async()).await;
             pending.lock().unwrap().asks.take(&id);
-            drop(guard);
 
             Ok(match response {
                 Ok(Ok(raw)) => elicitation::format_response(&input, &raw),
@@ -822,12 +822,12 @@ fn handle_incoming_response(srv: &Server, raw: &Value) {
         ),
         // The waiting question tool parses this; an error response decodes to
         // nothing and counts as a dismissal.
-        Ask::Elicitation => (
+        Ask::Elicitation { answer_tx } => (
             raw.get("result")
                 .cloned()
                 .unwrap_or(Value::Null)
                 .to_string(),
-            None,
+            Some(answer_tx),
         ),
     };
     let _ = answer_tx.unwrap_or(&session.handle.answer_tx).send(answer);
@@ -946,6 +946,8 @@ fn start_event_pump(
                     scopes,
                     reason,
                 } => {
+                    let managed = SessionMailbox::tool_permission(session_id.id(), &id);
+                    let input_id = managed.as_ref().map_or(&id, |(original, _)| original);
                     let owner = AskOwner::of(&Envelope {
                         event: AgentEvent::StreamClosed,
                         subagent: subagent.clone(),
@@ -966,13 +968,14 @@ fn start_event_pump(
                     // security prompt is worse than naming none.
                     let raw_input = subagent
                         .is_none()
-                        .then(|| tool_inputs.get(&(run_id, id.clone())))
+                        .then(|| tool_inputs.get(&(run_id, input_id.clone())))
                         .flatten();
                     // A child's own tool call never reached the client, nor
                     // this cache, so its permission rides on the `task` call
                     // the client can see, only the child's channel may take the
                     // answer, and the title is all the dialog gets.
                     let request_id = id.clone();
+                    let input_id = input_id.clone();
                     let (id, title, answer_tx) = match subagent {
                         Some(info) => {
                             let parent_tool_use_id = info.spawn_row_id().to_owned();
@@ -989,7 +992,7 @@ fn start_event_pump(
                             let title = format!("{}: {scope}", info.name);
                             (parent_tool_use_id, title, Some(answer_tx))
                         }
-                        None => (id, scope, None),
+                        None => (input_id, scope, managed.map(|(_, tx)| tx)),
                     };
                     let request =
                         AgentRequest::RequestPermissionRequest(RequestPermissionRequest::new(
@@ -1148,8 +1151,8 @@ mod tests {
     use maki_agent::permissions::{PermissionCheck, PermissionError, PermissionManager};
     use maki_agent::tools::PermissionScopes;
     use maki_agent::{
-        CancelToken, DoneReason, EventSender, SessionMailbox, SubagentInfo, ToolStartEvent,
-        TurnCompleteEvent,
+        CancelToken, DoneReason, EventSender, SessionMailbox, SubagentInfo, TaskKind,
+        ToolStartEvent, TurnCompleteEvent,
     };
     use maki_config::project::TrustQuestion;
     use maki_config::{AgentConfig, Effect, ToolKey, TrustFileConfig};
@@ -1621,6 +1624,7 @@ mod tests {
             model: None,
             opts: None,
             detached: false,
+            kind: TaskKind::Agent,
             owner_cancel: None,
             spawn_tool_use_id: None,
             answer_tx,
@@ -2416,18 +2420,22 @@ mod tests {
 
     #[test]
     fn elicitation_response_forwards_the_raw_result() {
-        let (srv, answer_rx, ..) = server_with_ask(Ask::Elicitation);
+        let (reply_tx, reply_rx) = flume::unbounded();
+        let (srv, answer_rx, ..) = server_with_ask(Ask::Elicitation {
+            answer_tx: reply_tx,
+        });
         let raw = serde_json::json!({
             "id": ANSWERED_ID,
             "result": { "action": "accept", "content": { "q1": "axum" } },
         });
 
         handle_incoming_response(&srv, &raw);
-        let forwarded = answer_rx.try_recv().unwrap();
+        let forwarded = reply_rx.try_recv().unwrap();
         assert_eq!(
             serde_json::from_str::<Value>(&forwarded).unwrap(),
             raw["result"]
         );
+        assert!(answer_rx.is_empty(), "the question owns its reply channel");
     }
 
     #[test]

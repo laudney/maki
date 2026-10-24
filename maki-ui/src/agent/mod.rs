@@ -118,6 +118,10 @@ impl AgentHandles {
         self.cancels.cancel(run_id);
     }
 
+    pub(crate) fn background_tools(&self, run_id: u64) -> usize {
+        self.mailbox.background_tools(run_id)
+    }
+
     pub(crate) fn cancel_subagent(&self, tool_use_id: String) {
         self.subagent_cancels.cancel(tool_use_id);
     }
@@ -313,7 +317,7 @@ mod tests {
     use maki_agent::tools::ToolRegistry;
     use maki_agent::{
         AgentEvent, AgentInput, AgentMode, AgentSeed, CancelToken, DETACHED_RUN_ID, InputSource,
-        SubagentInfo,
+        SubagentInfo, TaskKind,
     };
     use maki_config::{PermissionsConfig, ProjectConfig};
     use maki_lua::{PluginHost, UiAction};
@@ -790,6 +794,7 @@ maki.api.create_autocmd("SessionEnd", { callback = function() maki.ui.input() en
                 model: None,
                 opts: None,
                 detached: true,
+                kind: TaskKind::Agent,
                 owner_cancel: Some(owner.clone()),
                 spawn_tool_use_id: None,
                 answer_tx: None,
@@ -828,6 +833,7 @@ maki.api.create_autocmd("SessionEnd", { callback = function() maki.ui.input() en
                         model: None,
                         opts: None,
                         detached: false,
+                        kind: TaskKind::Agent,
                         owner_cancel: Some(owner.clone()),
                         spawn_tool_use_id: None,
                         answer_tx: None,

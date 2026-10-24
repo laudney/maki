@@ -49,7 +49,7 @@ const BASH_COMMAND_FIELD: &str = "command";
 const GIT_COMMIT: &str = "git commit";
 const GH_PR_CREATE: &str = "gh pr create";
 
-const ERROR_CANCELLED: &str = "cancelled";
+pub(super) const ERROR_CANCELLED: &str = "cancelled";
 const ERROR_TIMEOUT: &str = "timeout";
 const ERROR_DENIED: &str = "permission_denied";
 const ERROR_NOT_FOUND: &str = "not_found";
@@ -193,9 +193,9 @@ pub async fn run(
     done
 }
 
-/// A file counts as seen only once its block is on an output the model reads,
-/// and the insert is what settles which of two sibling calls that found the
-/// same file in one turn carries it.
+/// A file counts as seen once its block is on an output, and the insert is
+/// what settles which of two sibling calls that found the same file in one
+/// turn carries it. An output the model never reads gives its files back.
 fn attach_call_instructions(ctx: &ToolContext, done: &mut ToolDoneEvent) {
     let found = ctx.call_instructions.take();
     if found.is_empty() {
@@ -215,9 +215,22 @@ fn attach_call_instructions(ctx: &ToolContext, done: &mut ToolDoneEvent) {
                 .contains_or_insert(PathBuf::from(&block.path))
         })
         .collect();
-    if !blocks.is_empty() {
-        *slot = Some(blocks);
+    if blocks.is_empty() {
+        return;
     }
+    if let Some(delivery) = &ctx.result_delivery {
+        let paths: Vec<_> = blocks
+            .iter()
+            .map(|block| PathBuf::from(&block.path))
+            .collect();
+        let loaded = ctx.loaded_instructions.clone();
+        delivery.on_reject(move || {
+            for path in &paths {
+                loaded.remove(path);
+            }
+        });
+    }
+    *slot = Some(blocks);
 }
 
 /// The hook installed on this registry, bound to one call. `None` when nobody
@@ -676,16 +689,7 @@ async fn run_native_tool(
     let mutated = invocation.mutable_path().map(FileKey::new);
 
     if let Some(key) = &mutated {
-        if let Some(chat) = ctx.background_for
-            && let Some(reason) = AgentSeed::background_write_block(chat)
-        {
-            warn!(
-                tool = %name,
-                %chat,
-                target = %key.as_path().display(),
-                reason = %reason,
-                "blocked background write"
-            );
+        if let Some(reason) = background_write_block(ctx, name, key) {
             return done_error(reason);
         }
         let is_plan_target = ctx
@@ -739,6 +743,9 @@ async fn run_native_tool(
     let _guard = match &mutated {
         Some(key) => {
             let guard = ctx.file_access.acquire(key).await;
+            if let Some(reason) = background_write_block(ctx, name, key) {
+                return done_error(reason);
+            }
             if ctx.config.stale_read_check
                 && let Err(message) = ctx.file_access.check_before_edit(key)
             {
@@ -791,6 +798,26 @@ async fn run_native_tool(
             done_error(message)
         }
     }
+}
+
+/// A write from work that runs for a chat in the background, refused while
+/// that chat plans. A call can move to the background while it waits for a
+/// prompt or a file lock, so the gate runs again once the lock is held.
+fn background_write_block(ctx: &ToolContext, name: &str, key: &FileKey) -> Option<String> {
+    let chat = ctx.background_for.or_else(|| {
+        ctx.running_tool
+            .as_ref()
+            .and_then(crate::RunningTool::background_session)
+    })?;
+    let reason = AgentSeed::background_write_block(chat)?;
+    warn!(
+        tool = %name,
+        %chat,
+        target = %key.as_path().display(),
+        reason = %reason,
+        "blocked background write"
+    );
+    Some(reason)
 }
 
 /// Header summary and body format of a call the registry cannot describe
@@ -1093,6 +1120,11 @@ pub(super) async fn process_tool_calls(
         .tool_uses()
         .map(|(id, name, input)| (id.to_owned(), name.to_owned(), input.clone()))
         .collect();
+    let order: HashMap<_, _> = tool_uses
+        .iter()
+        .enumerate()
+        .map(|(index, (id, _, _))| (id.clone(), index))
+        .collect();
 
     history.push(response.message);
 
@@ -1117,6 +1149,35 @@ pub(super) async fn process_tool_calls(
 
     for err in &immediate_errors {
         event_tx.try_send(AgentEvent::ToolDone(Box::new(err.clone())));
+    }
+
+    let mut deliveries = Vec::new();
+    if let Some(managed) = super::managed_tools::execute(&runnable, ctx).await {
+        let mut submitted = Vec::new();
+        let mut results = Vec::new();
+        for result in managed {
+            if !result.promoted {
+                submitted.push(result.done.clone());
+            }
+            if let Some(delivery) = result.delivery {
+                deliveries.push(delivery);
+            }
+            results.push(result.done);
+        }
+        submitted.extend(immediate_errors.iter().cloned());
+        results.extend(immediate_errors);
+        submitted.sort_by_key(|done| order.get(&done.id));
+        results.sort_by_key(|done| order.get(&done.id));
+        history.push(crate::types::tool_results(results));
+        for delivery in deliveries {
+            delivery.accept();
+        }
+        if !submitted.is_empty() {
+            event_tx.send(AgentEvent::ToolResultsSubmitted {
+                message: Box::new(crate::types::tool_results(submitted)),
+            })?;
+        }
+        return Ok(());
     }
 
     let mut set = TaskSet::new();
@@ -1152,6 +1213,7 @@ pub(super) async fn process_tool_calls(
 
     let mut all_results = results;
     all_results.extend(immediate_errors);
+    all_results.sort_by_key(|done| order.get(&done.id));
     let tool_msg = crate::types::tool_results(all_results);
     event_tx.send(AgentEvent::ToolResultsSubmitted {
         message: Box::new(tool_msg.clone()),
@@ -1248,6 +1310,7 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
+    use crate::ResultDelivery;
     use crate::cancel::CancelToken;
     use crate::live_session::{BACKGROUND_PLAN_WRITE_DENIED, SessionMailbox};
     use crate::mcp::test_support::stub_session;
@@ -2333,34 +2396,83 @@ mod tests {
         });
     }
 
-    #[test]
-    fn sibling_model_calls_carry_a_found_file_once() {
-        smol::block_on(async {
-            let mut ctx = stub_ctx(&AgentMode::Build);
-            ctx.local_tools = Arc::new(HashMap::from([(
-                INSTRUCTED_TOOL.to_owned(),
-                local_tool(ToolAudience::all(), |_, ctx| {
-                    Box::pin(async move {
-                        ctx.call_instructions.record(vec![InstructionBlock {
-                            path: INSTRUCTION_PATH.into(),
-                            content: INSTRUCTION_CONTENT.into(),
-                        }]);
-                        Ok(CHILD_TEXT.into())
-                    })
-                }),
-            )]));
-            let sibling = |ctx: &ToolContext| ToolContext {
-                call_instructions: CallInstructions::default(),
-                ..ctx.clone()
-            };
+    fn instructed_ctx() -> ToolContext {
+        let mut ctx = stub_ctx(&AgentMode::Build);
+        ctx.local_tools = Arc::new(HashMap::from([(
+            INSTRUCTED_TOOL.to_owned(),
+            local_tool(ToolAudience::all(), |_, ctx| {
+                Box::pin(async move {
+                    ctx.call_instructions.record(vec![InstructionBlock {
+                        path: INSTRUCTION_PATH.into(),
+                        content: INSTRUCTION_CONTENT.into(),
+                    }]);
+                    Ok(CHILD_TEXT.into())
+                })
+            }),
+        )]));
+        ctx
+    }
 
-            let first = dispatch(&sibling(&ctx), INSTRUCTED_TOOL, &serde_json::json!({})).await;
-            let second = dispatch(&sibling(&ctx), INSTRUCTED_TOOL, &serde_json::json!({})).await;
+    fn sibling(ctx: &ToolContext, delivery: Option<&ResultDelivery>) -> ToolContext {
+        ToolContext {
+            call_instructions: CallInstructions::default(),
+            result_delivery: delivery.cloned(),
+            ..ctx.clone()
+        }
+    }
+
+    #[test_case(false; "unmanaged")]
+    #[test_case(true; "managed_delivery")]
+    fn sibling_model_calls_carry_a_found_file_once(managed: bool) {
+        smol::block_on(async {
+            let ctx = instructed_ctx();
+            let deliveries = [ResultDelivery::default(), ResultDelivery::default()];
+            let delivery = |index: usize| managed.then(|| &deliveries[index]);
+            let first = dispatch(
+                &sibling(&ctx, delivery(0)),
+                INSTRUCTED_TOOL,
+                &serde_json::json!({}),
+            )
+            .await;
+            let second = dispatch(
+                &sibling(&ctx, delivery(1)),
+                INSTRUCTED_TOOL,
+                &serde_json::json!({}),
+            )
+            .await;
             assert_eq!(first.output.instructions().map(<[_]>::len), Some(1));
             assert!(
                 second.output.instructions().is_none(),
                 "both found the file before either was marked; only the first attaches"
             );
+        });
+    }
+
+    #[test_case(true, false; "accepted_output_keeps_the_file")]
+    #[test_case(false, true; "rejected_output_gives_the_file_back")]
+    fn a_managed_output_keeps_its_file_only_once_accepted(accepted: bool, attached_again: bool) {
+        smol::block_on(async {
+            let ctx = instructed_ctx();
+            let delivery = ResultDelivery::default();
+            let first = dispatch(
+                &sibling(&ctx, Some(&delivery)),
+                INSTRUCTED_TOOL,
+                &serde_json::json!({}),
+            )
+            .await;
+            assert_eq!(first.output.instructions().map(<[_]>::len), Some(1));
+            if accepted {
+                delivery.accept();
+            } else {
+                delivery.reject();
+            }
+            let later = dispatch(
+                &sibling(&ctx, None),
+                INSTRUCTED_TOOL,
+                &serde_json::json!({}),
+            )
+            .await;
+            assert_eq!(later.output.instructions().is_some(), attached_again);
         });
     }
 

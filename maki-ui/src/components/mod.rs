@@ -213,6 +213,9 @@ pub enum Action {
     CancelAgent {
         run_id: u64,
     },
+    BackgroundTools {
+        run_id: u64,
+    },
     CancelSubagent {
         tool_use_id: String,
     },

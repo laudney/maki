@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::future::Future;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::Path;
@@ -8,20 +9,22 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use maki_agent::live_session::BACKGROUND_PLAN_WRITE_DENIED;
+use maki_agent::permissions::{PermissionAnswer, PermissionManager, TaggedAnswer};
 use maki_agent::template::Vars;
 use maki_agent::tools::test_support::stub_seed;
 use maki_agent::tools::{
-    DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError, Tool, ToolAudience,
-    ToolContext, ToolExecResult, ToolFilter, ToolInvocation, ToolLive, ToolReach, ToolRegistry,
-    ToolSource, timeout_annotation,
+    DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError, RequestTools, Tool,
+    ToolAudience, ToolContext, ToolExecResult, ToolFilter, ToolInvocation, ToolLive, ToolReach,
+    ToolRegistry, ToolSource, timeout_annotation,
 };
 use maki_agent::{
-    AgentEvent, AgentMode, AgentSeed, CancelToken, ModelSlot, SessionMailbox, ToolOutput,
-    TurnCompleteEvent,
+    Agent, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, AgentSeed, CancelToken,
+    DETACHED_RUN_ID, EventSender, History, InputSource, ModelSlot, RunContext, RunContextBuilder,
+    SessionDefaults, SessionMailbox, ToolOutput, TurnCompleteEvent,
 };
 use maki_config::{
-    AlwaysThinking, EDIT_SUB_TOOLS, Effect, FILE_WRITE_TOOLS, Permission, PluginsConfig,
-    ThinkingLines, ToolKey, ToolOutputLines,
+    AlwaysThinking, DefaultEffect, EDIT_SUB_TOOLS, Effect, FILE_WRITE_TOOLS, Permission,
+    PermissionsConfig, PluginsConfig, ProjectConfig, ThinkingLines, ToolKey, ToolOutputLines,
 };
 use maki_lua::{
     InitFiles, Interaction, KEY_WARNING, MAX_INFLIGHT_TOOLS, Missing, NO_UI_ERR,
@@ -29,6 +32,7 @@ use maki_lua::{
     SKIPPED_PLUGIN_WARNING, SessionEndReason, UiAction, WARM_TOOL_CAP, set_allowed_private_hosts,
 };
 use maki_providers::provider::{BoxFuture, Provider};
+use maki_providers::tokens::ContextGauge;
 use maki_providers::{
     AgentError, ContentBlock, Message, Model, ModelInfo, ProviderEvent, RequestOptions, Role,
     StopReason, StreamResponse, ThinkingConfig, TokenUsage,
@@ -37,6 +41,7 @@ use maki_storage::id::{MakiId, SessionRef};
 #[cfg(unix)]
 use rustix::process::{Pid, test_kill_process_group};
 use serde_json::{Value, json};
+use smol::io::{AsyncReadExt, AsyncWriteExt};
 
 const BUILTIN_COMMANDS: &[&str] = &["/sessions", "/rename", "/tasks"];
 const NARGS_ERR: &str = r#"'nargs' must be 0, 1, "?", "*", or "+""#;
@@ -8351,6 +8356,585 @@ fn tool_result_text(request: &[Message]) -> &str {
             _ => None,
         })
         .expect("the second request must carry the write's result")
+}
+
+const PROMOTED_JOB_TOOL: &str = "promoted_job";
+const PROMOTED_JOB_STATE: &str = "promoted_job_state";
+const PROMOTED_JOB_OUTPUT: &str = "managed process completed";
+const PROMOTED_JOB_PENDING: &str = "1:0";
+const PROMOTED_JOB_FINISHED: &str = "1:1";
+const PROMOTED_JOB_RUN: u64 = 41;
+const PROMOTED_JOB_SOURCE: &str = r#"
+local starts, finishes = 0, 0
+local schema = {
+    type = "object",
+    properties = { host = { type = "string" }, port = { type = "integer" } },
+    required = { "host", "port" },
+    additionalProperties = false,
+}
+maki.api.register_tool({
+    name = "promoted_process",
+    description = "runs a managed process until the test releases it",
+    schema = schema,
+    audiences = { "main" },
+    handler = function(input, ctx)
+        starts = starts + 1
+        local output = {}
+        maki.fn.jobstart({ "python3", "-u", "-c", [[
+import socket, sys
+with socket.create_connection((sys.argv[1], int(sys.argv[2]))) as connection:
+    connection.sendall(b"S")
+    assert connection.recv(1) == b"R"
+    print("managed process completed", flush=True)
+]], input.host, tostring(input.port) }, {
+            on_stdout = function(_, line) output[#output + 1] = line end,
+            on_exit = function(_, code)
+                ctx:finish({ llm_output = table.concat(output, "\n"), is_error = code ~= 0 })
+            end,
+        })
+    end,
+})
+maki.api.register_tool({
+    name = "promoted_job",
+    description = "wraps a managed process and waits for its actual child reply",
+    schema = schema,
+    audiences = { "main" },
+    handler = function(input, ctx)
+        local output, err = maki.agent.call_tool(ctx, "promoted_process", input)
+        finishes = finishes + 1
+        return { llm_output = output or err, is_error = err ~= nil }
+    end,
+})
+maki.api.register_tool({
+    name = "promoted_job_state",
+    description = "reports managed invocation and completion counts",
+    schema = { type = "object", properties = {}, additionalProperties = false },
+    audiences = { "main" },
+    handler = function()
+        return starts .. ":" .. finishes
+    end,
+})
+"#;
+
+async fn promotion_deadline<T>(future: impl Future<Output = T>) -> T {
+    futures_lite::future::or(future, async {
+        smol::Timer::after(CANCEL_TEST_TIMEOUT).await;
+        panic!("managed tool promotion did not settle");
+    })
+    .await
+}
+
+async fn promoted_job_state(reg: &Arc<ToolRegistry>) -> String {
+    let reg = Arc::clone(reg);
+    smol::unblock(move || exec_tool(&reg, PROMOTED_JOB_STATE, json!({})))
+        .await
+        .unwrap()
+}
+
+fn promotion_context(reg: &Arc<ToolRegistry>) -> RunContextBuilder {
+    let registry = Arc::clone(reg);
+    Arc::new(move |model, workflow| {
+        RunContext::fixed(
+            String::new(),
+            RequestTools::build(
+                &registry,
+                &Vars::new(),
+                model,
+                &Default::default(),
+                &[],
+                workflow,
+                false,
+            ),
+        )
+    })
+}
+
+fn promotion_params(
+    reg: &Arc<ToolRegistry>,
+    mailbox: &SessionMailbox,
+    provider: Arc<dyn Provider>,
+) -> AgentParams {
+    let ctx = maki_agent::tools::test_support::stub_ctx(&AgentMode::Build);
+    AgentParams {
+        provider,
+        model: (*ctx.model).clone(),
+        config: ctx.config,
+        tool_output_lines: ctx.tool_output_lines,
+        permissions: ctx.permissions,
+        session_id: Some(mailbox.session_id().into()),
+        background_for: None,
+        running_tool: None,
+        task_id: None,
+        mailbox: Some(mailbox.clone()),
+        timeouts: ctx.timeouts,
+        file_access: ctx.file_access,
+        prompt_slots: ctx.prompt_slots,
+        subagent_cancels: ctx.subagent_cancels,
+        ledger: ctx.ledger,
+        registry: Arc::clone(reg),
+        audience: ToolAudience::MAIN,
+        model_policy: ctx.model_policy,
+    }
+}
+
+enum PromotedJobEnd {
+    Accept,
+    CancelRunning,
+    CancelCompletion,
+}
+
+#[test_case::test_case(PromotedJobEnd::Accept; "completion_is_delivered_after_receipt")]
+#[test_case::test_case(PromotedJobEnd::CancelRunning; "generation_teardown_kills_the_process")]
+#[test_case::test_case(PromotedJobEnd::CancelCompletion; "unaccepted_completion_is_rejected")]
+fn a_promoted_lua_tool_keeps_its_running_process(end: PromotedJobEnd) {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source(PROMOTED_JOB_TOOL, PROMOTED_JOB_SOURCE)
+        .unwrap();
+    let session = MakiId::generate();
+    let mailbox = SessionMailbox::register(session);
+    let (generation_owner, generation) = CancelToken::new();
+    mailbox.publish_generation(generation.clone());
+    let (foreground_owner, foreground) = CancelToken::new();
+    let (requests_tx, requests) = flume::unbounded();
+    let (events_tx, _events) = flume::unbounded();
+    let event_tx =
+        EventSender::new(events_tx, PROMOTED_JOB_RUN).with_owner_cancel(generation.clone());
+    let context = promotion_context(&reg);
+
+    smol::block_on(promotion_deadline(async {
+        let listener = smol::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let params = promotion_params(
+            &reg,
+            &mailbox,
+            Arc::new(CallOnce {
+                tool: PROMOTED_JOB_TOOL,
+                input: json!({ "host": address.ip().to_string(), "port": address.port() }),
+                asked: AtomicBool::new(false),
+                requests: requests_tx,
+            }),
+        );
+        let first_context = Arc::clone(&context);
+        let first_events = event_tx.clone();
+        let running = smol::spawn(async move {
+            let mut history = History::new(Vec::new());
+            let mut gauge = ContextGauge::default();
+            let result = Agent::new(
+                params.clone(),
+                AgentRunParams {
+                    history: &mut history,
+                    gauge: &mut gauge,
+                    event_tx: first_events,
+                    context: first_context,
+                },
+            )
+            .with_cancel(foreground)
+            .run(AgentInput::from_defaults(
+                "start the managed process".into(),
+                AgentMode::Build,
+                Vec::new(),
+                SessionDefaults::default(),
+                InputSource::Tui,
+            ))
+            .await;
+            (result, params, history, gauge)
+        });
+        let (mut process, _) = listener.accept().await.unwrap();
+        let mut started = [0];
+        process.read_exact(&mut started).await.unwrap();
+        assert_eq!(&started, b"S");
+        assert_eq!(mailbox.background_tools(PROMOTED_JOB_RUN), 1);
+        assert_eq!(mailbox.background_tools(PROMOTED_JOB_RUN), 0);
+
+        let (result, params, mut history, mut gauge) = running.await;
+        assert!(result.is_ok(), "the foreground must continue: {result:?}");
+        requests.recv_async().await.unwrap();
+        let receipt_request = requests.recv_async().await.unwrap();
+        assert!(tool_result_text(&receipt_request).contains("background"));
+        assert_eq!(
+            promoted_job_state(&reg).await,
+            PROMOTED_JOB_PENDING,
+            "a receipt must not restart the handler"
+        );
+        foreground_owner.cancel();
+        let wake = mailbox.wake_listener();
+        if matches!(end, PromotedJobEnd::CancelRunning) {
+            generation_owner.cancel();
+            assert_eq!(process.read(&mut started).await.unwrap(), 0);
+            assert!(mailbox.drain().is_empty());
+            return;
+        }
+        process.write_all(b"R").await.unwrap();
+        assert_eq!(process.read(&mut started).await.unwrap(), 0);
+        wake.await;
+        assert_eq!(promoted_job_state(&reg).await, PROMOTED_JOB_FINISHED);
+        if matches!(end, PromotedJobEnd::CancelCompletion) {
+            let held_completion = mailbox.claim_wake();
+            assert_eq!(held_completion.len(), 1);
+            generation_owner.cancel();
+            drop(held_completion);
+            assert!(mailbox.drain().is_empty());
+            return;
+        }
+        let result = Agent::new(
+            params,
+            AgentRunParams {
+                history: &mut history,
+                gauge: &mut gauge,
+                event_tx: event_tx.with_run_id(PROMOTED_JOB_RUN + 1),
+                context,
+            },
+        )
+        .run(AgentInput::from_defaults(
+            "read the completed process".into(),
+            AgentMode::Build,
+            Vec::new(),
+            SessionDefaults::default(),
+            InputSource::Tui,
+        ))
+        .await;
+        assert!(
+            result.is_ok(),
+            "the completion must be accepted: {result:?}"
+        );
+        let completed_request = requests.recv_async().await.unwrap();
+        assert!(completed_request.iter().any(|message| {
+            message
+                .first_text_content()
+                .is_some_and(|text| text.contains(PROMOTED_JOB_OUTPUT))
+        }));
+    }));
+}
+
+const PROMOTED_SESSION_PLUGIN: &str = "promoted_sessions";
+const PROMOTED_SESSION_ROOT: &str = "promoted_session_root";
+const PROMOTED_SESSION_CHILD: &str = "promoted_session_child";
+const PROMOTED_SESSION_NESTED: &str = "promoted_session_nested";
+const PROMOTED_SESSION_GRANDCHILD: &str = "promoted_session_grandchild";
+const PROMOTED_SESSION_GUARD: &str = "promoted_session_guard";
+const PROMOTED_SESSION_SCOPE: &str = "managed-session-command";
+const PROMOTED_SESSION_OUTPUT: &str = "permitted nested session output";
+const PROMOTED_SESSION_DONE: &str = "nested session completed";
+const PROMOTED_SESSION_DELTA: &str = "grandchild resumed after promotion";
+const PROMOTED_SESSION_NEXT: &str = "run another foreground turn";
+const PROMOTED_SESSION_SOURCE: &str = r#"
+local empty_schema = { type = "object", properties = {}, additionalProperties = false }
+local guarded_schema = {
+    type = "object",
+    properties = { command = { type = "string" } },
+    required = { "command" },
+    additionalProperties = false,
+}
+local function open(ctx, name, tool, background)
+    local tools = {
+        { name = "promoted_session_guard", description = "permission-gated command", input_schema = guarded_schema },
+    }
+    if tool ~= "promoted_session_guard" then
+        tools[#tools + 1] = { name = tool, description = "nested session", input_schema = empty_schema }
+    end
+    return assert(maki.agent.session(ctx, {
+        system = name, name = name, tools = tools, background = background,
+    }))
+end
+local function finish(session)
+    local result, err = session:prompt("run the nested work")
+    session:close()
+    if err then return { llm_output = err, is_error = true } end
+    return result.text
+end
+maki.api.register_tool({
+    name = "promoted_session_root",
+    description = "waits for a child session and its grandchild",
+    schema = {
+        type = "object",
+        properties = { background = { type = "boolean" } },
+        required = { "background" },
+        additionalProperties = false,
+    },
+    audiences = { "main" },
+    handler = function(input, ctx)
+        local session = open(ctx, "promoted_session_child", "promoted_session_nested", input.background)
+        if input.background then
+            maki.async.spawn(function() finish(session) end)
+            return "independent session launched"
+        end
+        return finish(session)
+    end,
+})
+maki.api.register_tool({
+    name = "promoted_session_nested",
+    description = "waits for the permission-gated grandchild session",
+    schema = empty_schema,
+    audiences = { "general_sub" },
+    handler = function(_, ctx)
+        return finish(open(ctx, "promoted_session_grandchild", "promoted_session_guard", false))
+    end,
+})
+maki.api.register_tool({
+    name = "promoted_session_guard",
+    description = "runs only after the grandchild receives its own permission reply",
+    schema = guarded_schema,
+    audiences = { "general_sub" },
+    permission = "run",
+    permission_scopes = "command",
+    handler = function() return "permitted nested session output" end,
+})
+"#;
+
+struct PromotedSessionProvider {
+    background: bool,
+    child_started: flume::Sender<()>,
+    child_release: flume::Receiver<()>,
+    main_started: flume::Sender<()>,
+    main_release: flume::Receiver<()>,
+}
+
+impl Provider for PromotedSessionProvider {
+    fn stream_message<'a>(
+        &'a self,
+        _: &'a Model,
+        messages: &'a [Message],
+        system: &'a str,
+        _: &'a Value,
+        events: &'a flume::Sender<ProviderEvent>,
+        _: RequestOptions,
+        _: Option<&'a SessionRef>,
+    ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+        Box::pin(async move {
+            let tool = match system {
+                PROMOTED_SESSION_CHILD => PROMOTED_SESSION_NESTED,
+                PROMOTED_SESSION_GRANDCHILD => PROMOTED_SESSION_GUARD,
+                _ => PROMOTED_SESSION_ROOT,
+            };
+            let already_called = messages
+                .iter()
+                .flat_map(Message::tool_uses)
+                .any(|(_, name, _)| name == tool);
+            let (block, stop) = if already_called {
+                if system == PROMOTED_SESSION_GRANDCHILD {
+                    assert!(messages.iter().flat_map(|message| &message.content).any(|block| {
+                        matches!(block, ContentBlock::ToolResult { content, is_error: false, .. } if content == PROMOTED_SESSION_OUTPUT)
+                    }));
+                } else if messages.last().and_then(Message::user_text)
+                    == Some(PROMOTED_SESSION_NEXT)
+                {
+                    self.main_started.send_async(()).await.unwrap();
+                    self.main_release.recv_async().await.unwrap();
+                }
+                (
+                    ContentBlock::Text {
+                        text: PROMOTED_SESSION_DONE.into(),
+                    },
+                    StopReason::EndTurn,
+                )
+            } else {
+                if system == PROMOTED_SESSION_GRANDCHILD {
+                    self.child_started.send_async(()).await.unwrap();
+                    self.child_release.recv_async().await.unwrap();
+                    events
+                        .send_async(ProviderEvent::TextDelta {
+                            text: PROMOTED_SESSION_DELTA.into(),
+                        })
+                        .await
+                        .unwrap();
+                }
+                let input = if tool == PROMOTED_SESSION_GUARD {
+                    json!({ "command": PROMOTED_SESSION_SCOPE })
+                } else if tool == PROMOTED_SESSION_ROOT {
+                    json!({ "background": self.background })
+                } else {
+                    json!({})
+                };
+                (
+                    ContentBlock::tool_use(tool, tool, input),
+                    StopReason::ToolUse,
+                )
+            };
+            Ok(StreamResponse {
+                message: Message {
+                    role: Role::Assistant,
+                    content: vec![block],
+                    ..Default::default()
+                },
+                stop_reason: Some(stop),
+                ..Default::default()
+            })
+        })
+    }
+
+    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+}
+
+#[test_case::test_case(false; "promoted_blocking_sessions")]
+#[test_case::test_case(true; "independent_background_sessions")]
+fn promoted_lua_sessions_keep_nested_events_and_permission_replies(background: bool) {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source(PROMOTED_SESSION_PLUGIN, PROMOTED_SESSION_SOURCE)
+        .unwrap();
+    let mailbox = SessionMailbox::register(MakiId::generate());
+    let (_generation_owner, generation) = CancelToken::new();
+    mailbox.publish_generation(generation.clone());
+    let (event_tx, events) = flume::unbounded();
+    let event_tx = EventSender::new(event_tx, PROMOTED_JOB_RUN).with_owner_cancel(generation);
+    let (answers, answer_rx) = flume::unbounded();
+    let answer_rx = Arc::new(smol::lock::Mutex::new(answer_rx));
+    let (child_started_tx, child_started) = flume::bounded(1);
+    let (child_release, child_release_rx) = flume::bounded(1);
+    let (main_started_tx, main_started) = flume::bounded(1);
+    let (main_release, main_release_rx) = flume::bounded(1);
+    let mut params = promotion_params(
+        &reg,
+        &mailbox,
+        Arc::new(PromotedSessionProvider {
+            background,
+            child_started: child_started_tx,
+            child_release: child_release_rx,
+            main_started: main_started_tx,
+            main_release: main_release_rx,
+        }),
+    );
+    let cwd = tempfile::tempdir().unwrap();
+    params.permissions = Arc::new(PermissionManager::new(
+        PermissionsConfig {
+            default: DefaultEffect::Prompt,
+            ..Default::default()
+        },
+        cwd.path().to_owned(),
+        ProjectConfig::discover(cwd.path()),
+        host.plugin_rules(),
+    ));
+    let context = promotion_context(&reg);
+    smol::block_on(promotion_deadline(async {
+        let first_params = params.clone();
+        let first_context = Arc::clone(&context);
+        let first_events = event_tx.clone();
+        let first_answers = Arc::clone(&answer_rx);
+        let foreground = smol::spawn(async move {
+            let mut history = History::new(Vec::new());
+            let mut gauge = ContextGauge::default();
+            let result = Agent::new(
+                first_params,
+                AgentRunParams {
+                    history: &mut history,
+                    gauge: &mut gauge,
+                    event_tx: first_events,
+                    context: first_context,
+                },
+            )
+            .with_user_response_rx(first_answers)
+            .run(AgentInput::from_defaults(
+                "delegate to the nested sessions".into(),
+                AgentMode::Build,
+                Vec::new(),
+                SessionDefaults::default(),
+                InputSource::Tui,
+            ))
+            .await;
+            (result, history, gauge)
+        });
+        child_started.recv_async().await.unwrap();
+        if !background {
+            assert_eq!(mailbox.background_tools(PROMOTED_JOB_RUN), 1);
+        }
+        let (result, mut history, mut gauge) = foreground.await;
+        assert!(
+            result.is_ok(),
+            "the promoted wrapper must release its run: {result:?}"
+        );
+        let next_events = event_tx.with_run_id(PROMOTED_JOB_RUN + 1);
+        let next_run = smol::spawn(async move {
+            Agent::new(
+                params,
+                AgentRunParams {
+                    history: &mut history,
+                    gauge: &mut gauge,
+                    event_tx: next_events,
+                    context,
+                },
+            )
+            .with_user_response_rx(answer_rx)
+            .run(AgentInput::from_defaults(
+                PROMOTED_SESSION_NEXT.into(),
+                AgentMode::Build,
+                Vec::new(),
+                SessionDefaults::default(),
+                InputSource::Tui,
+            ))
+            .await
+        });
+        main_started.recv_async().await.unwrap();
+        child_release.send_async(()).await.unwrap();
+        let mut saw_delta = false;
+        let ask = loop {
+            let envelope = events.recv_async().await.unwrap();
+            if matches!(&envelope.event, AgentEvent::TextDelta { text } if text == PROMOTED_SESSION_DELTA)
+            {
+                assert_eq!(envelope.run_id, DETACHED_RUN_ID);
+                let info = envelope.subagent.as_ref().unwrap();
+                assert_eq!(info.name, PROMOTED_SESSION_GRANDCHILD);
+                assert!(info.detached);
+                saw_delta = true;
+            }
+            if matches!(&envelope.event, AgentEvent::PermissionRequest { tool, .. } if tool == &ToolKey::native(PROMOTED_SESSION_GUARD))
+            {
+                break envelope;
+            }
+        };
+        assert!(
+            saw_delta,
+            "the actual grandchild stream must arrive before its permission ask"
+        );
+        assert_eq!(ask.run_id, DETACHED_RUN_ID);
+        let info = ask.subagent.as_ref().unwrap();
+        assert_eq!(info.name, PROMOTED_SESSION_GRANDCHILD);
+        assert!(info.detached);
+        let AgentEvent::PermissionRequest { id, scopes, .. } = ask.event else {
+            unreachable!()
+        };
+        assert_eq!(scopes, vec![PROMOTED_SESSION_SCOPE]);
+        let reply = TaggedAnswer::new(&id, PermissionAnswer::AllowOnce).encode();
+        if background {
+            info.answer_tx.as_ref().unwrap().send(reply).unwrap();
+        } else {
+            assert!(SessionMailbox::reply_tool(mailbox.session_id(), &reply));
+        }
+        let mut saw_result = false;
+        loop {
+            let envelope = events.recv_async().await.unwrap();
+            if let AgentEvent::ToolDone(done) = &envelope.event
+                && done.tool.as_ref() == PROMOTED_SESSION_GUARD
+            {
+                assert_eq!(envelope.run_id, DETACHED_RUN_ID);
+                assert_eq!(done.output.as_text(), PROMOTED_SESSION_OUTPUT);
+                assert!(!done.is_error);
+                saw_result = true;
+            }
+            if matches!(&envelope.event, AgentEvent::SubagentHistory { .. })
+                && envelope
+                    .subagent
+                    .as_ref()
+                    .is_some_and(|info| info.name == PROMOTED_SESSION_CHILD)
+            {
+                assert!(
+                    saw_result,
+                    "child history must follow the grandchild's actual result"
+                );
+                assert_eq!(envelope.run_id, DETACHED_RUN_ID);
+                break;
+            }
+        }
+        assert!(
+            answers.is_empty(),
+            "the next foreground run must not receive the child's reply"
+        );
+        main_release.send_async(()).await.unwrap();
+        assert!(next_run.await.is_ok());
+    }));
+    host.unload(PROMOTED_SESSION_PLUGIN).unwrap();
 }
 
 /// Plan mode used to reach background sessions as is. The plan prompt landed in

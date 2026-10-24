@@ -369,6 +369,8 @@ pub struct ToolContext {
     /// caller (`maki.agent.call_tool`). Never inherited: `to_tool_context`
     /// clears it, and each caller sets it for its own call only.
     pub live_sink: Option<flume::Sender<ToolLive>>,
+    pub result_delivery: Option<crate::ResultDelivery>,
+    pub running_tool: Option<crate::RunningTool>,
     pub model_policy: Arc<ModelPolicy>,
 }
 
@@ -594,6 +596,8 @@ pub fn interpreter_ctx(
         prompt_slots: Arc::new(ResolvedPrompts::default()),
         opts: RequestOptions::default(),
         subagent_cancels: Arc::new(CancelMap::new()),
+        result_delivery: None,
+        running_tool: None,
         ledger: Arc::default(),
         registry,
         workflow: false,

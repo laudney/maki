@@ -16,8 +16,8 @@ use crate::selection::{DocPos, RowPos, Selection};
 use maki_agent::tools::{MAIN_TASK_ID, ToolInvocation, ToolRegistry, WRITE_TOOL_NAME};
 use maki_agent::types::ALLOWED_BY;
 use maki_agent::{
-    AgentEvent, BufferSnapshot, DisplayItem, SteerKind, SubagentInbox, ToolDoneEvent, ToolOutput,
-    ToolStartEvent, display_order,
+    AgentEvent, BufferSnapshot, DisplayItem, SteerKind, SubagentInbox, TaskKind, ToolDoneEvent,
+    ToolOutput, ToolStartEvent, display_order,
 };
 use maki_config::{ToolKey, ToolOutputLines, UiConfig};
 use maki_lua::{LuaCommandInfo, WinView};
@@ -60,9 +60,8 @@ pub enum ChatEventResult {
 
 pub struct Chat {
     pub name: String,
-    /// The plugin that opened this task with `maki.agent.session`. A tool task
-    /// has none: it lives for one turn of the main chat and is swept with it,
-    /// while a plugin task answers only to its plugin and to Esc in its tab.
+    /// The plugin that opened this task with `maki.agent.session`. Plugin
+    /// sessions keep their own lifecycle across the main chat's turns.
     pub(crate) plugin: Option<Arc<str>>,
     /// A plugin task between prompts: its run ended, its session did not.
     pub(crate) idle: bool,
@@ -80,9 +79,9 @@ pub struct Chat {
     pub(crate) inbox: Option<Arc<SubagentInbox>>,
     /// Parked while another chat is in front, see `App::set_active_chat`.
     pub(crate) draft: Submission,
-    /// True for a background subagent: one that outlives the tool call and the
-    /// turn that spawned it, so this chat is not turn-scoped.
-    pub agent: bool,
+    /// Session-owned work keeps its routing and input after the main turn ends.
+    pub detached: bool,
+    pub kind: TaskKind,
     pending_turn_usage: Option<String>,
     messages_panel: MessagesPanel,
     /// The ending and the index of the bubble announcing it, so a later, better
@@ -114,7 +113,8 @@ impl Chat {
             opts: None,
             inbox: None,
             draft: Submission::default(),
-            agent: false,
+            detached: false,
+            kind: TaskKind::Agent,
             pending_turn_usage: None,
             messages_panel,
             finish: None,
@@ -174,6 +174,7 @@ impl Chat {
             AgentEvent::ToolOutput { id, content } => {
                 self.messages_panel.tool_output(&id, &content)
             }
+            AgentEvent::ToolBackgrounded(e) => self.messages_panel.tool_done(*e),
             AgentEvent::ToolDone(e) => {
                 let plan_write = plan_path.filter(|pp| e.wrote_to(pp));
                 let is_full_write = &*e.tool == WRITE_TOOL_NAME;

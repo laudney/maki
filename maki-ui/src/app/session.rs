@@ -180,7 +180,8 @@ impl App {
                     fast: chat.opts.is_some_and(|o| o.fast),
                     plugin: chat.plugin.clone(),
                     cost: chat.cost,
-                    detached: chat.agent,
+                    detached: chat.detached,
+                    kind: chat.kind,
                 })
             })
             .collect();
@@ -291,7 +292,8 @@ impl App {
             chat.plugin = sa.plugin;
             chat.cost = sa.cost;
             chat.model_id = sa.model;
-            chat.agent = sa.detached;
+            chat.detached = sa.detached;
+            chat.kind = sa.kind;
             chat.opts = sa.thinking.map(|thinking| RequestOptions {
                 thinking: thinking.into(),
                 fast: sa.fast,

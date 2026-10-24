@@ -37,7 +37,9 @@ impl Shared {
 #[derive(Clone)]
 pub struct CancelToken(Arc<Shared>);
 
-pub struct CancelTrigger(Arc<Shared>);
+/// `None` once released: it no longer fires, and its token ends only with
+/// its parent.
+pub struct CancelTrigger(Option<Arc<Shared>>);
 
 impl Debug for CancelToken {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
@@ -50,7 +52,7 @@ impl Debug for CancelToken {
 impl CancelToken {
     pub fn new() -> (CancelTrigger, Self) {
         let shared = Arc::<Shared>::default();
-        (CancelTrigger(Arc::clone(&shared)), Self(shared))
+        (CancelTrigger(Some(Arc::clone(&shared))), Self(shared))
     }
 
     pub fn none() -> Self {
@@ -107,20 +109,30 @@ impl CancelToken {
 
 impl CancelTrigger {
     pub fn cancel(self) {
-        self.0.fire();
+        drop(self);
+    }
+
+    /// Drops the trigger without firing, for work that ended on its own: what
+    /// it left running, like a late render, goes on until the parent ends.
+    pub fn release(mut self) {
+        self.0 = None;
     }
 
     /// Whether dropping this trigger is what fires {token}. A registry keeps
     /// the triggers and hands out the tokens, so this is how an owner finds its
     /// own row again without an id that somebody else could reuse.
     pub fn fires(&self, token: &CancelToken) -> bool {
-        Arc::ptr_eq(&self.0, &token.0)
+        self.0
+            .as_ref()
+            .is_some_and(|shared| Arc::ptr_eq(shared, &token.0))
     }
 }
 
 impl Drop for CancelTrigger {
     fn drop(&mut self) {
-        self.0.fire();
+        if let Some(shared) = &self.0 {
+            shared.fire();
+        }
     }
 }
 
@@ -202,16 +214,32 @@ impl<K: Eq + std::hash::Hash> CancelMap<K> {
     /// Retires one registration and drops its trigger. Siblings and the id's
     /// cancelled mark stay.
     pub fn retire(&self, id: &K, slot: CancelSlot) {
-        let mut map = self.lock();
-        let Some(entry) = map.get_mut(id) else {
-            return;
-        };
-        for registrations in [&mut entry.registrations, &mut entry.detached] {
-            registrations.retain(|&(registered, _)| registered != slot);
+        drop(self.take(id, slot));
+    }
+
+    /// [`retire`](Self::retire) for work that ended on its own, releasing
+    /// its trigger instead of firing it.
+    pub fn release(&self, id: &K, slot: CancelSlot) {
+        if let Some(trigger) = self.take(id, slot) {
+            trigger.release();
         }
+    }
+
+    fn take(&self, id: &K, slot: CancelSlot) -> Option<CancelTrigger> {
+        let mut map = self.lock();
+        let entry = map.get_mut(id)?;
+        let trigger = [&mut entry.registrations, &mut entry.detached]
+            .into_iter()
+            .find_map(|registrations| {
+                let index = registrations
+                    .iter()
+                    .position(|&(registered, _)| registered == slot)?;
+                Some(registrations.remove(index).1)
+            });
         if entry.registrations.is_empty() && entry.detached.is_empty() && !entry.cancelled {
             map.remove(id);
         }
+        trigger
     }
 
     /// Cancels every registration under {id} and marks the id, so a session
@@ -302,6 +330,16 @@ mod tests {
             assert!(child_token.is_cancelled());
             assert!(!parent_token.is_cancelled());
         });
+    }
+
+    #[test]
+    fn a_released_trigger_leaves_its_token_to_the_parent() {
+        let (parent_trigger, parent) = CancelToken::new();
+        let (trigger, child) = parent.child();
+        trigger.release();
+        assert!(!child.is_cancelled());
+        parent_trigger.cancel();
+        assert!(child.is_cancelled());
     }
 
     #[test]

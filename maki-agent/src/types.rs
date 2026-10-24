@@ -663,6 +663,8 @@ pub enum AgentEvent {
         content: String,
     },
     ToolDone(Box<ToolDoneEvent>),
+    /// A receipt closes the foreground wait without completing the tool.
+    ToolBackgrounded(Box<ToolDoneEvent>),
     TurnComplete(Box<TurnCompleteEvent>),
     ToolResultsSubmitted {
         message: Box<Message>,
@@ -1147,6 +1149,8 @@ pub const DETACHED_RUN_ID: u64 = u64::MAX - 1;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SubagentInfo {
+    #[serde(default, skip_serializing_if = "crate::TaskKind::is_agent")]
+    pub kind: crate::TaskKind,
     pub parent_tool_use_id: String,
     #[serde(rename = "parent_name")]
     pub name: String,
@@ -1233,6 +1237,18 @@ impl EventSender {
             owner_cancel: self.owner_cancel.clone(),
             root_tx: Some(self.root_tx.as_ref().unwrap_or(&self.tx).clone()),
             session_cancel: Some(session_cancel),
+        }
+    }
+
+    /// A tool owns its event stream without becoming a native session. A
+    /// background child must still inherit the enclosing session's lifetime.
+    pub(crate) fn tool_sender(&self, stream: &EventStreamGuard) -> Self {
+        Self {
+            tx: stream.tx.clone(),
+            run_id: self.run_id,
+            owner_cancel: self.owner_cancel.clone(),
+            root_tx: Some(self.root_tx.as_ref().unwrap_or(&self.tx).clone()),
+            session_cancel: self.session_cancel.clone(),
         }
     }
 

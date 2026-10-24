@@ -48,6 +48,13 @@ impl LoadedInstructions {
         let mut set = self.0.lock().unwrap_or_else(|e| e.into_inner());
         !set.insert(path)
     }
+
+    pub fn remove(&self, path: &Path) {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(path);
+    }
 }
 
 /// Instruction files found during one model call, at any nesting depth.

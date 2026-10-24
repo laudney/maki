@@ -204,6 +204,18 @@ fn write_overrides(out: &mut String) {
         "The `/help` modal and the splash show default labels, not live \
          overrides, but pressing the key still runs the override.\n\n",
     );
+    out.push_str(
+        "`Ctrl+B` moves the unfinished tool calls of the current main-agent \
+         turn to the background. Nothing restarts, and the agent continues \
+         with a receipt in place of each moved call. Each moved call keeps \
+         running as a `tool-` task in `/tasks`, its result arrives as a \
+         notification, and `Ctrl+S` in `/tasks` stops it.\n\n",
+    );
+    out.push_str(
+        "The key does nothing in a task chat, in an idle chat, or while a \
+         permission prompt is open. To use another key, bind it to \
+         `maki.ui.action(\"background_tools\")`.\n\n",
+    );
     out.push_str("### Recovering from a bad keymap\n\n");
     out.push_str(
         "If an override leaves Maki stuck (a modal that does not close, a \

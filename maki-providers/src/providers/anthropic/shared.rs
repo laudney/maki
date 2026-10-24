@@ -331,13 +331,41 @@ fn wire_content<'a>(
 /// array: it decides which recorded loads may replay as references.
 pub(crate) fn wire_messages<'a>(messages: &'a [Message], tools: &Value) -> Vec<WireMessage<'a>> {
     let mut unreferenced = deferred_tool_names(tools);
-    messages
-        .iter()
-        .map(|msg| WireMessage {
+    let mut wire = Vec::new();
+    for msg in messages {
+        let mut content = wire_content(msg, &mut unreferenced);
+        if let Some(result) = &msg.background_tool {
+            // An observation cannot carry tool_reference blocks. Plain schema
+            // text preserves discovery without inventing an assistant turn,
+            // which would invalidate authenticated extended thinking.
+            let mut seen = HashSet::new();
+            let definitions: Vec<_> = result
+                .loaded_tools
+                .iter()
+                .filter(|name| seen.insert(name.as_str()))
+                .filter_map(|name| {
+                    tools
+                        .as_array()?
+                        .iter()
+                        .find(|tool| is_deferred_tool(tool) && tool["name"].as_str() == Some(name))
+                })
+                .collect();
+            if !definitions.is_empty() {
+                content.push(WireContentBlock {
+                    inner: WireBlock::Rebuilt(text_block(&format!(
+                        "Tool definitions loaded by this background task:\n{}",
+                        json!(definitions),
+                    ))),
+                    cache_control: None,
+                });
+            }
+        }
+        wire.push(WireMessage {
             role: &msg.role,
-            content: wire_content(msg, &mut unreferenced),
-        })
-        .collect()
+            content,
+        });
+    }
+    wire
 }
 
 pub(super) fn build_wire_messages<'a>(
@@ -765,5 +793,93 @@ mod tests {
             );
             assert_eq!(&after[..before.len()], before.as_slice(), "{key}");
         }
+    }
+
+    #[test]
+    fn background_discovery_keeps_signed_history_and_uses_observation_text() {
+        let deferred = json!({
+            "name": LOADED_TOOL, "defer_loading": true,
+            "description": "loaded schema", "input_schema": {"type":"object","properties":{"query":{"type":"string"}}},
+        });
+        let tools = json!([{"name":"read"}, deferred]);
+        let mut messages = vec![
+            Message::user("go".into()),
+            Message {
+                role: Role::Assistant,
+                content: vec![
+                    ContentBlock::Thinking {
+                        thinking: "plan".into(),
+                        signature: Some("signed-prefix".into()),
+                    },
+                    ContentBlock::tool_use(TOOL_USE_ID, TOOL_SEARCH, json!({})),
+                ],
+                ..Default::default()
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::tool_result(
+                    TOOL_USE_ID,
+                    "running in background",
+                    false,
+                )],
+                ..Default::default()
+            },
+        ];
+        let original = encode(&messages, &tools);
+        let mut completed =
+            Message::observation("Background lookup failed after loading a tool.".into());
+        completed.background_tool = Some(crate::BackgroundToolResult {
+            task_id: "task-identity".into(),
+            tool_use_id: TOOL_USE_ID.into(),
+            is_error: true,
+            loaded_tools: vec![
+                LOADED_TOOL.into(),
+                LOADED_TOOL.into(),
+                "read".into(),
+                "gone".into(),
+            ],
+        });
+        completed.content.push(ContentBlock::Image {
+            source: crate::ImageSource::new(crate::ImageMediaType::Png, "aW1hZ2U=".into()),
+        });
+        messages.push(completed);
+        let completed = encode(&messages, &tools);
+        assert_eq!(completed["system"], original["system"]);
+        assert_eq!(completed["tools"], original["tools"]);
+        assert_eq!(
+            &completed["messages"].as_array().unwrap()[..3],
+            original["messages"].as_array().unwrap()
+        );
+        let observation = &completed["messages"][3]["content"];
+        assert_eq!(
+            observation[0]["text"],
+            "Background lookup failed after loading a tool."
+        );
+        assert_eq!(observation[1]["type"], "image");
+        let schema_text = observation[2]["text"].as_str().unwrap();
+        let schema_text = schema_text.split_once('\n').unwrap().1;
+        assert_eq!(
+            serde_json::from_str::<Value>(schema_text).unwrap(),
+            json!([deferred])
+        );
+        assert!(
+            !observation.as_array().unwrap().iter().any(|block| matches!(
+                block["type"].as_str(),
+                Some("tool_use" | "tool_result" | "tool_reference")
+            ))
+        );
+        messages.push(Message::user("continue".into()));
+        let later = encode(&messages, &tools);
+        assert_eq!(
+            &later["messages"].as_array().unwrap()[..4],
+            completed["messages"].as_array().unwrap()
+        );
+        let restored: Vec<Message> =
+            serde_json::from_value(serde_json::to_value(&messages).unwrap()).unwrap();
+        assert_eq!(
+            encode(&restored, &tools),
+            later,
+            "saved history retains discovered schemas"
+        );
     }
 }

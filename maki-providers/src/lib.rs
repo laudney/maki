@@ -1,4 +1,5 @@
 mod child_env;
+mod delivery;
 pub(crate) mod error;
 pub(crate) mod image;
 pub(crate) mod manifest;
@@ -18,6 +19,7 @@ pub mod tokens;
 pub(crate) mod types;
 
 pub use child_env::{shell_command, strip_provider_keys};
+pub use delivery::{DeliveryReceipt, ResultDelivery};
 pub use error::{AgentError, Overflow};
 pub use maki_storage::sessions::add_cost;
 pub use model::{
@@ -39,11 +41,11 @@ pub use providers::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth};
 pub use providers::{Timeouts, user_agent};
 pub use tokens::{ContextGauge, estimate_message_tokens, estimate_prompt_tokens};
 pub use types::{
-    CONTEXT_UPDATE_WITHOUT_FACTS, ContentBlock, DEFER_LOADING_KEY, EMPTY_RESPONSE_MARKER, Effort,
-    EffortDialect, FACTS_WITHOUT_CONTEXT_UPDATE, IMAGE_EVICTED_NOTE, IMAGE_OMITTED_NOTE,
-    IMAGE_PLACEHOLDER, IMAGE_UNUSABLE_NOTE, ImageMediaType, ImageSource, InputTransformation,
-    Message, MessageKind, ModelUsageRow, ProviderEvent, ProviderUsage, RequestOptions, Role,
-    StopReason, StreamResponse, THINKING_USAGE, ThinkingConfig, ThinkingFallback,
-    UNKNOWN_IMAGE_MEDIA_TYPE, UNTYPED_BLOCK, UsageLimit, adapt_images_for_model, dialect,
-    is_deferred_tool,
+    BackgroundToolResult, CONTEXT_UPDATE_WITHOUT_FACTS, ContentBlock, DEFER_LOADING_KEY,
+    EMPTY_RESPONSE_MARKER, Effort, EffortDialect, FACTS_WITHOUT_CONTEXT_UPDATE, IMAGE_EVICTED_NOTE,
+    IMAGE_OMITTED_NOTE, IMAGE_PLACEHOLDER, IMAGE_UNUSABLE_NOTE, ImageMediaType, ImageSource,
+    InputTransformation, Message, MessageKind, ModelUsageRow, ProviderEvent, ProviderUsage,
+    RequestOptions, Role, StopReason, StreamResponse, THINKING_USAGE, ThinkingConfig,
+    ThinkingFallback, UNKNOWN_IMAGE_MEDIA_TYPE, UNTYPED_BLOCK, UsageLimit, adapt_images_for_model,
+    dialect, is_deferred_tool,
 };

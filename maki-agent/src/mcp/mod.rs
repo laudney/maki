@@ -364,16 +364,25 @@ impl std::ops::Deref for McpSession {
 impl McpSession {
     /// `history` seeds the loaded set when resuming: tools the model was
     /// already calling, or a search had loaded, stay declared across
-    /// restarts. A pure string scan, so it is safe before servers connect,
-    /// and unknown names are inert.
+    /// restarts. A search moved to the background reports its loads on the
+    /// notice that carries its result. A pure string scan, so it is safe
+    /// before servers connect, and unknown names are inert.
     pub fn new(handle: McpHandle, history: &[Message]) -> Self {
         let loaded = history
             .iter()
-            .flat_map(|m| &m.content)
-            .flat_map(|block| match block {
-                ContentBlock::ToolUse { name, .. } => std::slice::from_ref(name),
-                ContentBlock::ToolResult { loaded_tools, .. } => loaded_tools.as_slice(),
-                _ => &[],
+            .flat_map(|m| {
+                let moved = m
+                    .background_tool
+                    .as_ref()
+                    .map_or(&[][..], |result| result.loaded_tools.as_slice());
+                m.content
+                    .iter()
+                    .flat_map(|block| match block {
+                        ContentBlock::ToolUse { name, .. } => std::slice::from_ref(name),
+                        ContentBlock::ToolResult { loaded_tools, .. } => loaded_tools.as_slice(),
+                        _ => &[],
+                    })
+                    .chain(moved)
             })
             .filter(|name| is_wire_name(name))
             .map(|name| internal_tool_name(name).into())
@@ -1442,7 +1451,7 @@ fn intern(name: String) -> Arc<str> {
 mod tests {
     use super::*;
     use config::{RawHttpFields, RawServerConfig, RawStdioFields, RawTransport};
-    use maki_providers::Role;
+    use maki_providers::{BackgroundToolResult, Role};
     use smol::lock::Mutex as AsyncMutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
     #[cfg(unix)]
@@ -1951,23 +1960,39 @@ mod tests {
         assert_eq!(tool_names(&tools), vec!["eager__tool"]);
     }
 
-    #[test_case(vec![
-        ContentBlock::tool_use("t", WIRE_TOOL_NAME, json!({})),
-        ContentBlock::tool_use("t", "read", json!({})),
-        ContentBlock::tool_use("t", "gone__tool", json!({})),
-    ] ; "tool_calls")]
-    #[test_case(vec![ContentBlock::ToolResult {
-        tool_use_id: "t".into(),
-        content: String::new(),
-        is_error: false,
-        loaded_tools: vec![WIRE_TOOL_NAME.into(), "read".into(), "gone__tool".into()],
-    }] ; "search_result")]
-    fn new_seeds_loads_only_from_wire_names_in_history(content: Vec<ContentBlock>) {
+    fn seeded_loads() -> Vec<String> {
+        vec![WIRE_TOOL_NAME.into(), "read".into(), "gone__tool".into()]
+    }
+
+    #[test_case(Message {
+        content: vec![
+            ContentBlock::tool_use("t", WIRE_TOOL_NAME, json!({})),
+            ContentBlock::tool_use("t", "read", json!({})),
+            ContentBlock::tool_use("t", "gone__tool", json!({})),
+        ],
+        ..Default::default()
+    } ; "tool_calls")]
+    #[test_case(Message {
+        content: vec![ContentBlock::ToolResult {
+            tool_use_id: "t".into(),
+            content: String::new(),
+            is_error: false,
+            loaded_tools: seeded_loads(),
+        }],
+        ..Default::default()
+    } ; "search_result")]
+    #[test_case(Message {
+        background_tool: Some(BackgroundToolResult {
+            task_id: "tool-t".into(),
+            tool_use_id: "t".into(),
+            is_error: false,
+            loaded_tools: seeded_loads(),
+        }),
+        ..Message::observation(String::new())
+    } ; "moved_search_result")]
+    fn new_seeds_loads_only_from_wire_names_in_history(message: Message) {
         let (_inner, session) = setup(vec![fake_entry("srv", FakeTransport::new())]);
-        let history = vec![Message {
-            content,
-            ..Default::default()
-        }];
+        let history = vec![message];
         let restored = McpSession::new(session.handle.clone(), &history);
         let mut tools = json!([]);
         restored.extend_tools(&mut tools, ToolDeferral::Client);

@@ -25,6 +25,7 @@ pub mod inbox;
 pub mod session;
 pub use inbox::SubagentInbox;
 pub(crate) mod task_set;
+pub use agent::managed_tools::RunningTool;
 pub use agent::{
     Agent, AgentParams, AgentRunParams, DisplayItem, History, HistorySnapshot, Instructions,
     LoadedInstructions, ModelSlot, RunContext, RunContextBuilder, SharedMessages, Transcript,
@@ -34,6 +35,8 @@ pub use agent::{
 pub use cancel::{CancelMap, CancelToken, CancelTrigger};
 pub use live_session::{AgentSeed, MailboxError, Notice, SessionMailbox};
 pub use maki_config::{AgentConfig, PermissionsConfig, SessionDefaults, ToolOutputLines};
+pub use maki_providers::ResultDelivery;
+pub use maki_storage::sessions::TaskKind;
 pub mod command;
 pub mod diff;
 pub mod permissions;

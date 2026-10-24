@@ -110,7 +110,7 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
-    use crate::{AgentEvent, SubagentInfo};
+    use crate::{AgentEvent, SubagentInfo, TaskKind};
 
     const RUN: u64 = 7;
     const OTHER_RUN: u64 = 8;
@@ -122,6 +122,7 @@ mod tests {
         Envelope {
             event: AgentEvent::StreamClosed,
             subagent: Some(SubagentInfo {
+                kind: TaskKind::Agent,
                 parent_tool_use_id: CHILD.into(),
                 name: CHILD.into(),
                 prompt: None,

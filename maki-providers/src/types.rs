@@ -21,6 +21,7 @@ use serde_json::{Map, Value, json};
 use strum::{Display, IntoStaticStr, VariantNames};
 use tracing::{debug, warn};
 
+use crate::DeliveryReceipt;
 use crate::TokenUsage;
 use crate::image::{Fix, IMAGE_EVICTION_STEP, MAX_IMAGES, fix_for_wire};
 use crate::model::Model;
@@ -248,10 +249,8 @@ pub async fn adapt_images_for_model<'a>(
             }
         }
         adapted.push(Message {
-            role: message.role.clone(),
             content,
-            display_text: message.display_text.clone(),
-            kind: message.kind.clone(),
+            ..message.clone()
         });
     }
     Cow::Owned(adapted)
@@ -465,11 +464,20 @@ impl ContentBlock {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BackgroundToolResult {
+    pub task_id: String,
+    pub tool_use_id: String,
+    pub is_error: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub loaded_tools: Vec<String>,
+}
+
 /// Part of the frozen session surface (disk, exports, Lua), written flat:
-/// `{"role", "content", "display_text"?, "kind"?, "facts"?}`, with `kind` as
-/// a bare tag and `facts` beside a `context_update`. Older logs nest it as
-/// `{"kind": {"context_update": facts}}`. Those still load, and are not
-/// rewritten just for that.
+/// `{"role", "content", "display_text"?, "kind"?, "facts"?,
+/// "background_tool"?}`, with `kind` as a bare tag and `facts` beside a
+/// `context_update`. Older logs nest it as `{"kind": {"context_update":
+/// facts}}`. Those still load, and are not rewritten just for that.
 ///
 /// It only grows, by the same rules as [`ContentBlock`].
 #[derive(Debug, Default, Clone, PartialEq, Deserialize)]
@@ -479,6 +487,8 @@ pub struct Message {
     pub content: Vec<ContentBlock>,
     pub display_text: Option<String>,
     pub kind: MessageKind,
+    pub background_tool: Option<BackgroundToolResult>,
+    pub delivery: Option<Arc<DeliveryReceipt>>,
 }
 
 /// [`Message`] as stored, before `kind` and `facts` are paired up.
@@ -492,6 +502,8 @@ struct RawMessage {
     kind: Option<RawKind>,
     #[serde(default)]
     facts: Option<Arc<FactsUpdate>>,
+    #[serde(default)]
+    background_tool: Option<BackgroundToolResult>,
 }
 
 /// [`MessageKind`] reads every kind but the flat `context_update` tag, whose
@@ -528,6 +540,8 @@ impl TryFrom<RawMessage> for Message {
             content: raw.content,
             display_text: raw.display_text,
             kind,
+            background_tool: raw.background_tool,
+            delivery: None,
         })
     }
 }
@@ -540,7 +554,8 @@ impl Serialize for Message {
         let len = 2
             + usize::from(self.display_text.is_some())
             + usize::from(!self.kind.is_turn())
-            + usize::from(facts.is_some());
+            + usize::from(facts.is_some())
+            + usize::from(self.background_tool.is_some());
         let mut state = serializer.serialize_struct("Message", len)?;
         state.serialize_field("role", &self.role)?;
         state.serialize_field("content", &self.content)?;
@@ -552,6 +567,9 @@ impl Serialize for Message {
         }
         if let Some(facts) = facts {
             state.serialize_field("facts", facts)?;
+        }
+        if let Some(background_tool) = &self.background_tool {
+            state.serialize_field("background_tool", background_tool)?;
         }
         state.end()
     }

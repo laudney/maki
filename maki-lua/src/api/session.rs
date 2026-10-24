@@ -300,6 +300,8 @@ fn message_table(lua: &Lua, message: &Message) -> LuaResult<Value> {
         content: Vec::new(),
         display_text: message.display_text.clone(),
         kind: message.kind.clone(),
+        background_tool: message.background_tool.clone(),
+        delivery: None,
     };
     let json = serde_json::to_value(&envelope).map_err(mlua::Error::external)?;
     let table = lua.unpack::<Table>(json_to_lua_exact(lua, &json)?)?;

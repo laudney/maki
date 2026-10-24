@@ -27,7 +27,7 @@ use maki_agent::tools::QUESTION_TOOL_NAME;
 use maki_agent::{
     AgentConfig, AgentEvent, AgentInput, AgentMode, AskOwner, DETACHED_RUN_ID, DoneReason,
     Envelope, InputSource, OwnedAsks, PermissionsConfig, SessionEndReason, SessionEvents,
-    SteerKind,
+    SessionMailbox, SteerKind,
 };
 use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
 use maki_lua::session_snapshot::{HeadlessMeta, HeadlessSnapshot, MODE_BUILD, MODE_PLAN};
@@ -1107,6 +1107,7 @@ impl EventPump {
             AgentEvent::ToolPending { .. }
             | AgentEvent::ToolOutput { .. }
             | AgentEvent::ToolDone(_)
+            | AgentEvent::ToolBackgrounded(_)
             | AgentEvent::QueueItemConsumed { .. }
             | AgentEvent::QueueDrained
             | AgentEvent::AuthRequired
@@ -1184,10 +1185,14 @@ impl EventPump {
                 }))?;
             }
             AgentEvent::PermissionRequest { id, tool, .. } => {
-                let answer_tx = match &envelope.subagent {
-                    Some(child) => child.answer_tx.clone(),
-                    None => Some(self.shared.lock().unwrap().permissions.answer_tx.clone()),
-                };
+                let managed = SessionMailbox::tool_permission(self.writer.session_id.id(), id);
+                let input_id = managed.as_ref().map_or(id, |(original, _)| original);
+                let answer_tx = managed.as_ref().map(|(_, tx)| tx.clone()).or_else(|| {
+                    match &envelope.subagent {
+                        Some(child) => child.answer_tx.clone(),
+                        None => Some(self.shared.lock().unwrap().permissions.answer_tx.clone()),
+                    }
+                });
                 let Some(answer_tx) = answer_tx else {
                     warn!(ask_id = %id, "subagent permission request has no answer channel");
                     if let Some(child) = &parent_tool_use_id {
@@ -1209,7 +1214,7 @@ impl EventPump {
 
                 let (tool_name, input) = self
                     .tool_inputs
-                    .get(&(owner.clone(), id.clone()))
+                    .get(&(owner.clone(), input_id.clone()))
                     .cloned()
                     .unwrap_or_else(|| (tool.to_string(), Value::Null));
 
@@ -1230,7 +1235,7 @@ impl EventPump {
                             subtype: "can_use_tool",
                             tool_name: Some(maki_to_claude_tool_name(&tool_name).into()),
                             input: Some(input),
-                            tool_use_id: Some(id.clone()),
+                            tool_use_id: Some(input_id.clone()),
                         },
                     }))?;
             }
@@ -1303,7 +1308,7 @@ fn map_tool_names_in_content(content: &Value) -> Value {
 mod tests {
     use flume::Receiver;
     use maki_agent::cancel::CancelToken;
-    use maki_agent::{SubagentInfo, ToolStartEvent, TurnCompleteEvent};
+    use maki_agent::{SubagentInfo, TaskKind, ToolStartEvent, TurnCompleteEvent};
     use maki_config::ToolKey;
     use maki_providers::{ContentBlock, Message, Role};
     use test_case::test_case;
@@ -1795,6 +1800,7 @@ mod tests {
                 prompt: None,
                 model: None,
                 detached: run_id == DETACHED_RUN_ID,
+                kind: TaskKind::Agent,
                 owner_cancel: None,
                 spawn_tool_use_id: None,
                 opts: None,

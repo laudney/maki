@@ -186,6 +186,12 @@ impl PermissionPrompt {
         project_trusted: bool,
         reason: Option<String>,
     ) {
+        if let Some(request) = self.queue.iter_mut().find(|request| request.id == id) {
+            if subagent_id.is_some() {
+                request.subagent_id = subagent_id;
+            }
+            return;
+        }
         let allow_scopes = generalized_scopes(&tool, &scopes);
         let allow_scopes = if allow_scopes == scopes {
             vec![]

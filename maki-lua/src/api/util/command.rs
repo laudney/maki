@@ -634,6 +634,7 @@ pub enum BuiltinAction {
     PrevChat,
     NextChat,
     ModelPicker,
+    BackgroundTools,
 }
 
 impl BuiltinAction {
@@ -644,7 +645,9 @@ impl BuiltinAction {
     /// Most actions open something the user then sees and drives, or move
     /// focus like `maki.task.focus`, so they are open. The plan form only
     /// shows, and the user decides there. Popping the queue throws away a
-    /// prompt the user wrote, with nobody asked.
+    /// prompt the user wrote, with nobody asked. Moving running tools to the
+    /// background answers them with receipts and wakes the chat when each
+    /// ends, like `maki.session.notify` with `wake`.
     pub fn needs(self) -> &'static [Permission] {
         match self {
             Self::FilePicker
@@ -657,6 +660,7 @@ impl BuiltinAction {
             | Self::NextChat
             | Self::ModelPicker => &[],
             Self::PopQueue => &[Permission::SessionWrite],
+            Self::BackgroundTools => &[Permission::Agent, Permission::SessionWrite],
         }
     }
 }

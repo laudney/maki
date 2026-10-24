@@ -115,6 +115,7 @@ pub struct AgentParams {
     /// inherit it, or a monitor could get around the block by starting one.
     pub background_for: Option<MakiId>,
     pub task_id: Option<Arc<str>>,
+    pub running_tool: Option<crate::RunningTool>,
     pub mailbox: Option<SessionMailbox>,
     pub timeouts: maki_providers::Timeouts,
     pub file_access: Arc<FileAccess>,
@@ -173,6 +174,7 @@ pub struct Agent<'h> {
     session_id: Option<SessionRef>,
     background_for: Option<MakiId>,
     task_id: Option<Arc<str>>,
+    running_tool: Option<crate::RunningTool>,
     mailbox: Option<SessionMailbox>,
     timeouts: maki_providers::Timeouts,
     file_access: Arc<FileAccess>,
@@ -220,6 +222,7 @@ impl<'h> Agent<'h> {
             session_id: params.session_id,
             background_for: params.background_for,
             task_id: params.task_id,
+            running_tool: params.running_tool,
             mailbox: params.mailbox,
             file_access: params.file_access,
             prompt_slots: params.prompt_slots,
@@ -310,6 +313,7 @@ impl<'h> Agent<'h> {
             .map(|e| (e.message, e.images, e.preamble))
             .chain([(message, images, preamble)]);
         let mut prompt = None;
+        let mut landed = false;
         for (message, images, preamble) in burst {
             let kept = match self
                 .filter_user_message(message, images.len(), source)
@@ -327,9 +331,10 @@ impl<'h> Agent<'h> {
                 prompt = Some(text.clone());
                 Message::user_with_images(text, images)
             });
-            self.land_input(preamble, kept, true)?;
+            landed |= self.land_input(preamble, kept, true)?;
         }
-        let Some(message) = prompt else {
+        // A wake whose every notice was refused brings the model nothing new.
+        let Some(message) = prompt.filter(|_| landed) else {
             self.emit_done(DoneReason::Dropped)?;
             return Ok(DoneReason::Dropped);
         };
@@ -390,39 +395,85 @@ impl<'h> Agent<'h> {
     /// one drains it only with the last, so a note's line comes after every
     /// prompt it was saved ahead of. Whatever changed goes right before the
     /// message, so the model reads the change first and a rewind takes both.
+    /// Returns whether anything new for the model landed.
     fn land_input(
         &mut self,
         preamble: Vec<Message>,
         message: Option<Message>,
         drain_mailbox: bool,
-    ) -> Result<(), AgentError> {
+    ) -> Result<bool, AgentError> {
+        let mut landed = false;
         for message in preamble {
-            self.land_observation(message)?;
+            landed |= self.land_observation(message)?;
         }
         let Some(message) = message else {
-            return Ok(());
+            return Ok(landed);
         };
-        if drain_mailbox && let Some(mailbox) = &self.mailbox {
-            for notice in mailbox.drain() {
-                self.land_observation(notice.message)?;
-            }
+        if drain_mailbox {
+            landed |= self.land_notices()?;
         }
         self.tell_changes();
         if !message.content.is_empty() {
             self.history.push(message);
+            landed = true;
         }
-        Ok(())
+        Ok(landed)
     }
 
     /// The line follows the observation into history, so frontends draw it
-    /// once and a restore draws it too.
-    fn land_observation(&mut self, message: Message) -> Result<(), AgentError> {
+    /// once and a restore draws it too. A notice whose owner ended shows
+    /// nothing. Returns whether it landed.
+    fn land_observation(&mut self, message: Message) -> Result<bool, AgentError> {
+        if message
+            .delivery
+            .as_ref()
+            .is_some_and(|receipt| !receipt.is_live())
+        {
+            return Ok(false);
+        }
+        let delivery = message.delivery.clone();
         let line = observation_line(&message).map(str::to_owned);
+        let submitted = message.background_tool.as_ref().map(|result| Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: result.tool_use_id.clone(),
+                content: message
+                    .content
+                    .iter()
+                    .filter_map(|block| match block {
+                        ContentBlock::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                is_error: result.is_error,
+                loaded_tools: result.loaded_tools.clone(),
+            }],
+            ..Default::default()
+        });
         self.history.push(message);
+        if let Some(delivery) = delivery {
+            delivery.accept();
+        }
         if let Some(text) = line {
             self.event_tx.send(AgentEvent::ObservationLine { text })?;
         }
-        Ok(())
+        if let Some(message) = submitted {
+            self.event_tx.send(AgentEvent::ToolResultsSubmitted {
+                message: Box::new(message),
+            })?;
+        }
+        Ok(true)
+    }
+
+    fn land_notices(&mut self) -> Result<bool, AgentError> {
+        let mut landed = false;
+        if let Some(mailbox) = &self.mailbox {
+            for notice in mailbox.drain() {
+                landed |= self.land_observation(notice.message)?;
+            }
+        }
+        Ok(landed)
     }
 
     fn turns_exhausted(&self) -> bool {
@@ -433,6 +484,14 @@ impl<'h> Agent<'h> {
 
     async fn run_loop(&mut self) -> Result<DoneReason, AgentError> {
         loop {
+            // A notice would end the request that continues a cut-off answer,
+            // so it waits for the one after. One that lands counts toward the
+            // size the compaction check below reads.
+            if !self.continues_answer() {
+                let landed_from = self.history.len();
+                self.land_notices()?;
+                self.gauge.append(&self.history.as_slice()[landed_from..]);
+            }
             // Ahead of `try_auto_compact`: a switch landing after the check
             // would compact against the old window and then overflow the new
             // one.
@@ -532,15 +591,17 @@ impl<'h> Agent<'h> {
         }
         // After a cut-off answer the request continues it, and an update
         // there would get a reply instead. The next request tells it.
-        let continues_answer = self
-            .history
-            .as_slice()
-            .last()
-            .is_some_and(|m| matches!(m.role, Role::Assistant));
-        if !continues_answer {
+        if !self.continues_answer() {
             self.tell_changes();
         }
         Ok(())
+    }
+
+    fn continues_answer(&self) -> bool {
+        self.history
+            .as_slice()
+            .last()
+            .is_some_and(|m| matches!(m.role, Role::Assistant))
     }
 
     async fn turn(&mut self) -> Result<TurnOutcome, AgentError> {
@@ -973,6 +1034,8 @@ impl<'h> Agent<'h> {
             audience: self.audience,
             local_tools: Arc::clone(&self.local_tools),
             live_sink: None,
+            result_delivery: None,
+            running_tool: self.running_tool.clone(),
             model_policy: Arc::clone(&self.model_policy),
         }
     }
@@ -1174,6 +1237,7 @@ mod tests {
 
     use maki_config::ProjectConfig;
     use maki_providers::provider::{BoxFuture, Provider};
+    use maki_providers::tokens::estimate_message_tokens;
     use maki_providers::{
         ContentBlock, Message, Model, ProviderEvent, RequestOptions, Role, StopReason,
         StreamResponse, ThinkingSupport, TokenUsage,
@@ -1209,6 +1273,8 @@ mod tests {
         "TurnComplete, Done, and the compaction trigger must read one context gauge";
     const NOTICE_BODY: &str = "Background task find auth finished:\n\nok";
     const NOTICE_LINE: &str = "Background agent finished: find auth";
+    const LARGE_NOTICE: &str = "a long background result ";
+    const LARGE_NOTICE_REPEAT: usize = 2_000;
 
     struct MockInterruptSource {
         commands: Mutex<VecDeque<ExtractedCommand>>,
@@ -1420,6 +1486,7 @@ mod tests {
                 session_id: None,
                 background_for: None,
                 task_id: None,
+                running_tool: None,
                 mailbox: None,
                 timeouts: maki_providers::Timeouts::default(),
                 file_access: FileAccess::fresh(),
@@ -1796,11 +1863,43 @@ mod tests {
         PromptPreamble,
         NextPrompt,
         Interrupt,
+        MidRun,
     }
 
-    fn notice(display: Option<&str>) -> Notice {
+    /// Queues its notice while the first request is in flight, as a background
+    /// result that finishes during a run.
+    struct NotifyingProvider {
+        inner: MockProvider,
+        pending: Mutex<Option<(MakiId, Notice)>>,
+    }
+
+    impl Provider for NotifyingProvider {
+        fn stream_message<'a>(
+            &'a self,
+            model: &'a Model,
+            messages: &'a [Message],
+            system: &'a str,
+            tools: &'a Value,
+            events: &'a flume::Sender<ProviderEvent>,
+            opts: RequestOptions,
+            session: Option<&'a SessionRef>,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            if let Some((id, notice)) = self.pending.lock().unwrap().take() {
+                SessionMailbox::notify(id, notice, true).unwrap();
+            }
+            self.inner
+                .stream_message(model, messages, system, tools, events, opts, session)
+        }
+
+        fn list_models(&self) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, AgentError>> {
+            Box::pin(async { unimplemented!() })
+        }
+    }
+
+    fn notice(display: Option<&str>, owner: Option<CancelToken>) -> Notice {
         let mut notice = Notice::text(NOTICE_BODY.into());
         notice.message.display_text = display.map(str::to_owned);
+        notice.owner_cancel = owner;
         notice
     }
 
@@ -1826,16 +1925,40 @@ mod tests {
             .collect()
     }
 
+    /// Whatever the label, the model reads the same observation.
+    #[track_caller]
+    fn assert_sent_as_plain_observation(request: &CapturedRequest) {
+        let plain = serde_json::to_value(Message::observation(NOTICE_BODY.into())).unwrap();
+        assert!(
+            request
+                .messages
+                .iter()
+                .any(|sent| sent["content"] == plain["content"] && sent["kind"] == plain["kind"]),
+            "the notice body must reach the provider unchanged"
+        );
+    }
+
     #[test_case(NoticePath::WakePreamble ; "wake_preamble")]
     #[test_case(NoticePath::WakeBatchedWithPrompt ; "wake_batched_with_prompt")]
     #[test_case(NoticePath::PromptPreamble ; "prompt_preamble")]
     #[test_case(NoticePath::NextPrompt ; "next_prompt")]
     #[test_case(NoticePath::Interrupt ; "interrupt")]
+    #[test_case(NoticePath::MidRun ; "mid_run")]
     fn an_accepted_notice_draws_its_line_once(path: NoticePath) {
         smol::block_on(async {
             let id = maki_storage::id::MakiId::generate();
             let mailbox = SessionMailbox::register(id);
-            SessionMailbox::notify(id, notice(Some(NOTICE_LINE)), true).unwrap();
+            let (_owner, generation) = CancelToken::new();
+            mailbox.publish_generation(generation.clone());
+            let owned = notice(Some(NOTICE_LINE), Some(generation));
+            let mut responses = vec![text_response(StopReason::EndTurn)];
+            let mut pending = None;
+            if let NoticePath::MidRun = path {
+                responses.insert(0, tool_call_response("glob", "t1"));
+                pending = Some((id, owned));
+            } else {
+                SessionMailbox::notify(id, owned, true).unwrap();
+            }
             let mut input = default_input();
             match path {
                 NoticePath::WakePreamble => {
@@ -1850,13 +1973,15 @@ mod tests {
                     }];
                 }
                 NoticePath::PromptPreamble => input.preamble = messages(mailbox.drain()),
-                NoticePath::NextPrompt | NoticePath::Interrupt => {}
+                NoticePath::NextPrompt | NoticePath::Interrupt | NoticePath::MidRun => {}
             }
+            let provider = NotifyingProvider {
+                inner: MockProvider::new(responses),
+                pending: Mutex::new(pending),
+            };
+            let requests = Arc::clone(&provider.inner.requests);
             let mut history = History::new(Vec::new());
-            let (mut agent, event_rx) = make_agent(
-                MockProvider::new(vec![text_response(StopReason::EndTurn)]),
-                &mut history,
-            );
+            let (mut agent, event_rx) = make_agent(provider, &mut history);
             agent.mailbox = Some(mailbox);
 
             if let NoticePath::Interrupt = path {
@@ -1873,6 +1998,50 @@ mod tests {
             assert_eq!(landed.len(), 1);
             assert_eq!(landed[0].display_text.as_deref(), Some(NOTICE_LINE));
             assert_eq!(landed[0].first_text_content(), Some(NOTICE_BODY));
+            let requests = requests.lock().unwrap();
+            if let Some(last) = requests.last() {
+                assert_sent_as_plain_observation(last);
+            }
+            for pair in requests.windows(2) {
+                assert_append_only(&pair[0], &pair[1]);
+            }
+        });
+    }
+
+    /// A background result that lands while an answer was cut off waits until
+    /// the answer is continued, and one that lands between turns counts toward
+    /// the context size.
+    #[test_case(StopReason::MaxTokens ; "cut_off_answer")]
+    #[test_case(StopReason::ToolUse ; "tool_turn")]
+    fn a_mid_run_notice_waits_for_a_continuation_and_counts_once_landed(first: StopReason) {
+        smol::block_on(async {
+            let id = MakiId::generate();
+            let mailbox = SessionMailbox::register(id);
+            let mut large = notice(Some(NOTICE_LINE), None);
+            large.message = Message::observation(LARGE_NOTICE.repeat(LARGE_NOTICE_REPEAT));
+            let landed_size = estimate_message_tokens(std::slice::from_ref(&large.message));
+            let first_response = match first {
+                StopReason::MaxTokens => text_response(StopReason::MaxTokens),
+                _ => tool_call_response("glob", "t1"),
+            };
+            let provider = NotifyingProvider {
+                inner: MockProvider::new(vec![first_response, text_response(StopReason::EndTurn)]),
+                pending: Mutex::new(Some((id, large))),
+            };
+            let requests = Arc::clone(&provider.inner.requests);
+            let mut history = History::new(Vec::new());
+            let (mut agent, _event_rx) = make_agent(provider, &mut history);
+            agent.mailbox = Some(mailbox.clone());
+
+            agent.run(default_input()).await.unwrap();
+
+            let continued = first == StopReason::MaxTokens;
+            assert_eq!(agent.gauge.size() >= landed_size, !continued);
+            drop(agent);
+            let requests = requests.lock().unwrap();
+            let last_sent = requests[1].messages.last().unwrap();
+            assert_eq!(last_sent["role"] == "assistant", continued);
+            assert_eq!(mailbox.drain().len(), usize::from(continued));
         });
     }
 
@@ -1885,7 +2054,7 @@ mod tests {
         smol::block_on(async {
             let id = maki_storage::id::MakiId::generate();
             let mailbox = SessionMailbox::register(id);
-            SessionMailbox::notify(id, notice(Some(NOTICE_LINE)), false).unwrap();
+            SessionMailbox::notify(id, notice(Some(NOTICE_LINE), None), false).unwrap();
             let mut history = History::new(Vec::new());
             let (agent, event_rx) = make_agent(MockProvider::new(Vec::new()), &mut history);
             let mut agent = agent.with_interrupt_source(MockInterruptSource::new(vec![
@@ -1931,7 +2100,7 @@ mod tests {
         smol::block_on(async {
             let id = maki_storage::id::MakiId::generate();
             let mailbox = SessionMailbox::register(id);
-            SessionMailbox::notify(id, notice(None), false).unwrap();
+            SessionMailbox::notify(id, notice(None, None), false).unwrap();
             let mut history = History::new(Vec::new());
             let (mut agent, event_rx) = make_agent(
                 MockProvider::new(vec![text_response(StopReason::EndTurn)]),
@@ -1946,6 +2115,62 @@ mod tests {
             let landed = observations(&history);
             assert_eq!(landed.len(), 1);
             assert_eq!(landed[0].display_text, None);
+        });
+    }
+
+    /// A wake claimed into a preamble keeps its owner guard, so an owner that
+    /// ends before the run accepts it leaves no history and no line.
+    #[test]
+    fn a_claimed_notice_whose_owner_ended_is_not_accepted() {
+        smol::block_on(async {
+            let id = MakiId::generate();
+            let mailbox = SessionMailbox::register(id);
+            let (owner, generation) = CancelToken::new();
+            mailbox.publish_generation(generation.clone());
+            SessionMailbox::notify(id, notice(Some(NOTICE_LINE), Some(generation)), true).unwrap();
+            let mut input = default_input();
+            input.preamble = messages(mailbox.claim_wake());
+            owner.cancel();
+            let mut history = History::new(Vec::new());
+            let (mut agent, event_rx) = make_agent(
+                MockProvider::new(vec![text_response(StopReason::EndTurn)]),
+                &mut history,
+            );
+            agent.mailbox = Some(mailbox);
+
+            agent.run(input).await.unwrap();
+            drop(agent);
+
+            assert!(notice_lines(&drain_events(&event_rx)).is_empty());
+            assert!(observations(&history).is_empty());
+        });
+    }
+
+    /// A wake whose every notice was refused brings the model nothing new,
+    /// so the run ends without a request.
+    #[test]
+    fn a_wake_with_only_refused_notices_asks_nothing() {
+        smol::block_on(async {
+            let id = MakiId::generate();
+            let mailbox = SessionMailbox::register(id);
+            let (owner, generation) = CancelToken::new();
+            mailbox.publish_generation(generation.clone());
+            SessionMailbox::notify(id, notice(Some(NOTICE_LINE), Some(generation)), true).unwrap();
+            let mut input = default_input();
+            input.message.clear();
+            input.preamble = messages(mailbox.claim_wake());
+            owner.cancel();
+            let mut history = History::new(Vec::new());
+            let provider = MockProvider::new(vec![text_response(StopReason::EndTurn)]);
+            let requests = Arc::clone(&provider.requests);
+            let (mut agent, _event_rx) = make_agent(provider, &mut history);
+            agent.mailbox = Some(mailbox);
+
+            assert_eq!(agent.run(input).await.unwrap(), DoneReason::Dropped);
+            drop(agent);
+
+            assert!(requests.lock().unwrap().is_empty());
+            assert!(history.as_slice().is_empty());
         });
     }
 

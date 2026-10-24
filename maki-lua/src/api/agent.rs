@@ -22,7 +22,8 @@ use maki_agent::{
     Agent, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, AgentSeed,
     DETACHED_RUN_ID, DoneReason, EMPTY_RESPONSE_MARKER, Envelope, EventSender, EventStreamGuard,
     History, InputSource, McpSession, RunContext, RunContextBuilder, RunLedger, SessionEvents,
-    SubagentInbox, SubagentInfo, SubagentVerdict, ToolDoneEvent, UNAVAILABLE_RESULT, event_stream,
+    SubagentInbox, SubagentInfo, SubagentVerdict, TaskKind, ToolDoneEvent, UNAVAILABLE_RESULT,
+    event_stream,
 };
 use maki_lua_macro::{lua_class, lua_fn, lua_table};
 use maki_providers::model::ModelTier;
@@ -932,7 +933,9 @@ async fn session(
         .event_tx
         .owner_cancel()
         .unwrap_or_else(CancelToken::none);
-    let parent_tx = if agent_ctx.background_for.is_some() {
+    let parent_tx = if agent_ctx.background_for.is_some()
+        || (!background && agent_ctx.running_tool.is_some())
+    {
         agent_ctx.event_tx.clone()
     } else {
         agent_ctx.event_tx.root_sender()
@@ -1060,6 +1063,7 @@ async fn session(
             permissions: Arc::clone(&agent_ctx.permissions),
             session_id: agent_ctx.session_id.clone(),
             background_for: agent_ctx.background_for,
+            running_tool: agent_ctx.running_tool.clone(),
             task_id: Some(Arc::from(ui_id.as_str())),
             mailbox: None,
             timeouts: agent_ctx.timeouts,
@@ -1071,7 +1075,7 @@ async fn session(
             prompt_slots: Arc::clone(&agent_ctx.prompt_slots),
             subagent_cancels: Arc::clone(&agent_ctx.subagent_cancels),
             ledger: RunLedger::child(&agent_ctx.ledger),
-            registry: Arc::clone(maki_agent::tools::ToolRegistry::global_arc()),
+            registry: Arc::clone(&agent_ctx.registry),
             audience,
             model_policy: Arc::clone(&agent_ctx.model_policy),
         },
@@ -1107,6 +1111,7 @@ async fn session(
 
     if state.background.is_some() {
         let info = SubagentInfo {
+            kind: TaskKind::Agent,
             parent_tool_use_id: state.cancel.ui_id.clone(),
             name: state.name.clone(),
             prompt: None,
@@ -1457,6 +1462,7 @@ impl SessionState {
     fn set_prompt_info(&mut self, message: &str) {
         if self.subagent_info.get().is_none() {
             let _ = self.subagent_info.set(SubagentInfo {
+                kind: TaskKind::Agent,
                 parent_tool_use_id: self.cancel.ui_id.clone(),
                 name: self.name.clone(),
                 prompt: Some(message.to_owned()),
@@ -2647,6 +2653,7 @@ mod tests {
             let handle = session.borrow::<LuaSession>().unwrap();
             let native = Arc::clone(&handle.cancel);
             let info = SubagentInfo {
+                kind: TaskKind::Agent,
                 parent_tool_use_id: native.ui_id.clone(),
                 name: NATIVE_CHILD.into(),
                 prompt: None,
@@ -2789,6 +2796,7 @@ mod tests {
     fn subagent_info() -> Arc<OnceLock<SubagentInfo>> {
         let info = Arc::new(OnceLock::new());
         info.set(SubagentInfo {
+            kind: TaskKind::Agent,
             parent_tool_use_id: PARENT_ID.into(),
             name: "research".into(),
             prompt: None,

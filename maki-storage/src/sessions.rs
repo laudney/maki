@@ -659,6 +659,20 @@ impl fmt::Display for StoredThinking {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskKind {
+    #[default]
+    Agent,
+    Tool,
+}
+
+impl TaskKind {
+    pub fn is_agent(&self) -> bool {
+        *self == Self::Agent
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StoredSubagent {
     pub tool_use_id: String,
@@ -676,10 +690,11 @@ pub struct StoredSubagent {
     pub plugin: Option<Arc<str>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost: Option<f64>,
-    /// True when the child outlived the tool call that spawned it, which keeps
-    /// it a background agent after a reload.
+    /// Work that outlived the foreground call, owned by the session.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub detached: bool,
+    #[serde(default, skip_serializing_if = "TaskKind::is_agent")]
+    pub kind: TaskKind,
 }
 
 #[derive(Deserialize)]
@@ -2340,8 +2355,8 @@ mod tests {
     use super::{
         ARCHIVE_DIR, ARCHIVE_KEEP, ARCHIVE_MAX_BYTES, CWD_INDEX_FILE, DEFAULT_TITLE, LOG_BLOATED,
         MAX_APPENDS, MAX_TITLE_LEN, MSG_PREFIX, SESSION_VERSION, SESSIONS_DIR, StoredSubagent,
-        TAIL_BUF, generate_title, json_path, jsonl_path, load_cwd_index, lock_path, locks_dir,
-        next_epoch, update_cwd_index, write_full_session,
+        TAIL_BUF, TaskKind, generate_title, json_path, jsonl_path, load_cwd_index, lock_path,
+        locks_dir, next_epoch, update_cwd_index, write_full_session,
     };
     use super::{
         HistorySnapshot, LOG_FORMAT_VERSION, NEWER_LOG_FORMAT, OLDEST_LOG_FORMAT_VERSION,
@@ -2453,6 +2468,7 @@ mod tests {
                 plugin: plugin.map(Arc::from),
                 cost: None,
                 detached: false,
+                kind: TaskKind::Agent,
             }
         }
 

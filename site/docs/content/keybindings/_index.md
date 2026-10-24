@@ -55,6 +55,7 @@ On macOS, some bindings use Option or Fn keys instead (run `/help` for exact key
 | Key | Action |
 |-----|--------|
 | `↑` / `↓` | Navigate input history |
+| `Ctrl+B` | Move running tools to background |
 | `Esc Esc` | Cancel agent |
 
 ## Form
@@ -126,6 +127,10 @@ Precedence, high to low:
 `Ctrl+C` and `Ctrl+Z` cannot be rebound, so quit and suspend always work. Only single-key bindings can be overridden. Multi-key combinations and non-key rows (like `Type` to filter) cannot.
 
 The `/help` modal and the splash show default labels, not live overrides, but pressing the key still runs the override.
+
+`Ctrl+B` moves the unfinished tool calls of the current main-agent turn to the background. Nothing restarts, and the agent continues with a receipt in place of each moved call. Each moved call keeps running as a `tool-` task in `/tasks`, its result arrives as a notification, and `Ctrl+S` in `/tasks` stops it.
+
+The key does nothing in a task chat, in an idle chat, or while a permission prompt is open. To use another key, bind it to `maki.ui.action("background_tools")`.
 
 ### Recovering from a bad keymap
 

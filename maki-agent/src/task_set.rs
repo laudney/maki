@@ -38,7 +38,7 @@ impl<T: Send + 'static> TaskSet<T> {
     }
 }
 
-fn panic_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
+pub(crate) fn panic_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
     let msg = if let Some(s) = payload.downcast_ref::<&str>() {
         (*s).to_owned()
     } else if let Some(s) = payload.downcast_ref::<String>() {
