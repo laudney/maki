@@ -1064,6 +1064,7 @@ impl EventPump {
             | AgentEvent::LiveToolBuf { .. }
             | AgentEvent::Nudge
             | AgentEvent::Notice { .. }
+            | AgentEvent::ObservationLine { .. }
             | AgentEvent::PromptProgress { .. }
             | AgentEvent::StreamClosed => {}
             // A later kept message overwrites this with its own answer, so the

@@ -24,9 +24,10 @@ pub mod session;
 pub use inbox::SubagentInbox;
 pub(crate) mod task_set;
 pub use agent::{
-    Agent, AgentParams, AgentRunParams, History, HistorySnapshot, Instructions, LoadedInstructions,
-    ModelSlot, RunContext, RunContextBuilder, SharedMessages, Transcript, UNAVAILABLE_RESULT,
-    close_dangling_tool_calls, find_subdirectory_instructions, is_instruction_file,
+    Agent, AgentParams, AgentRunParams, DisplayItem, History, HistorySnapshot, Instructions,
+    LoadedInstructions, ModelSlot, RunContext, RunContextBuilder, SharedMessages, Transcript,
+    UNAVAILABLE_RESULT, close_dangling_tool_calls, display_order, find_subdirectory_instructions,
+    is_instruction_file, observation_line,
 };
 pub use cancel::{CancelMap, CancelToken, CancelTrigger};
 pub use live_session::{AgentSeed, MailboxError, SessionMailbox};

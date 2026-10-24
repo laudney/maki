@@ -1,4 +1,5 @@
 mod compaction;
+mod display_order;
 mod frame;
 mod history;
 pub mod hook;
@@ -9,6 +10,7 @@ pub mod tool_dispatch;
 mod transcript;
 
 pub use compaction::compact;
+pub use display_order::{DisplayItem, display_order, observation_line};
 pub use frame::{RunContext, RunContextBuilder, plan_mode_update};
 pub use history::{
     History, HistorySnapshot, SharedHeader, SharedMessages, UNAVAILABLE_RESULT,
