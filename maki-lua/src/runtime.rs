@@ -24,6 +24,7 @@ use maki_agent::tools::hook::Verdict;
 use maki_agent::tools::{
     HeaderResult, PermissionScopes, RegistryError, Tool, ToolLive, ToolRegistry, ToolSource,
 };
+use maki_agent::{BACKGROUND_STOP_REASON, InvocationStop};
 use maki_agent::{
     BufferSnapshot, SessionEndReason, SharedBuf, SnapshotLine, SnapshotSpan, SpanStyle, UiWaker,
 };
@@ -664,6 +665,7 @@ pub struct LiveCtx {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum KillReason {
+    Background,
     Cancelled,
     Deadline,
 }
@@ -689,6 +691,10 @@ fn stuck_message(plugin: &str) -> String {
 pub(crate) struct TaskCell {
     pub(crate) id: u64,
     pub(crate) cancel: CancelToken,
+    invocation_stop: Option<Arc<InvocationStop>>,
+    /// Set while hooks answer a background stop, so a `ctx:finish` they make
+    /// is the call's receipt rather than its result.
+    pub(crate) in_background_hook: bool,
     /// End of the current [`KILL_GRACE`], armed by the first watchdog poke
     /// that sees a doomed or stuck task and cleared at every yield.
     kill_at: Cell<Option<Instant>>,
@@ -697,6 +703,9 @@ pub(crate) struct TaskCell {
     /// The watchdog pokes every 50ms, and a slow slice should log once.
     slice_warned: Cell<bool>,
     pub(crate) deadline: Cell<Option<Instant>>,
+    /// Set on a tool handler, whose deadline is its call's foreground
+    /// timeout. A `maki.async.run` task keeps its own deadline after a move.
+    foreground_deadline: bool,
     pub(crate) deadline_secs: Cell<Option<u64>>,
     /// Notified by `ctx:set_deadline`, so [`until_abandoned`] re-arms on the
     /// new deadline instead of staying parked on the one it started with.
@@ -746,10 +755,13 @@ impl TaskCell {
         Self {
             id: NEXT_TASK_ID.fetch_add(1, Ordering::Relaxed),
             cancel,
+            invocation_stop: None,
+            in_background_hook: false,
             kill_at: Cell::new(None),
             slice_started: Cell::new(None),
             slice_warned: Cell::new(false),
             deadline: Cell::new(deadline),
+            foreground_deadline: false,
             deadline_secs: Cell::new(None),
             deadline_changed: Event::new(),
             bufs: BufferStore::new(),
@@ -773,13 +785,30 @@ impl TaskCell {
     /// Cancel outranks the deadline: once nobody waits for the reply,
     /// reporting a timeout would only mislead.
     fn doomed(&self, now: Instant) -> Option<KillReason> {
-        if self.cancel.is_cancelled() {
+        if self
+            .invocation_stop
+            .as_ref()
+            .is_some_and(|stop| stop.is_background())
+        {
+            Some(KillReason::Background)
+        } else if self.cancel.is_cancelled() {
             Some(KillReason::Cancelled)
-        } else if self.deadline.get().is_some_and(|d| now > d) {
+        } else if self.live_deadline().is_some_and(|d| now > d) {
             Some(KillReason::Deadline)
         } else {
             None
         }
+    }
+
+    /// A call moved to the background runs until it ends or the user stops
+    /// it, so its foreground timeout is lifted.
+    fn live_deadline(&self) -> Option<Instant> {
+        let moved = self.foreground_deadline
+            && self
+                .invocation_stop
+                .as_ref()
+                .is_some_and(|stop| stop.is_detached());
+        self.deadline.get().filter(|_| !moved)
     }
 
     /// [`Self::doomed`] gated by [`KILL_GRACE`]: the task is only shot
@@ -883,6 +912,10 @@ pub(crate) fn register_cancel_hook(lua: &Lua, callback: Function) -> Result<(), 
         let mut cell = lock_cell(&handle);
         cell.cancel_hooks.push(key);
         cell.cancel.is_cancelled()
+            || cell
+                .invocation_stop
+                .as_ref()
+                .is_some_and(|stop| stop.is_background())
     };
     if cancelled {
         fire_cancel_hooks(lua, &handle, KillReason::Cancelled);
@@ -891,12 +924,26 @@ pub(crate) fn register_cancel_hook(lua: &Lua, callback: Function) -> Result<(), 
 }
 
 fn fire_cancel_hooks(lua: &Lua, handle: &TaskHandle, reason: KillReason) {
+    let background = lock_cell(handle)
+        .invocation_stop
+        .as_ref()
+        .is_some_and(|stop| stop.is_background());
+    let reason = if background {
+        KillReason::Background
+    } else {
+        reason
+    };
     // Hooks word their partial-output marker from this string.
     let reason = match reason {
+        KillReason::Background => BACKGROUND_STOP_REASON,
         KillReason::Cancelled => CANCELLED_MSG,
         KillReason::Deadline => HANDLER_TIMEOUT_MSG,
     };
-    let hooks = std::mem::take(&mut lock_cell(handle).cancel_hooks);
+    let (hooks, outer) = {
+        let mut cell = lock_cell(handle);
+        let outer = std::mem::replace(&mut cell.in_background_hook, background);
+        (std::mem::take(&mut cell.cancel_hooks), outer)
+    };
     for key in hooks {
         if let Err(e) = lua
             .registry_value::<Function>(&key)
@@ -906,6 +953,7 @@ fn fire_cancel_hooks(lua: &Lua, handle: &TaskHandle, reason: KillReason) {
         }
         lua.remove_registry_value(key).ok();
     }
+    lock_cell(handle).in_background_hook = outer;
 }
 
 /// The buf whose click handler owns this task's clicks: the explicit root
@@ -1316,6 +1364,7 @@ fn interrupt_reason(state: *mut ffi::lua_State) -> Option<Cow<'static, str>> {
         );
     }
     Some(match kill? {
+        Kill::Doomed(KillReason::Background) => BACKGROUND_STOP_REASON.into(),
         Kill::Doomed(KillReason::Cancelled) => INTERRUPT_CANCELLED_MSG.into(),
         Kill::Doomed(KillReason::Deadline) => INTERRUPT_DEADLINE_MSG.into(),
         Kill::Stuck => {
@@ -1464,7 +1513,16 @@ pub(crate) struct TaskScope {
 }
 
 impl TaskScope {
-    pub(crate) fn new(lua: &Lua, cell: TaskCell) -> Self {
+    pub(crate) fn new(lua: &Lua, mut cell: TaskCell) -> Self {
+        if cell.invocation_stop.is_none() {
+            cell.invocation_stop = lua.app_data_ref::<TaskHandle>().and_then(|parent| {
+                lock_cell(&parent)
+                    .invocation_stop
+                    .as_ref()
+                    .filter(|stop| stop.matches(&cell.cancel))
+                    .cloned()
+            });
+        }
         let handle: TaskHandle = Arc::new(Mutex::new(cell));
         let claim = Arc::new(BufsClaim(Arc::clone(&handle)));
         lock_cell(&handle).bufs_claim = Arc::downgrade(&claim);
@@ -2391,7 +2449,7 @@ async fn until_abandoned<T>(
             // two wakes us instead of leaving us armed on the stale deadline.
             let changed = lock_cell(handle).deadline_changed.listen();
             // Bound before the match: the guard would outlive the await.
-            let deadline = lock_cell(handle).deadline.get();
+            let deadline = lock_cell(handle).live_deadline();
             match deadline {
                 Some(dl) if dl <= Instant::now() => break,
                 Some(dl) => {
@@ -2408,7 +2466,16 @@ async fn until_abandoned<T>(
         CANCELLED_MSG
     };
     futures_lite::future::or(async { Ok(fut.await) }, async {
-        Err(futures_lite::future::or(timed_out, cancelled).await)
+        let reason = futures_lite::future::or(timed_out, cancelled).await;
+        let background = lock_cell(handle)
+            .invocation_stop
+            .as_ref()
+            .is_some_and(|stop| stop.is_background());
+        Err(if background {
+            BACKGROUND_STOP_REASON
+        } else {
+            reason
+        })
     })
     .await
 }
@@ -2569,6 +2636,13 @@ fn spawn_async_task(
         let slot = Some(g.admit((!detached).then(|| DrainHold::new(&g))).await);
 
         let mut cell = TaskCell::new(task.cancel.clone(), task.deadline, task.live_ctx.clone());
+        cell.invocation_stop = task.owner.as_ref().and_then(|owner| {
+            lock_cell(&owner.0)
+                .invocation_stop
+                .as_ref()
+                .filter(|stop| stop.matches(&task.cancel))
+                .cloned()
+        });
         cell.command_depth = task.command_depth;
         cell.detached = detached;
         let scope = TaskScope::new(&lua, cell);
@@ -3263,6 +3337,7 @@ impl LuaRuntime {
                     description: t.description.clone(),
                     schema: t.schema,
                     audience: t.audience,
+                    background_receipt: t.background_receipt,
                     kind: t.kind.clone(),
                     tx: self.tx.clone(),
                     plugin: Arc::clone(&name),
@@ -3720,16 +3795,15 @@ async fn dispatch_async(
     handle: TaskHandle,
     plugin: &str,
     tool: &str,
-    finish_rx: flume::Receiver<ToolCallReply>,
+    finish_rx: &flume::Receiver<ToolCallReply>,
 ) -> ToolCallReply {
     let owner = JobOwner::Task(lock_cell(&handle).id);
     if with_jobs(lua, |store| store.is_empty(&owner)) {
         lua.gc_collect().ok();
         smol::Timer::after(DISPATCH_POLL_INTERVAL).await;
-        return match finish_rx.try_recv() {
-            Ok(reply) => reply,
-            _ => ToolCallReply::err(NIL_WITHOUT_FINISH_MSG),
-        };
+        return finish_rx
+            .try_recv()
+            .unwrap_or_else(|_| nil_without_finish(&handle));
     }
 
     loop {
@@ -3738,10 +3812,11 @@ async fn dispatch_async(
         // before `timeout_reply`, which locks the same cell.
         let kill = lock_cell(&handle).doomed(Instant::now());
         if let Some(reason) = kill {
-            if let Some(reply) = cancel_hook_reply(lua, &handle, &finish_rx, reason) {
+            if let Some(reply) = cancel_hook_reply(lua, &handle, finish_rx, reason) {
                 return reply;
             }
             return match reason {
+                KillReason::Background => ToolCallReply::moved_without_receipt(),
                 KillReason::Cancelled => ToolCallReply::err(CANCELLED_MSG),
                 KillReason::Deadline => timeout_reply(&handle, plugin, tool),
             };
@@ -3749,9 +3824,7 @@ async fn dispatch_async(
 
         match finish_rx.try_recv() {
             Ok(reply) => return reply,
-            Err(flume::TryRecvError::Disconnected) => {
-                return ToolCallReply::err(NIL_WITHOUT_FINISH_MSG);
-            }
+            Err(flume::TryRecvError::Disconnected) => return nil_without_finish(&handle),
             Err(flume::TryRecvError::Empty) => {}
         }
 
@@ -3765,12 +3838,21 @@ async fn dispatch_async(
 
         if with_jobs(lua, |store| store.is_empty(&owner)) {
             smol::Timer::after(DISPATCH_POLL_INTERVAL).await;
-            return match finish_rx.try_recv() {
-                Ok(reply) => reply,
-                _ => ToolCallReply::err(NIL_WITHOUT_FINISH_MSG),
-            };
+            return finish_rx
+                .try_recv()
+                .unwrap_or_else(|_| nil_without_finish(&handle));
         }
         smol::Timer::after(DISPATCH_POLL_INTERVAL).await;
+    }
+}
+
+/// A handler that went async and ended without `ctx:finish`. Stopped for a
+/// move, the call still owes the model a receipt.
+fn nil_without_finish(handle: &TaskHandle) -> ToolCallReply {
+    if lock_cell(handle).doomed(Instant::now()) == Some(KillReason::Background) {
+        ToolCallReply::moved_without_receipt()
+    } else {
+        ToolCallReply::err(NIL_WITHOUT_FINISH_MSG)
     }
 }
 
@@ -4367,6 +4449,7 @@ async fn run_tool_call(
         Err(e) => return ToolCallReply::err(strip_traceback(&e)),
     };
     let live_sink = ctx.agent().and_then(|a| a.live_sink.clone());
+    let invocation_stop = ctx.invocation_stop();
     let ctx_ud = match lua.create_userdata(*ctx) {
         Ok(u) => u,
         Err(e) => return ToolCallReply::err(strip_traceback(&e)),
@@ -4374,6 +4457,8 @@ async fn run_tool_call(
 
     let live_id = live.as_ref().map(|l| l.tool_use_id.clone());
     let mut cell = TaskCell::new(cancel.clone(), deadline, live);
+    cell.invocation_stop = invocation_stop;
+    cell.foreground_deadline = true;
     cell.live_sink = live_sink;
     let scope = TaskScope::new(&lua, cell);
     let handle = Arc::clone(scope.handle());
@@ -4386,7 +4471,7 @@ async fn run_tool_call(
     }
 
     let call_future = scope.scope_future(async {
-        match until_abandoned(async_thread, &handle)
+        let reply = match until_abandoned(async_thread, &handle)
             .await
             .unwrap_or_else(|msg| Err(mlua::Error::runtime(msg)))
         {
@@ -4406,7 +4491,7 @@ async fn run_tool_call(
                         let _ = sink.send(ToolLive::Buf(buf));
                     }
                 }
-                dispatch_async(&lua, Arc::clone(&handle), &plugin, &tool, finish_rx).await
+                dispatch_async(&lua, Arc::clone(&handle), &plugin, &tool, &finish_rx).await
             }
             Ok(val) => {
                 if let Some(buf) = crate::api::ui::buf::buf_from_reply(&val) {
@@ -4425,9 +4510,18 @@ async fn run_tool_call(
                         tracing::debug!(%tool, error = %strip_traceback(&e), "handler error superseded by cancel hook reply");
                         reply
                     }
+                    None if kill == Some(KillReason::Background) => {
+                        ToolCallReply::moved_without_receipt()
+                    }
                     None => ToolCallReply::err(strip_traceback(&e)),
                 }
             }
+        };
+        // A hook that took over the result answered for the call, so its
+        // receipt outranks whatever the handler returned afterwards.
+        match finish_rx.try_recv() {
+            Ok(queued) if queued.receipt => queued,
+            _ => reply,
         }
     });
 
@@ -4720,6 +4814,7 @@ pub fn spawn(
                             let shutdown_ref = Arc::clone(&rt.shutdown);
                             let g = Rc::clone(&gate);
                             let cancel = ctx.cancel.clone();
+                            let stop = ctx.invocation_stop();
                             ex.spawn(async move {
                                 let _hold = nested.then(|| DrainHold::new(&g));
                                 let slot = if nested {
@@ -4728,7 +4823,12 @@ pub fn spawn(
                                     match g.acquire_before_abandoned(&cancel, deadline).await {
                                         Ok(guard) => Some(guard),
                                         Err(msg) => {
-                                            let _ = reply.send(ToolCallReply::err(msg));
+                                            let refused = if stop.is_some_and(|stop| stop.is_background()) {
+                                                ToolCallReply::moved_without_receipt()
+                                            } else {
+                                                ToolCallReply::err(msg)
+                                            };
+                                            let _ = reply.send(refused);
                                             return;
                                         }
                                     }
@@ -6617,7 +6717,7 @@ mod tests {
                 Arc::clone(scope.handle()),
                 DISPATCH_TEST_PLUGIN,
                 DISPATCH_TEST_TOOL,
-                finish_rx,
+                &finish_rx,
             ));
             drop(tx.send((reply.result, start.elapsed())));
         });

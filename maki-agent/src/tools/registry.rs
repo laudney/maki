@@ -249,6 +249,9 @@ pub trait Tool: Send + Sync + 'static {
     fn reach(&self) -> Option<ToolReach> {
         None
     }
+    fn background_receipt(&self) -> bool {
+        false
+    }
     fn parse(&self, input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError>;
 }
 

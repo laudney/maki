@@ -494,7 +494,7 @@ only in compact mode.
     - `state` (`any`) Serializable state forwarded to restore.
   - `audiences` (`string[]`) Which model audiences see the tool. Values: "main", "sub", "all". Default: all audiences.
   - `kind` (`string`) Optional grouping label (e.g. "filesystem").
-  - `timeout` (`number`) Execution timeout in seconds. 0 or false disables. Default: inherits agent deadline.
+  - `timeout` (`number`) Execution timeout in seconds. 0 or false disables. Default: inherits agent deadline. Neither it nor `ctx:set_deadline` applies once the user moves the call to the background.
   - `header` (`function`) Optional. Called before execution, returns a string or BufHandle for the one-line header.
   - `restore` (`function`) Optional. Called to re-render a previous tool result. Receives `(tool_name, input, output, ctx)`.
   - `start` (`function`) Optional. Called when the tool call starts, before the handler runs.
@@ -503,6 +503,7 @@ only in compact mode.
   - `permission_scopes` (`string|function`) Field name in schema (string) or `function(input)` returning a list of path scopes that need write permission. Declaring it is what puts the tool in front of the permission prompt, and it requires `permission`.
   - `permission` (`string`) The capability the tool reaches: "fs_read", "fs_write", "net", "run", or "env". Your plugin must hold it, and so must any plugin that pre-approves the tool, hooks it, or hands it to a session. Without `permission_scopes` the tool never prompts, the right declaration for read-only tools. A tool declaring neither costs those plugins every permission.
   - `mutable_path` (`string`) Schema field name (type: string) for the primary path the tool writes. Required with `permission = "fs_write"`. Declaring it is what gets the tool, from the dispatcher and never from the handler: serialization of concurrent calls on that file, the stale-read rejection, the plan-mode block, and the permission boundary check.
+  - `background_receipt` (`boolean`) Optional, default false. When the user moves a running main-agent call to the background, cancel it with reason `"background"` instead of wrapping it in a generic `tool-` task. The reply its `maki.async.on_cancel` hook gives through `ctx:finish` is the receipt the model reads, and the sessions it opened with `background = true` move to `/tasks` and keep running. A hook that gives no reply leaves the model a generic receipt. Not part of the provider schema.
   - `start_annotation` (`string|table`) Schema field used to annotate the start header with a count (string) or timeout (`{ field, kind="timeout" }`).
 
 **Example:**
@@ -2124,6 +2125,12 @@ The callback receives the reason (`"cancelled"` or `"timeout"`) and may
 still call `ctx:finish`; the host prefers that reply over the generic
 cancelled/timeout error. Mark it `is_error = true` and end it with a
 marker, so the model knows the output it gets is cut short.
+
+A tool registered with `background_receipt = true` also gets
+`"background"` when the user moves its call to the background. The reply
+the hook gives through `ctx:finish` is then the receipt the model reads in
+place of the result. A result the handler already had wins instead, and
+the call completes as usual.
 
 The callback runs outside your coroutine, so it must not yield. It
 fires at most once, immediately if the task is already cancelled. An

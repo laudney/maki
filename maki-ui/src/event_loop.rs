@@ -1835,9 +1835,7 @@ impl<'t> EventLoop<'t> {
             }
             Action::BackgroundTools { run_id } => {
                 let rt = &mut self.sessions[idx];
-                if rt.handles.background_tools(run_id) > 0 {
-                    rt.app.background_tools_accepted(run_id);
-                }
+                rt.handles.background_tools(run_id);
             }
             Action::CancelSubagent { tool_use_id } => {
                 self.sessions[idx]

@@ -2,7 +2,7 @@ use std::borrow::Cow;
 use std::cell::RefCell;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -19,7 +19,8 @@ use maki_agent::tools::{
     ToolReach, is_tool_enabled, timeout_annotation,
 };
 use maki_agent::{
-    AgentEvent, BufferSnapshot, ImageMediaType, ImageSource, SharedBuf, TextOutput, ToolOutput,
+    AgentEvent, BufferSnapshot, ImageMediaType, ImageSource, MOVED_CALL_NO_RECEIPT, SharedBuf,
+    TextOutput, ToolOutput,
 };
 use maki_config::{Effect, PermissionRule, ToolKey, ToolOutputLines};
 use maki_lua_macro::{lua_fn, lua_table};
@@ -44,6 +45,8 @@ use crate::runtime::{
     HintContent, LiveCtx, PromptHintCallbacks, PromptHintRegistration, PromptTarget, Request,
     command_depth,
 };
+
+const BACKGROUND_RECEIPT_BOOL_ERR: &str = "background_receipt must be a boolean";
 
 const TOOL_NAME_MAX: usize = 64;
 const TOOL_HANDLER_RETURN_ERR: &str =
@@ -155,6 +158,7 @@ pub(crate) struct PendingTool {
     pub(crate) description: String,
     pub(crate) schema: &'static ParamSchema,
     pub(crate) audience: ToolAudience,
+    pub(crate) background_receipt: bool,
     pub(crate) kind: Option<Arc<str>>,
     pub(crate) handler_key: RegistryKey,
     pub(crate) header_key: Option<RegistryKey>,
@@ -203,6 +207,7 @@ pub(crate) struct LuaTool {
     pub(crate) description: String,
     pub(crate) schema: &'static ParamSchema,
     pub(crate) audience: ToolAudience,
+    pub(crate) background_receipt: bool,
     pub(crate) kind: Option<Arc<str>>,
     pub(crate) tx: Sender<Request>,
     pub(crate) plugin: Arc<str>,
@@ -262,6 +267,10 @@ impl Tool for LuaTool {
 
     fn audience(&self) -> ToolAudience {
         self.audience
+    }
+
+    fn background_receipt(&self) -> bool {
+        self.background_receipt
     }
 
     fn tool_kind(&self) -> Option<&str> {
@@ -465,6 +474,17 @@ impl ToolInvocation for LuaToolInvocation {
                 Err(e) => return Err(e).into(),
             };
 
+            let now = Instant::now();
+            let effective_at = tool_timeout
+                .map(|budget| now + budget)
+                .map_or(deadline_at, |at| {
+                    Some(deadline_at.map_or(at, |parent| parent.min(at)))
+                });
+            if let (Some(running), Some(at)) = (&ctx.running_tool, effective_at)
+                && running.matches_invocation(ctx.tool_use_id.as_deref(), &ctx.cancel)
+            {
+                running.set_execution_deadline(at);
+            }
             let (reply_tx, reply_rx) = flume::bounded::<ToolCallReply>(1);
             let live = ctx.tool_use_id.clone().map(|id| LiveCtx {
                 event_tx: ctx.event_tx.clone(),
@@ -490,10 +510,17 @@ impl ToolInvocation for LuaToolInvocation {
             }
 
             let recv = async { Some(reply_rx.recv_async().await) };
+            let stop = ctx
+                .running_tool
+                .as_ref()
+                .and_then(|running| running.invocation_stop(&ctx.cancel));
             let result = match effective_secs {
                 Some(secs) => {
                     futures_lite::future::race(recv, async move {
                         smol::Timer::after(Duration::from_secs(secs)).await;
+                        if stop.is_some_and(|stop| stop.is_detached()) {
+                            futures_lite::future::pending::<()>().await;
+                        }
                         None
                     })
                     .await
@@ -511,6 +538,12 @@ impl ToolInvocation for LuaToolInvocation {
                 .into(),
                 Some(Err(_)) => Err("lua thread disconnected".to_string()).into(),
                 Some(Ok(reply)) => {
+                    if reply.receipt
+                        && let Some(running) = &ctx.running_tool
+                        && running.matches_invocation(ctx.tool_use_id.as_deref(), &ctx.cancel)
+                    {
+                        running.commit_receipt();
+                    }
                     if let Some(ref id) = ctx.tool_use_id {
                         if let Some(live_buf) = reply.live_buf {
                             crate::runtime::send_render_event(
@@ -716,7 +749,7 @@ fn register_prompt(
 ///                                state       (any)     Serializable state forwarded to restore.
 ///   audiences       (string[]) Which model audiences see the tool. Values: "main", "sub", "all". Default: all audiences.
 ///   kind            (string)   Optional grouping label (e.g. "filesystem").
-///   timeout         (number)   Execution timeout in seconds. 0 or false disables. Default: inherits agent deadline.
+///   timeout         (number)   Execution timeout in seconds. 0 or false disables. Default: inherits agent deadline. Neither it nor `ctx:set_deadline` applies once the user moves the call to the background.
 ///   header          (function) Optional. Called before execution, returns a string or BufHandle for the one-line header.
 ///   restore         (function) Optional. Called to re-render a previous tool result. Receives `(tool_name, input, output, ctx)`.
 ///   start           (function) Optional. Called when the tool call starts, before the handler runs.
@@ -725,6 +758,7 @@ fn register_prompt(
 ///   permission_scopes (string|function) Field name in schema (string) or `function(input)` returning a list of path scopes that need write permission. Declaring it is what puts the tool in front of the permission prompt, and it requires `permission`.
 ///   permission      (string)   The capability the tool reaches: "fs_read", "fs_write", "net", "run", or "env". Your plugin must hold it, and so must any plugin that pre-approves the tool, hooks it, or hands it to a session. Without `permission_scopes` the tool never prompts, the right declaration for read-only tools. A tool declaring neither costs those plugins every permission.
 ///   mutable_path    (string)   Schema field name (type: string) for the primary path the tool writes. Required with `permission = "fs_write"`. Declaring it is what gets the tool, from the dispatcher and never from the handler: serialization of concurrent calls on that file, the stale-read rejection, the plan-mode block, and the permission boundary check.
+///   background_receipt (boolean) Optional, default false. When the user moves a running main-agent call to the background, cancel it with reason `"background"` instead of wrapping it in a generic `tool-` task. The reply its `maki.async.on_cancel` hook gives through `ctx:finish` is the receipt the model reads, and the sessions it opened with `background = true` move to `/tasks` and keep running. A hook that gives no reply leaves the model a generic receipt. Not part of the provider schema.
 ///   start_annotation (string|table) Schema field used to annotate the start header with a count (string) or timeout (`{ field, kind="timeout" }`).
 /// @return
 /// @example
@@ -1615,6 +1649,11 @@ fn register_tool_from_lua(
         .ok()
         .map(|s| Arc::from(s.as_str()));
     let audience = parse_audience(audiences, ToolAudience::default())?;
+    let background_receipt = match spec.opt::<LuaValue>("background_receipt")? {
+        None => false,
+        Some(LuaValue::Boolean(value)) => value,
+        Some(_) => return Err(mlua::Error::runtime(BACKGROUND_RECEIPT_BOOL_ERR)),
+    };
     let timeout = parse_timeout(spec)?;
     let start_annotation = parse_start_annotation(spec, &schema_val)?;
     let handler_key: RegistryKey = lua.create_registry_value(handler)?;
@@ -1647,6 +1686,7 @@ fn register_tool_from_lua(
             description,
             schema: param_schema,
             audience,
+            background_receipt,
             kind,
             handler_key,
             header_key,
@@ -1763,9 +1803,21 @@ pub(crate) struct ToolCallReply {
     /// return. It becomes `ToolOutput::Image` with `llm_output` as caption.
     pub image: Option<ImageSource>,
     pub state: Option<Value>,
+    /// Given by a cancel hook answering a background stop: the reply the
+    /// model reads in place of the result.
+    pub receipt: bool,
 }
 
 impl ToolCallReply {
+    /// What the model reads when a call stopped for the move gave no
+    /// receipt of its own.
+    pub(crate) fn moved_without_receipt() -> Self {
+        Self {
+            receipt: true,
+            ..Self::plain(Ok(MOVED_CALL_NO_RECEIPT.to_owned()))
+        }
+    }
+
     pub fn from_lua_value(lua: &Lua, val: &LuaValue) -> Self {
         let mut result = coerce_tool_result(val);
         let LuaValue::Table(t) = val else {
@@ -1810,6 +1862,7 @@ impl ToolCallReply {
             diff,
             image,
             state,
+            receipt: false,
         }
     }
 
@@ -1842,6 +1895,7 @@ impl ToolCallReply {
             diff: None,
             image: None,
             state: None,
+            receipt: false,
         }
     }
 
@@ -2006,6 +2060,28 @@ mod tests {
         assert_eq!(image.media_type, ImageMediaType::Png);
     }
 
+    #[test_case::test_case("true"; "true_is_not_a_string")]
+    #[test_case::test_case(1; "one_is_not_a_boolean")]
+    fn background_receipt_registration_requires_a_boolean(value: impl mlua::IntoLua) {
+        let lua = Lua::new();
+        let spec: Table = lua.load("return { name = 'receipt_type', description = 'receipt type check', schema = {type='object'}, handler = function() return '' end }").eval().unwrap();
+        spec.set("background_receipt", value).unwrap();
+        let pending = Arc::new(Mutex::new(Vec::new()));
+        let error = register_tool_from_lua(&lua, &spec, pending, &PluginPermissions::trusted())
+            .unwrap_err();
+        assert!(error.to_string().contains(BACKGROUND_RECEIPT_BOOL_ERR));
+    }
+
+    #[test_case::test_case(false; "default")]
+    #[test_case::test_case(true; "opted_in")]
+    fn background_receipt_metadata_is_not_a_provider_schema_field(opted_in: bool) {
+        let mut tool = make_lua_tool(None);
+        let schema = tool.schema();
+        tool.background_receipt = opted_in;
+        assert_eq!(tool.background_receipt(), opted_in);
+        assert_eq!(tool.schema(), schema);
+    }
+
     fn invocation(input: Value) -> LuaToolInvocation {
         let (tx, _rx) = flume::unbounded();
         LuaToolInvocation {
@@ -2063,6 +2139,7 @@ mod tests {
             name: Arc::from("test_tool"),
             description: "test".into(),
             schema,
+            background_receipt: false,
             audience: ToolAudience::default(),
             kind: None,
             tx,

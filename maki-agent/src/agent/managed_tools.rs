@@ -1,5 +1,7 @@
 use std::panic::AssertUnwindSafe;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
+use std::time::Instant;
 
 use futures_lite::FutureExt;
 use futures_lite::future::{or, pending, race, zip};
@@ -11,7 +13,7 @@ use super::CallInstructions;
 use super::tool_dispatch;
 use crate::cancel::{CancelMap, CancelSlot, CancelToken, CancelTrigger};
 use crate::permissions::TaggedAnswer;
-use crate::tools::{CallOrigin, ToolContext};
+use crate::tools::ToolContext;
 use crate::{
     AgentEvent, ChildPresentation, DETACHED_RUN_ID, Envelope, EventSender, Notice, ResultDelivery,
     SessionMailbox, SubagentInfo, SubagentVerdict, TaskKind, ToolDoneEvent, ToolOutput,
@@ -19,11 +21,65 @@ use crate::{
 };
 
 const CANCELLED: &str = "cancelled";
+pub const BACKGROUND_STOP_REASON: &str = "background";
+pub const MOVED_CALL_NO_RECEIPT: &str = "The user moved this call to the background, and it gave no receipt, so its result may never arrive. Do not wait for it. Continue with other work, or end your turn.";
+
+/// Why an invocation stopped, read by the invocation itself after the
+/// managed batch is gone. A background stop becomes a move only once the
+/// invocation answers it with a receipt.
+pub struct InvocationStop {
+    cancel: CancelToken,
+    background: AtomicBool,
+    receipt: AtomicBool,
+    detached: AtomicBool,
+}
+
+impl InvocationStop {
+    pub fn is_background(&self) -> bool {
+        self.background.load(Ordering::Acquire)
+    }
+
+    /// The call moved without stopping, so its foreground timeout no longer
+    /// applies: it runs until it ends or the user stops its task.
+    pub fn is_detached(&self) -> bool {
+        self.detached.load(Ordering::Acquire)
+    }
+
+    pub fn matches(&self, cancel: &CancelToken) -> bool {
+        self.cancel.same_token(cancel)
+    }
+}
+
+struct MoveSelection {
+    remaining: AtomicUsize,
+    committed: AtomicUsize,
+    event_tx: EventSender,
+    owner: CancelToken,
+}
+
+impl MoveSelection {
+    fn settle(&self, committed: bool) {
+        if committed {
+            self.committed.fetch_add(1, Ordering::AcqRel);
+        }
+        if self.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.event_tx.try_send(AgentEvent::BackgroundMoveSettled {
+                count: self.committed.load(Ordering::Acquire),
+                owner_cancel: self.owner.clone(),
+            });
+        }
+    }
+}
 
 /// A nested dispatch reads the same ownership decision as its invocation.
 #[derive(Clone)]
 pub struct RunningTool {
     children: Arc<Mutex<ChildPresentations>>,
+    batch: Weak<ForegroundTools>,
+    index: usize,
+    id: Arc<str>,
+    opted_in: bool,
+    stop: Arc<InvocationStop>,
 }
 
 struct ChildPresentations {
@@ -33,6 +89,26 @@ struct ChildPresentations {
 }
 
 impl RunningTool {
+    pub fn invocation_stop(&self, cancel: &CancelToken) -> Option<Arc<InvocationStop>> {
+        self.stop.matches(cancel).then(|| Arc::clone(&self.stop))
+    }
+
+    pub fn matches_invocation(&self, id: Option<&str>, cancel: &CancelToken) -> bool {
+        id == Some(&self.id) && self.stop.matches(cancel)
+    }
+
+    /// The invocation answered its background stop, so its reply is the
+    /// receipt the model reads in place of the result.
+    pub fn commit_receipt(&self) {
+        self.stop.receipt.store(true, Ordering::Release);
+    }
+
+    pub fn set_execution_deadline(&self, at: Instant) {
+        if let Some(batch) = self.batch.upgrade() {
+            batch.set_execution_deadline(self.index, at);
+        }
+    }
+
     pub fn background_session(&self) -> Option<MakiId> {
         let children = self.children.lock().unwrap_or_else(PoisonError::into_inner);
         children.detached.then_some(children.session)
@@ -56,10 +132,12 @@ impl RunningTool {
     }
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 enum Phase {
     Attached,
-    Detached,
+    /// An opted-in call was stopped for the move and has not answered yet.
+    Moving,
+    DetachedGeneric,
     Finished,
 }
 
@@ -80,6 +158,8 @@ struct Call {
     task_id: String,
     phase: Phase,
     running: RunningTool,
+    execution_deadline: Option<Instant>,
+    selection: Option<Arc<MoveSelection>>,
     trigger: Option<CancelTrigger>,
     cancel: CancelToken,
     slot: Option<CancelSlot>,
@@ -119,7 +199,8 @@ struct ForegroundWait {
 impl Drop for ForegroundWait {
     fn drop(&mut self) {
         for call in self.batch.calls().iter_mut() {
-            if call.phase == Phase::Attached {
+            if matches!(call.phase, Phase::Attached | Phase::Moving) {
+                ForegroundTools::settle(call, false);
                 call.trigger.take();
             }
         }
@@ -173,7 +254,22 @@ impl ForegroundTools {
         }
     }
 
-    pub(crate) fn promote(&self) -> usize {
+    fn settle(call: &mut Call, committed: bool) {
+        if let Some(selection) = call.selection.take() {
+            selection.settle(committed);
+        }
+    }
+
+    fn set_execution_deadline(&self, index: usize, at: Instant) {
+        let mut calls = self.calls();
+        let call = &mut calls[index];
+        if call.phase == Phase::Attached {
+            call.execution_deadline = Some(call.execution_deadline.map_or(at, |old| old.min(at)));
+        }
+    }
+
+    pub(crate) fn promote(self: &Arc<Self>) -> usize {
+        let now = Instant::now();
         let mut calls = self.calls();
         if self.run_cancel.is_cancelled() || !self.mailbox.owns_generation(&self.owner) {
             return 0;
@@ -181,16 +277,41 @@ impl ForegroundTools {
         let unfinished: Vec<_> = calls
             .iter()
             .enumerate()
-            .filter(|(_, call)| call.phase == Phase::Attached && !call.cancel.is_cancelled())
+            .filter(|(_, call)| {
+                call.phase == Phase::Attached
+                    && !call.cancel.is_cancelled()
+                    && call.execution_deadline.is_none_or(|at| now < at)
+            })
             .map(|(index, _)| index)
             .collect();
         let count = unfinished.len();
-        if count == 0 || !self.mailbox.reserve_tools(count) {
+        let generic = unfinished
+            .iter()
+            .filter(|&&index| !calls[index].running.opted_in)
+            .count();
+        if count == 0 || !self.mailbox.reserve_tools(generic) {
             return 0;
         }
+        let selection = Arc::new(MoveSelection {
+            remaining: AtomicUsize::new(count),
+            committed: AtomicUsize::new(0),
+            event_tx: self.event_tx.clone(),
+            owner: self.owner.clone(),
+        });
+        // Fired once the lock is released: a stop wakes the invocation, and
+        // its answer comes back through `finish`.
+        let mut stops = Vec::new();
         for index in unfinished {
             let call = &mut calls[index];
-            call.phase = Phase::Detached;
+            call.selection = Some(Arc::clone(&selection));
+            if call.running.opted_in {
+                call.phase = Phase::Moving;
+                call.running.stop.background.store(true, Ordering::Release);
+                stops.extend(call.trigger.take());
+                continue;
+            }
+            call.phase = Phase::DetachedGeneric;
+            call.running.stop.detached.store(true, Ordering::Release);
             call.running.detach_children();
             call.slot = call
                 .trigger
@@ -239,12 +360,16 @@ impl ForegroundTools {
             let done = ToolDoneEvent {
                 id: call.id.clone(),
                 tool: Arc::from(call.name.as_str()),
-                output: Arc::new(ToolOutput::Plain(json!({
-                    "task_id": call.task_id,
-                    "status": "running",
-                    "tool": call.name,
-                    "notification": "The existing invocation continues in the background. Its final result will arrive as a completion notification.",
-                }).to_string().into())),
+                output: Arc::new(ToolOutput::Plain(
+                    json!({
+                        "task_id": call.task_id,
+                        "status": "running",
+                        "tool": call.name,
+                        "notification": "The existing invocation continues in the background. Its final result will arrive as a completion notification.",
+                    })
+                    .to_string()
+                    .into(),
+                )),
                 is_error: false,
                 annotation: None,
                 written_path: None,
@@ -252,12 +377,15 @@ impl ForegroundTools {
             };
             self.event_tx
                 .try_send(AgentEvent::ToolBackgrounded(Box::new(done.clone())));
+            Self::settle(call, true);
             let _ = call.result_tx.try_send(ManagedResult {
                 done,
                 promoted: true,
                 delivery: None,
             });
         }
+        drop(calls);
+        drop(stops);
         count
     }
 
@@ -325,6 +453,9 @@ impl ForegroundTools {
     fn relay(self: &Arc<Self>, index: usize, mut envelope: Envelope) {
         let mut calls = self.calls();
         let call = &mut calls[index];
+        if call.phase == Phase::Finished {
+            return;
+        }
         match &mut envelope.event {
             AgentEvent::ToolStart(start) if start.id == call.id => {
                 call.start = Some((**start).clone())
@@ -364,7 +495,7 @@ impl ForegroundTools {
             }
             _ => {}
         }
-        if call.phase == Phase::Detached {
+        if call.phase == Phase::DetachedGeneric {
             envelope.run_id = DETACHED_RUN_ID;
             if let Some(info) = &mut envelope.subagent {
                 info.detached = true;
@@ -379,13 +510,14 @@ impl ForegroundTools {
     }
 
     fn is_attached(&self, index: usize) -> bool {
-        self.calls()[index].phase == Phase::Attached
+        matches!(self.calls()[index].phase, Phase::Attached | Phase::Moving)
     }
 
     fn cancel_attached(&self, index: usize) {
         let mut calls = self.calls();
         let call = &mut calls[index];
-        if call.phase == Phase::Attached {
+        if matches!(call.phase, Phase::Attached | Phase::Moving) {
+            Self::settle(call, false);
             call.trigger.take();
         }
     }
@@ -393,8 +525,15 @@ impl ForegroundTools {
     fn finish(self: &Arc<Self>, index: usize, done: ToolDoneEvent) {
         let mut calls = self.calls();
         let call = &mut calls[index];
-        let detached = call.phase == Phase::Detached;
+        if call.phase == Phase::Finished {
+            return;
+        }
+        let detached = call.phase == Phase::DetachedGeneric;
+        // A result that won the race against the stop completes normally.
+        let moved =
+            call.phase == Phase::Moving && call.running.stop.receipt.load(Ordering::Acquire);
         call.phase = Phase::Finished;
+        Self::settle(call, moved);
         // A call that ended on its own leaves its pending work, like a
         // render queued with `maki.async.run`, to finish. Only a call still in
         // the run holds its trigger here, and that work ends with the run.
@@ -468,11 +607,16 @@ impl ForegroundTools {
                 );
             }
         } else {
-            self.event_tx
-                .try_send(AgentEvent::ToolDone(Box::new(done.clone())));
+            let event = if moved {
+                call.running.detach_children();
+                AgentEvent::ToolBackgrounded(Box::new(done.clone()))
+            } else {
+                AgentEvent::ToolDone(Box::new(done.clone()))
+            };
+            self.event_tx.try_send(event);
             let _ = call.result_tx.try_send(ManagedResult {
                 done,
-                promoted: false,
+                promoted: moved,
                 delivery: Some(receipt),
             });
         }
@@ -513,7 +657,8 @@ pub(super) async fn execute(
     });
     let mut receivers = Vec::with_capacity(runnable.len());
     let mut workers = Vec::with_capacity(runnable.len());
-    for (id, name, input) in runnable {
+    for (index, (id, name, input)) in runnable.iter().enumerate() {
+        let route = tool_dispatch::resolve_owned(ctx, name);
         let (trigger, cancel) = owner.child();
         let (result_tx, result_rx) = flume::bounded(1);
         let (answer_tx, answer_rx) = flume::unbounded();
@@ -522,6 +667,16 @@ pub(super) async fn execute(
         let delivery = ResultDelivery::default();
         let (stream, events) = event_stream();
         let running = RunningTool {
+            batch: Arc::downgrade(&batch),
+            index,
+            id: Arc::from(id.as_str()),
+            opted_in: route.background_receipt(),
+            stop: Arc::new(InvocationStop {
+                cancel: cancel.clone(),
+                background: AtomicBool::new(false),
+                receipt: AtomicBool::new(false),
+                detached: AtomicBool::new(false),
+            }),
             children: Arc::new(Mutex::new(ChildPresentations {
                 session: batch.mailbox.session_id(),
                 detached: false,
@@ -545,6 +700,8 @@ pub(super) async fn execute(
             task_id: format!("tool-{}", MakiId::generate()),
             phase: Phase::Attached,
             running,
+            execution_deadline: ctx.deadline.at(),
+            selection: None,
             trigger: Some(trigger),
             cancel,
             slot: None,
@@ -560,7 +717,7 @@ pub(super) async fn execute(
         receivers.push(result_rx);
         workers.push((
             id.clone(),
-            name.clone(),
+            route,
             input.clone(),
             tool_ctx,
             stream,
@@ -574,21 +731,14 @@ pub(super) async fn execute(
         batch: Arc::clone(&batch),
         _waiter: waiter,
     };
-    for (index, (id, name, input, tool_ctx, stream, mut events, answers)) in
+    for (index, (id, route, input, tool_ctx, stream, mut events, answers)) in
         workers.into_iter().enumerate()
     {
         let batch = Arc::clone(&batch);
         let waiter_gone = waiter_gone.clone();
         smol::spawn(async move {
             let execution = async {
-                let run = AssertUnwindSafe(tool_dispatch::run(
-                    id.clone(),
-                    &name,
-                    &input,
-                    &tool_ctx,
-                    CallOrigin::Model,
-                ))
-                .catch_unwind();
+                let run = AssertUnwindSafe(route.run(id.clone(), &input, &tool_ctx)).catch_unwind();
                 // A cancelled tool ends on its own, so a reply its cancel
                 // path gives, like partial output, still reaches history.
                 let execute = async {
@@ -669,6 +819,7 @@ mod tests {
     use crate::History;
     use crate::live_session::BACKGROUND_PLAN_WRITE_DENIED;
     use crate::permissions::{PermissionAnswer, PermissionManager};
+    use crate::tools::CallOrigin;
     use crate::tools::registry::{
         ExecFuture, HeaderFuture, HeaderResult, ParseError, Tool, ToolInvocation, ToolSource,
     };
@@ -695,7 +846,6 @@ mod tests {
     const INSTRUCTION_PATH: &str = "/repo/sub/AGENTS.md";
     const CHILD_PROMPT: &str = "inspect the queued child";
     const INSTRUCTION_TEXT: &str = "subdirectory rule";
-    const PARTIAL: &str = "partial output before the stop";
 
     struct OnDrop(flume::Sender<()>);
 
@@ -712,6 +862,7 @@ mod tests {
         release: flume::Receiver<Result<ToolOutput, String>>,
         ended: flume::Sender<()>,
         count: Arc<AtomicUsize>,
+        receipt: bool,
         path: Option<PathBuf>,
     }
 
@@ -732,8 +883,13 @@ mod tests {
                     None
                 })
                 .await;
+                let moving = ctx
+                    .running_tool
+                    .as_ref()
+                    .is_some_and(|running| running.stop.is_background());
                 match released {
                     Some(reply) => reply.unwrap().into(),
+                    None if moving => self.release.recv_async().await.unwrap().into(),
                     None => Err(CANCELLED.to_owned()).into(),
                 }
             })
@@ -741,6 +897,9 @@ mod tests {
     }
 
     impl Tool for ControlledTool {
+        fn background_receipt(&self) -> bool {
+            self.receipt
+        }
         fn name(&self) -> &str {
             self.name
         }
@@ -763,10 +922,19 @@ mod tests {
     }
 
     fn controlled(ctx: &ToolContext, name: &'static str) -> Control {
-        controlled_tool(ctx, name, None)
+        controlled_tool(ctx, name, false, None)
     }
 
-    fn controlled_tool(ctx: &ToolContext, name: &'static str, path: Option<PathBuf>) -> Control {
+    fn controlled_receipt(ctx: &ToolContext, name: &'static str, receipt: bool) -> Control {
+        controlled_tool(ctx, name, receipt, None)
+    }
+
+    fn controlled_tool(
+        ctx: &ToolContext,
+        name: &'static str,
+        receipt: bool,
+        path: Option<PathBuf>,
+    ) -> Control {
         let (started, starts) = flume::unbounded();
         let (release, releases) = flume::unbounded();
         let (ended, ends) = flume::unbounded();
@@ -775,11 +943,12 @@ mod tests {
             .register(
                 Arc::new(ControlledTool {
                     name,
+                    receipt,
+                    path,
                     started,
                     release: releases,
                     ended,
                     count: Arc::clone(&count),
-                    path,
                 }),
                 ToolSource::Lua {
                     plugin: "fixture".into(),
@@ -871,6 +1040,391 @@ mod tests {
             .as_str()
             .unwrap()
             .to_owned()
+    }
+
+    const TEST_TOOL_CAPACITY: usize = 64;
+    const RECEIPT: &str = "the call moved to the background";
+    const PARTIAL: &str = "partial output before the stop";
+
+    fn settled_counts(events: &flume::Receiver<Envelope>) -> Vec<usize> {
+        events
+            .drain()
+            .filter_map(|event| match event.event {
+                AgentEvent::BackgroundMoveSettled { count, .. } => Some(count),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn answer_with_receipt(ctx: &ToolContext, control: &Control) {
+        ctx.running_tool.as_ref().unwrap().commit_receipt();
+        control
+            .release
+            .send(Ok(ToolOutput::Plain(RECEIPT.into())))
+            .unwrap();
+    }
+
+    fn result_text(history: &History, index: usize) -> (&str, bool) {
+        let ContentBlock::ToolResult {
+            content, is_error, ..
+        } = &history.as_slice()[1].content[index]
+        else {
+            panic!("expected a tool result");
+        };
+        (content, *is_error)
+    }
+
+    #[test_case(false; "free_generic_capacity")]
+    #[test_case(true; "full_generic_capacity")]
+    fn a_receipt_moves_the_call_without_generic_resources(full: bool) {
+        smol::block_on(async {
+            let fixture = fixture();
+            let control = controlled_receipt(&fixture.ctx, FIRST, true);
+            let foreground = dispatch(fixture.ctx.clone(), vec![(FIRST, FIRST.into())]);
+            let ctx = control.started.recv_async().await.unwrap();
+            let running = ctx.running_tool.as_ref().unwrap();
+            if full {
+                assert!(fixture.mailbox.reserve_tools(TEST_TOOL_CAPACITY));
+            }
+            assert_eq!(fixture.mailbox.background_tools(RUN), 1);
+            assert_eq!(fixture.mailbox.background_tools(RUN), 0);
+            assert!(ctx.cancel.is_cancelled());
+            assert!(running.stop.is_background());
+            assert!(settled_counts(&fixture.events).is_empty());
+            answer_with_receipt(&ctx, &control);
+            let history = foreground.await;
+            assert_eq!(result_text(&history, 0), (RECEIPT, false));
+            fixture.run.cancel();
+            assert!(fixture.mailbox.claim_wake().is_empty());
+            if !full {
+                assert!(fixture.mailbox.reserve_tools(TEST_TOOL_CAPACITY));
+            }
+            let events: Vec<_> = fixture.events.drain().collect();
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(
+                        &event.event,
+                        AgentEvent::BackgroundMoveSettled { count: 1, .. }
+                    ))
+                    .count(),
+                1
+            );
+            assert!(events.iter().any(|event| matches!(
+                &event.event,
+                AgentEvent::ToolBackgrounded(done) if done.output.as_text() == RECEIPT
+            )));
+            assert!(!events.iter().any(|event| matches!(
+                &event.event,
+                AgentEvent::ToolDone(_)
+                    | AgentEvent::SubagentHistory { .. }
+                    | AgentEvent::ToolResultsSubmitted { .. }
+            )));
+        });
+    }
+
+    #[test_case(Ok(ToolOutput::Plain(OUTPUT.into())), (OUTPUT, false); "result")]
+    #[test_case(Err(FAILED.into()), (FAILED, true); "failure")]
+    fn a_result_that_wins_the_race_completes_normally(
+        reply: Result<ToolOutput, String>,
+        expected: (&str, bool),
+    ) {
+        smol::block_on(async {
+            let fixture = fixture();
+            let control = controlled_receipt(&fixture.ctx, FIRST, true);
+            let foreground = dispatch(fixture.ctx.clone(), vec![(FIRST, FIRST.into())]);
+            control.started.recv_async().await.unwrap();
+            assert_eq!(fixture.mailbox.background_tools(RUN), 1);
+            control.release.send(reply).unwrap();
+            let history = foreground.await;
+            assert_eq!(result_text(&history, 0), expected);
+            let events: Vec<_> = fixture.events.drain().collect();
+            assert!(
+                events
+                    .iter()
+                    .any(|event| matches!(&event.event, AgentEvent::ToolDone(_)))
+            );
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(&event.event, AgentEvent::ToolBackgrounded(_)))
+            );
+            assert!(events.iter().any(|event| matches!(
+                &event.event,
+                AgentEvent::BackgroundMoveSettled { count: 0, .. }
+            )));
+            assert!(fixture.mailbox.claim_wake().is_empty());
+        });
+    }
+
+    #[test_case(false; "completion_first")]
+    #[test_case(true; "cancel_first")]
+    fn a_finished_or_cancelled_call_cannot_move(cancel: bool) {
+        smol::block_on(async {
+            let fixture = fixture();
+            let control = controlled_receipt(&fixture.ctx, FIRST, true);
+            let foreground = dispatch(fixture.ctx.clone(), vec![(FIRST, FIRST.into())]);
+            let ctx = control.started.recv_async().await.unwrap();
+            if cancel {
+                fixture.run.cancel();
+            } else {
+                control
+                    .release
+                    .send(Ok(ToolOutput::Plain(OUTPUT.into())))
+                    .unwrap();
+                while !matches!(
+                    fixture.events.recv_async().await.unwrap().event,
+                    AgentEvent::ToolDone(_)
+                ) {}
+            }
+            assert_eq!(fixture.mailbox.background_tools(RUN), 0);
+            foreground.await;
+            assert!(!ctx.running_tool.as_ref().unwrap().stop.is_background());
+        });
+    }
+
+    #[test]
+    fn generic_capacity_failure_leaves_every_call_attached() {
+        smol::block_on(async {
+            let fixture = fixture();
+            let first = controlled_receipt(&fixture.ctx, FIRST, true);
+            let second = controlled(&fixture.ctx, SECOND);
+            let foreground = dispatch(
+                fixture.ctx.clone(),
+                vec![(FIRST, FIRST.into()), (SECOND, SECOND.into())],
+            );
+            let ctx = first.started.recv_async().await.unwrap();
+            let other = second.started.recv_async().await.unwrap();
+            assert!(fixture.mailbox.reserve_tools(TEST_TOOL_CAPACITY));
+            assert_eq!(fixture.mailbox.background_tools(RUN), 0);
+            assert!(!ctx.running_tool.as_ref().unwrap().stop.is_background());
+            assert!(!ctx.cancel.is_cancelled());
+            assert!(!other.cancel.is_cancelled());
+            for control in [first, second] {
+                control
+                    .release
+                    .send(Ok(ToolOutput::Plain(OUTPUT.into())))
+                    .unwrap();
+            }
+            foreground.await;
+        });
+    }
+
+    #[test_case(false; "child_before_the_receipt")]
+    #[test_case(true; "child_after_the_receipt")]
+    fn a_receipt_detaches_current_and_late_children(late: bool) {
+        smol::block_on(async {
+            let fixture = fixture();
+            let control = controlled_receipt(&fixture.ctx, FIRST, true);
+            let foreground = dispatch(fixture.ctx.clone(), vec![(FIRST, FIRST.into())]);
+            let ctx = control.started.recv_async().await.unwrap();
+            let running = ctx.running_tool.as_ref().unwrap();
+            let batch = running.batch.upgrade().unwrap();
+            let info = batch.info(&batch.calls()[running.index]);
+            let make_child = || {
+                ChildPresentation::new(
+                    Some(fixture.mailbox.session_id()),
+                    Some(running),
+                    SubagentInfo {
+                        detached: false,
+                        ..info.clone()
+                    },
+                    ctx.event_tx.root_sender(),
+                )
+            };
+            let early = (!late).then(make_child);
+            assert_eq!(fixture.mailbox.background_tools(RUN), 1);
+            if let Some(child) = &early {
+                assert!(
+                    !child.is_detached(),
+                    "a pending stop leaves the child attached"
+                );
+            }
+            answer_with_receipt(&ctx, &control);
+            foreground.await;
+            let child = early.unwrap_or_else(make_child);
+            assert!(child.is_detached());
+            assert!(running.background_session().is_some());
+        });
+    }
+
+    #[test_case(FIRST; "first_tool")]
+    #[test_case(SECOND; "second_tool")]
+    fn owned_route_keeps_opt_in_and_execution_after_registry_replacement(name: &'static str) {
+        smol::block_on(async {
+            let fixture = fixture();
+            let control = controlled_receipt(&fixture.ctx, name, true);
+            let route = tool_dispatch::resolve_owned(&fixture.ctx, name);
+            assert!(route.background_receipt());
+            fixture.ctx.registry.clear_plugin("fixture");
+            let ctx = fixture.ctx.clone();
+            let execution =
+                smol::spawn(async move { route.run(FIRST.into(), &json!({}), &ctx).await });
+            control.started.recv_async().await.unwrap();
+            control
+                .release
+                .send(Ok(ToolOutput::Plain(OUTPUT.into())))
+                .unwrap();
+            assert_eq!(execution.await.output.as_text(), OUTPUT);
+        });
+    }
+
+    #[test_case(false, false; "single_press")]
+    #[test_case(true, false; "repeated_press")]
+    #[test_case(false, true; "failure_instead_of_a_receipt")]
+    fn mixed_press_settles_once_after_every_stop_answers(repeat: bool, fail: bool) {
+        smol::block_on(async {
+            let fixture = fixture();
+            let first = controlled_receipt(&fixture.ctx, FIRST, true);
+            let second = controlled_receipt(&fixture.ctx, SECOND, true);
+            let third = controlled(&fixture.ctx, THIRD);
+            let foreground = dispatch(
+                fixture.ctx.clone(),
+                vec![
+                    (FIRST, FIRST.into()),
+                    (SECOND, SECOND.into()),
+                    (THIRD, THIRD.into()),
+                ],
+            );
+            let moved = first.started.recv_async().await.unwrap();
+            second.started.recv_async().await.unwrap();
+            third.started.recv_async().await.unwrap();
+            assert_eq!(fixture.mailbox.background_tools(RUN), 3);
+            if repeat {
+                assert_eq!(fixture.mailbox.background_tools(RUN), 0);
+            }
+            answer_with_receipt(&moved, &first);
+            assert!(settled_counts(&fixture.events).is_empty());
+            let reply = if fail {
+                Err(FAILED.into())
+            } else {
+                Ok(ToolOutput::Plain(OUTPUT.into()))
+            };
+            second.release.send(reply).unwrap();
+            let history = foreground.await;
+            assert_eq!(result_text(&history, 0), (RECEIPT, false));
+            assert_eq!(result_text(&history, 1).1, fail);
+            assert_eq!(settled_counts(&fixture.events), vec![2]);
+            third
+                .release
+                .send(Ok(ToolOutput::Plain(OUTPUT.into())))
+                .unwrap();
+            notices(&fixture.mailbox, 1).await;
+        });
+    }
+
+    #[test_case(false; "replaced_generation")]
+    #[test_case(true; "cancelled_generation")]
+    fn stale_generation_cannot_promote(cancel: bool) {
+        smol::block_on(async {
+            let fixture = fixture();
+            let control = controlled_receipt(&fixture.ctx, FIRST, true);
+            let foreground = dispatch(fixture.ctx.clone(), vec![(FIRST, FIRST.into())]);
+            let ctx = control.started.recv_async().await.unwrap();
+            let (_next_generation, next) = CancelToken::new();
+            if cancel {
+                fixture.generation.cancel();
+            } else {
+                fixture.mailbox.publish_generation(next);
+            }
+            assert_eq!(fixture.mailbox.background_tools(RUN), 0);
+            assert!(!ctx.running_tool.as_ref().unwrap().stop.is_background());
+            control
+                .release
+                .send(Ok(ToolOutput::Plain(OUTPUT.into())))
+                .ok();
+            foreground.await;
+        });
+    }
+
+    #[test_case(false; "attached")]
+    #[test_case(true; "moving")]
+    fn dropping_the_foreground_waiter_cancels_unanswered_work(moving: bool) {
+        smol::block_on(async {
+            let fixture = fixture();
+            let control = controlled_receipt(&fixture.ctx, FIRST, true);
+            let foreground = dispatch(fixture.ctx.clone(), vec![(FIRST, FIRST.into())]);
+            let ctx = control.started.recv_async().await.unwrap();
+            if moving {
+                assert_eq!(fixture.mailbox.background_tools(RUN), 1);
+            }
+            foreground.cancel().await;
+            assert!(ctx.cancel.is_cancelled());
+            assert_eq!(
+                ctx.running_tool.as_ref().unwrap().stop.is_background(),
+                moving
+            );
+            assert_eq!(
+                settled_counts(&fixture.events),
+                if moving { vec![0] } else { Vec::new() }
+            );
+        });
+    }
+
+    #[test]
+    fn a_call_moved_while_it_waits_for_its_file_rechecks_the_write_gate() {
+        smol::block_on(async {
+            let fixture = fixture();
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = dir.path().join(FIRST);
+            let control = controlled_tool(&fixture.ctx, FIRST, false, Some(path.clone()));
+            let seed = fixture.mailbox.publish_seed(stub_seed_owned_by(
+                fixture.mailbox.session_id(),
+                fixture.ctx.event_tx.owner_cancel().unwrap(),
+            ));
+            let lock = fixture
+                .ctx
+                .file_access
+                .acquire(&crate::tools::FileKey::new(&path))
+                .await;
+            let foreground = dispatch(fixture.ctx.clone(), vec![(FIRST, FIRST.into())]);
+            while !matches!(
+                fixture.events.recv_async().await.unwrap().event,
+                AgentEvent::ToolStart(_)
+            ) {}
+            assert_eq!(fixture.mailbox.background_tools(RUN), 1);
+            foreground.await;
+            seed.set_chat_settings(Default::default(), &AgentMode::Plan(path.clone()));
+            drop(lock);
+            let notice = or(async { notices(&fixture.mailbox, 1).await.pop() }, async {
+                control.started.recv_async().await.unwrap();
+                None
+            })
+            .await
+            .expect("the moved call wrote while its chat plans");
+            assert!(
+                notice
+                    .message
+                    .first_text_content()
+                    .unwrap()
+                    .contains(BACKGROUND_PLAN_WRITE_DENIED)
+            );
+        });
+    }
+
+    #[test]
+    fn a_cancelled_call_keeps_the_reply_it_ends_with() {
+        smol::block_on(async {
+            let mut fixture = fixture();
+            fixture.ctx.local_tools = Arc::new(HashMap::from([(
+                WRAPPER.into(),
+                local_tool(ToolAudience::all(), |_, ctx| {
+                    Box::pin(async move {
+                        ctx.cancel.cancelled().await;
+                        smol::future::yield_now().await;
+                        Ok(PARTIAL.into())
+                    })
+                }),
+            )]));
+            let foreground = dispatch(fixture.ctx.clone(), vec![(WRAPPER, WRAPPER.into())]);
+            while !matches!(
+                fixture.events.recv_async().await.unwrap().event,
+                AgentEvent::ToolStart(_)
+            ) {}
+            fixture.run.cancel();
+            let history = foreground.await;
+            assert_eq!(result_text(&history, 0), (PARTIAL, false));
+        });
     }
 
     #[test_case(false; "current_child")]
@@ -1094,78 +1648,6 @@ mod tests {
         });
     }
 
-    #[test]
-    fn a_call_moved_while_it_waits_for_its_file_rechecks_the_write_gate() {
-        smol::block_on(async {
-            let fixture = fixture();
-            let dir = tempfile::TempDir::new().unwrap();
-            let path = dir.path().join(FIRST);
-            let control = controlled_tool(&fixture.ctx, FIRST, Some(path.clone()));
-            let seed = fixture.mailbox.publish_seed(stub_seed_owned_by(
-                fixture.mailbox.session_id(),
-                fixture.ctx.event_tx.owner_cancel().unwrap(),
-            ));
-            let lock = fixture
-                .ctx
-                .file_access
-                .acquire(&crate::tools::FileKey::new(&path))
-                .await;
-            let foreground = dispatch(fixture.ctx.clone(), vec![(FIRST, FIRST.into())]);
-            while !matches!(
-                fixture.events.recv_async().await.unwrap().event,
-                AgentEvent::ToolStart(_)
-            ) {}
-            assert_eq!(fixture.mailbox.background_tools(RUN), 1);
-            foreground.await;
-            seed.set_chat_settings(Default::default(), &AgentMode::Plan(path.clone()));
-            drop(lock);
-            let notice = or(async { notices(&fixture.mailbox, 1).await.pop() }, async {
-                control.started.recv_async().await.unwrap();
-                None
-            })
-            .await
-            .expect("the moved call wrote while its chat plans");
-            assert!(
-                notice
-                    .message
-                    .first_text_content()
-                    .unwrap()
-                    .contains(BACKGROUND_PLAN_WRITE_DENIED)
-            );
-        });
-    }
-
-    #[test]
-    fn a_cancelled_call_keeps_the_reply_it_ends_with() {
-        smol::block_on(async {
-            let mut fixture = fixture();
-            fixture.ctx.local_tools = Arc::new(HashMap::from([(
-                WRAPPER.into(),
-                local_tool(ToolAudience::all(), |_, ctx| {
-                    Box::pin(async move {
-                        ctx.cancel.cancelled().await;
-                        smol::future::yield_now().await;
-                        Ok(PARTIAL.into())
-                    })
-                }),
-            )]));
-            let foreground = dispatch(fixture.ctx.clone(), vec![(WRAPPER, WRAPPER.into())]);
-            while !matches!(
-                fixture.events.recv_async().await.unwrap().event,
-                AgentEvent::ToolStart(_)
-            ) {}
-            fixture.run.cancel();
-            let history = foreground.await;
-            let ContentBlock::ToolResult {
-                content, is_error, ..
-            } = &history.as_slice()[1].content[0]
-            else {
-                panic!("expected a tool result");
-            };
-            assert_eq!((content.as_str(), *is_error), (PARTIAL, false));
-        });
-    }
-
     /// Work a call leaves behind, like a render queued with
     /// `maki.async.run` or a session a plugin kept, holds the call's token:
     /// a stop cancels it, the call ending on its own does not. The run
@@ -1220,7 +1702,7 @@ mod tests {
             let fixture = fixture();
             let dir = tempfile::TempDir::new().unwrap();
             let path = dir.path().join(FIRST);
-            let control = controlled_tool(&fixture.ctx, FIRST, Some(path.clone()));
+            let control = controlled_tool(&fixture.ctx, FIRST, false, Some(path.clone()));
             let lock = fixture
                 .ctx
                 .file_access

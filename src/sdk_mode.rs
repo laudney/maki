@@ -1113,6 +1113,7 @@ impl EventPump {
             AgentEvent::ToolPending { .. }
             | AgentEvent::ToolOutput { .. }
             | AgentEvent::ToolDone(_)
+            | AgentEvent::BackgroundMoveSettled { .. }
             | AgentEvent::ToolBackgrounded(_)
             | AgentEvent::QueueItemConsumed { .. }
             | AgentEvent::QueueDrained

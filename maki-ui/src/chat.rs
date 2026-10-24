@@ -293,7 +293,8 @@ impl Chat {
                 self.messages_panel
                     .push(DisplayMessage::new(DisplayRole::Notice, text));
             }
-            AgentEvent::SubagentHistory { .. }
+            AgentEvent::BackgroundMoveSettled { .. }
+            | AgentEvent::SubagentHistory { .. }
             | AgentEvent::SubagentDetached { .. }
             | AgentEvent::StreamClosed => {}
             AgentEvent::LiveToolBuf { id, body } => {

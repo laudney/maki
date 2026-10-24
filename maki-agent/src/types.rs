@@ -747,6 +747,11 @@ pub enum AgentEvent {
         kind: SteerKind,
         text: String,
     },
+    BackgroundMoveSettled {
+        count: usize,
+        #[serde(skip)]
+        owner_cancel: CancelToken,
+    },
     SubagentDetached {
         child: Box<SubagentInfo>,
     },

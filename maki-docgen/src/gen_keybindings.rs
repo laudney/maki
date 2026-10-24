@@ -209,7 +209,11 @@ fn write_overrides(out: &mut String) {
          turn to the background. Nothing restarts, and the agent continues \
          with a receipt in place of each moved call. Each moved call keeps \
          running as a `tool-` task in `/tasks`, its result arrives as a \
-         notification, and `Ctrl+S` in `/tasks` stops it.\n\n",
+         notification, and `Ctrl+S` in `/tasks` stops it. Its foreground \
+         timeout, such as the `timeout` of a `bash` call, no longer applies, \
+         so a long build or test run goes on until it ends. Limits a tool \
+         puts on its own work, such as the `code_execution` script budget, \
+         still apply.\n\n",
     );
     out.push_str(
         "The key does nothing in a task chat, in an idle chat, or while a \

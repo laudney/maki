@@ -2985,7 +2985,12 @@ fn promotion_preserves_an_already_running_blocking_child(
     if receipt_before_end {
         app.update(receipt.take().unwrap());
     } else {
-        app.background_tools_accepted(app.run_id);
+        if let Some(event) = detached_event.take() {
+            app.update(event);
+        }
+    }
+    if let Some(event) = detached_event.take() {
+        app.update(event);
     }
     assert!(probe.try_recv_autocmd().is_none());
     assert_eq!(

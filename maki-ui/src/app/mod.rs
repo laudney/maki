@@ -1208,18 +1208,6 @@ impl App {
         self.state.mode == Mode::Plan && self.state.plan.is_ready()
     }
 
-    pub(crate) fn background_tools_accepted(&mut self, run_id: u64) {
-        if run_id != self.run_id {
-            return;
-        }
-        for chat in self.chats.iter_mut().skip(1) {
-            if chat.plugin.is_none() && !chat.is_finished() {
-                chat.detached = true;
-            }
-        }
-        self.sync_subagents();
-    }
-
     /// Single implementation behind both the default keybindings and
     /// `maki.ui.action`, so a Lua rebind can never drift from the
     /// original key's behavior.
@@ -1708,11 +1696,14 @@ impl App {
             return vec![];
         }
 
+        if let AgentEvent::BackgroundMoveSettled { .. } = envelope.event {
+            return vec![];
+        }
+
         if let AgentEvent::ToolBackgrounded(ref result) = envelope.event {
             self.state
                 .session_mut()
                 .insert_tool_output(result.id.clone(), result.output.clone());
-            self.background_tools_accepted(envelope.run_id);
             self.main_chat().handle_event(envelope.event, None);
             return vec![];
         }

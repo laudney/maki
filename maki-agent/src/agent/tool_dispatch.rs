@@ -126,7 +126,16 @@ pub async fn run(
     ctx: &ToolContext,
     origin: CallOrigin,
 ) -> ToolDoneEvent {
-    let resolved = resolve(ctx, name);
+    run_resolved(resolve(ctx, name), id, input, ctx, origin).await
+}
+
+async fn run_resolved(
+    resolved: Resolved<'_>,
+    id: String,
+    input: &Value,
+    ctx: &ToolContext,
+    origin: CallOrigin,
+) -> ToolDoneEvent {
     let name = resolved.name;
     let hook = Hook::of(ctx, &resolved, origin);
 
@@ -396,15 +405,15 @@ impl PromptLayers for PromptAsk<'_> {
 
 /// Where a name goes for one context. Dispatch and telemetry read this one
 /// answer, so a name can never be reported as one thing and run as another.
-enum Route<'a> {
-    Local(&'a LocalTool),
+enum Route {
+    Local(LocalTool),
     Native(RegisteredTool),
-    ToolSearch(&'a McpSession),
-    Mcp(&'a McpSession, Arc<str>),
+    ToolSearch(McpSession),
+    Mcp(McpSession, Arc<str>),
     Unknown,
 }
 
-impl Route<'_> {
+impl Route {
     /// Registry tools report the plugin behind them, because "native" alone
     /// tells whoever reads the metric nothing.
     fn source(&self) -> Cow<'static, str> {
@@ -437,7 +446,7 @@ impl Route<'_> {
 /// no caller can act on a name it forgot to canonicalize.
 struct Resolved<'a> {
     name: &'a str,
-    route: Route<'a>,
+    route: Route,
 }
 
 /// Precedence, highest first: client (ACP) tools, the registry, then MCP.
@@ -452,7 +461,7 @@ fn resolve<'a>(ctx: &'a ToolContext, name: &'a str) -> Resolved<'a> {
     // interpreter bridge) never passed through streaming.rs, so clean up here.
     let name = super::streaming::canonical_tool_name(name);
     let route = if let Some(local) = ctx.local_tools.get(name) {
-        Route::Local(local)
+        Route::Local(local.clone())
     } else if let Some(entry) = ctx.registry.get(name) {
         if ctx.tool_filter.matches(name) {
             Route::Native(entry)
@@ -461,14 +470,47 @@ fn resolve<'a>(ctx: &'a ToolContext, name: &'a str) -> Resolved<'a> {
         }
     } else if let Some(mcp) = ctx.mcp.as_ref() {
         match mcp.resolve(name) {
-            Some(qualified) => Route::Mcp(mcp, qualified),
-            None if name == TOOL_SEARCH_TOOL_NAME => Route::ToolSearch(mcp),
+            Some(qualified) => Route::Mcp(mcp.clone(), qualified),
+            None if name == TOOL_SEARCH_TOOL_NAME => Route::ToolSearch(mcp.clone()),
             None => Route::Unknown,
         }
     } else {
         Route::Unknown
     };
     Resolved { name, route }
+}
+
+pub(super) struct OwnedRoute {
+    name: String,
+    route: Route,
+}
+
+impl OwnedRoute {
+    pub(super) fn background_receipt(&self) -> bool {
+        matches!(&self.route, Route::Native(entry) if entry.tool.background_receipt())
+    }
+
+    pub(super) async fn run(self, id: String, input: &Value, ctx: &ToolContext) -> ToolDoneEvent {
+        run_resolved(
+            Resolved {
+                name: &self.name,
+                route: self.route,
+            },
+            id,
+            input,
+            ctx,
+            CallOrigin::Model,
+        )
+        .await
+    }
+}
+
+pub(super) fn resolve_owned(ctx: &ToolContext, name: &str) -> OwnedRoute {
+    let resolved = resolve(ctx, name);
+    OwnedRoute {
+        name: resolved.name.to_owned(),
+        route: resolved.route,
+    }
 }
 
 /// One callable name, as [`resolve`] would route it.
@@ -620,9 +662,9 @@ async fn run_inner(
         Route::Native(entry) => {
             run_native_tool(entry, id, name, input, ctx, origin, ask, hook).await
         }
-        Route::ToolSearch(mcp) => run_tool_search(mcp, id, input, ctx, origin),
+        Route::ToolSearch(mcp) => run_tool_search(&mcp, id, input, ctx, origin),
         Route::Mcp(mcp, qualified) => {
-            execute_mcp_tool(ctx, mcp, &id, qualified, input, origin, ask, hook).await
+            execute_mcp_tool(ctx, &mcp, &id, qualified, input, origin, ask, hook).await
         }
         Route::Unknown => {
             warn!(tool = %name, "unknown tool");

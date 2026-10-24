@@ -152,8 +152,9 @@ impl SessionMailbox {
         *lock(&self.live.foreground_tools) = Arc::downgrade(tools);
     }
 
-    /// Moves the unfinished tools of this exact main-agent run together.
-    /// Capacity exhaustion leaves all of them in the foreground.
+    /// Select the unfinished attached calls of this exact main-agent run. An
+    /// opted-in call is stopped and answers with its receipt, and other calls
+    /// use generic promotion. Generic capacity failure changes no call.
     pub fn background_tools(&self, run_id: u64) -> usize {
         let tools = lock(&self.live.foreground_tools).upgrade();
         tools

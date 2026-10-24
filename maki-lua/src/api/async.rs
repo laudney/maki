@@ -180,6 +180,12 @@ lua_class! {
 /// cancelled/timeout error. Mark it `is_error = true` and end it with a
 /// marker, so the model knows the output it gets is cut short.
 ///
+/// A tool registered with `background_receipt = true` also gets
+/// `"background"` when the user moves its call to the background. The reply
+/// the hook gives through `ctx:finish` is then the receipt the model reads in
+/// place of the result. A result the handler already had wins instead, and
+/// the call completes as usual.
+///
 /// The callback runs outside your coroutine, so it must not yield. It
 /// fires at most once, immediately if the task is already cancelled. An
 /// error inside it is logged and never reaches your handler, and the

@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use maki_agent::InvocationStop;
 use maki_agent::cancel::CancelToken;
 use maki_agent::tools::{
     Deadline, FileKey, MAIN_TASK_ID, ToolAudience, ToolContext, ToolLive, ToolOutputMode,
@@ -15,7 +16,7 @@ use crate::api::tool::ToolCallReply;
 use crate::api::ui::buf::BufHandle;
 use crate::api::util::convert::json_to_lua;
 use crate::api::util::pair::Pair;
-use crate::runtime::{RestoreReason, active_task, lock_cell};
+use crate::runtime::{RestoreReason, TaskHandle, active_task, lock_cell};
 
 const DEADLINE_ALREADY_SET_MSG: &str = "ctx:set_deadline() already called";
 
@@ -124,6 +125,13 @@ pub(crate) struct RestoreCtx {
 }
 
 impl LuaCtx {
+    pub(crate) fn invocation_stop(&self) -> Option<Arc<InvocationStop>> {
+        self.agent()?
+            .running_tool
+            .as_ref()?
+            .invocation_stop(&self.cancel)
+    }
+
     fn new(ctx: &ToolContext, caps: Caps) -> Self {
         Self {
             caps,
@@ -332,10 +340,19 @@ impl UserData for LuaCtx {
             if cell.deadline_secs.get().is_some() {
                 return Err(mlua::Error::runtime(DEADLINE_ALREADY_SET_MSG));
             }
+            let same_invocation = cell.cancel.same_token(&this.cancel);
             cell.deadline_secs.set(Some(secs));
-            cell.deadline
-                .set(Some(Instant::now() + Duration::from_secs(secs)));
+            let at = Instant::now() + Duration::from_secs(secs);
+            cell.deadline.set(Some(at));
             cell.deadline_changed.notify(usize::MAX);
+            drop(cell);
+            if same_invocation
+                && let Some(agent) = this.agent()
+                && let Some(running) = &agent.running_tool
+                && running.matches_invocation(agent.tool_use_id.as_deref(), &this.cancel)
+            {
+                running.set_execution_deadline(at);
+            }
             Ok((Some(true), None))
         });
 
@@ -391,7 +408,11 @@ impl UserData for LuaCtx {
             if let Some(buf) = crate::api::ui::buf::buf_from_reply(&val) {
                 lock_cell(&active_task(lua)).root_buf = Some(buf);
             }
-            let _ = tx.send(ToolCallReply::from_lua_value(lua, &val));
+            let mut reply = ToolCallReply::from_lua_value(lua, &val);
+            reply.receipt = lua
+                .app_data_ref::<TaskHandle>()
+                .is_some_and(|task| lock_cell(&task).in_background_hook);
+            let _ = tx.send(reply);
             Ok((Some(true), None))
         });
     }

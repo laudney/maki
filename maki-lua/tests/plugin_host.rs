@@ -19,8 +19,9 @@ use maki_agent::tools::{
 };
 use maki_agent::{
     Agent, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, AgentSeed, CancelToken,
-    DETACHED_RUN_ID, EventSender, History, InputSource, ModelSlot, RunContext, RunContextBuilder,
-    SessionDefaults, SessionMailbox, ToolOutput, TurnCompleteEvent,
+    DETACHED_RUN_ID, DoneReason, EventSender, History, InputSource, MOVED_CALL_NO_RECEIPT,
+    ModelSlot, RunContext, RunContextBuilder, SessionDefaults, SessionMailbox, ToolOutput,
+    TurnCompleteEvent,
 };
 use maki_config::{
     AlwaysThinking, DefaultEffect, EDIT_SUB_TOOLS, Effect, FILE_WRITE_TOOLS, Permission,
@@ -8608,6 +8609,114 @@ fn a_promoted_lua_tool_keeps_its_running_process(end: PromotedJobEnd) {
     }));
 }
 
+const MOVED_DEADLINE_TOOL: &str = "moved_deadline";
+const MOVED_DEADLINE_RESUME: &str = "moved_deadline_resume";
+const MOVED_DEADLINE_PARKED: &str = "moved deadline call parked";
+const MOVED_DEADLINE_OUTPUT: &str = "outlived its foreground timeout";
+const MOVED_DEADLINE_SOURCE: &str = r#"
+local parked
+maki.api.register_tool({
+    name = "moved_deadline",
+    description = "waits for the test, then outlives its foreground timeout",
+    schema = {
+        type = "object",
+        properties = { expire = { type = "boolean" }, wait_ms = { type = "integer" } },
+        required = { "expire", "wait_ms" },
+    },
+    audiences = { "main" },
+    timeout = 2,
+    handler = function(input, ctx)
+        maki.async.await(1, function(wake)
+            parked = wake
+            maki.ui.flash("moved deadline call parked")
+        end)
+        if input.expire then
+            ctx:set_deadline(0)
+        end
+        maki.async.sleep(input.wait_ms)
+        return "outlived its foreground timeout"
+    end,
+})
+maki.api.register_tool({
+    name = "moved_deadline_resume",
+    description = "resumes the parked call",
+    schema = { type = "object", properties = {} },
+    audiences = { "main" },
+    handler = function()
+        parked()
+        return "resumed"
+    end,
+})
+"#;
+
+/// A moved call runs until it ends or the user stops it, so neither the
+/// call's own deadline nor the tool's timeout cuts it short any more.
+#[test_case::test_case(true, 0; "call_deadline")]
+#[test_case::test_case(false, 2000; "tool_timeout")]
+fn a_moved_call_outlives_its_foreground_timeout(expire: bool, wait_ms: u64) {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source(MOVED_DEADLINE_TOOL, MOVED_DEADLINE_SOURCE)
+        .unwrap();
+    let mailbox = SessionMailbox::register(MakiId::generate());
+    let (_generation_owner, generation) = CancelToken::new();
+    mailbox.publish_generation(generation.clone());
+    let (events_tx, _events) = flume::unbounded();
+    let event_tx = EventSender::new(events_tx, PROMOTED_JOB_RUN).with_owner_cancel(generation);
+    let params = promotion_params(
+        &reg,
+        &mailbox,
+        Arc::new(CallOnce {
+            tool: MOVED_DEADLINE_TOOL,
+            input: json!({ "expire": expire, "wait_ms": wait_ms }),
+            asked: AtomicBool::new(false),
+            requests: flume::unbounded().0,
+        }),
+    );
+    let context = promotion_context(&reg);
+    smol::block_on(promotion_deadline(async {
+        let running = smol::spawn(async move {
+            let mut history = History::new(Vec::new());
+            let mut gauge = ContextGauge::default();
+            Agent::new(
+                params,
+                AgentRunParams {
+                    history: &mut history,
+                    gauge: &mut gauge,
+                    event_tx,
+                    context,
+                },
+            )
+            .run(AgentInput::from_defaults(
+                "run past the timeout".into(),
+                AgentMode::Build,
+                Vec::new(),
+                SessionDefaults::default(),
+                InputSource::Tui,
+            ))
+            .await
+        });
+        loop {
+            let action = host.ui_action_rx().recv_async().await.unwrap();
+            if matches!(action, UiAction::Flash(text) if text == MOVED_DEADLINE_PARKED) {
+                break;
+            }
+        }
+        assert_eq!(mailbox.background_tools(PROMOTED_JOB_RUN), 1);
+        assert!(running.await.is_ok());
+        let wake = mailbox.wake_listener();
+        let resume = Arc::clone(&reg);
+        smol::unblock(move || exec_tool(&resume, MOVED_DEADLINE_RESUME, json!({})))
+            .await
+            .unwrap();
+        wake.await;
+        let notices = mailbox.claim_wake();
+        assert_eq!(notices.len(), 1);
+        let text = notices[0].message.first_text_content().unwrap();
+        assert!(text.contains(MOVED_DEADLINE_OUTPUT), "{text}");
+    }));
+}
+
 const PROMOTED_SESSION_PLUGIN: &str = "promoted_sessions";
 const PROMOTED_SESSION_ROOT: &str = "promoted_session_root";
 const PROMOTED_SESSION_CHILD: &str = "promoted_session_child";
@@ -9217,4 +9326,177 @@ fn a_ctx_session_pays_for_reach_whoever_could_answer(answerable: bool) {
         panic!("unexpected output: {result:?}");
     };
     assert!(text.text.contains("fs_write"), "got: {}", text.text);
+}
+
+const MOVING_JOB: &str = "moving_job";
+const MOVING_STATE: &str = "moving_state";
+const MOVING_BARRIER: &str = "moving_barrier";
+const MOVING_RECEIPT: &str = "moved job receipt";
+const MOVING_RESULT: &str = "finished job result";
+const MOVING_PARTIAL: &str = "partial job output";
+const MOVING_PROMPT: &str = "moving child prompt";
+const MOVING_SOURCE: &str = r#"
+local empty = { type = "object", properties = {}, additionalProperties = false }
+local reasons, child, parked = {}, nil, nil
+maki.api.register_tool({
+    name = "moving_job", description = "answers the stop of its call",
+    background_receipt = true,
+    schema = { type = "object", properties = { mode = { type = "string" } } },
+    handler = function(input, ctx)
+        maki.async.on_cancel(function(reason)
+            reasons[#reasons + 1] = reason
+            maki.async.on_cancel(function(late) reasons[#reasons + 1] = late end)
+            if input.mode == "receipt" then
+                ctx:finish("moved job receipt")
+            elseif input.mode == "partial" then
+                ctx:finish({ llm_output = "partial job output", is_error = true })
+            end
+            if parked then parked() end
+        end)
+        if input.mode == "result" then ctx:finish("finished job result") end
+        child = assert(maki.agent.session(ctx, {
+            background = true, presentation = "attached", prompt = "moving child prompt",
+        }))
+        maki.agent.call_tool(ctx, "moving_barrier", {})
+        maki.async.await(1, function(wake) parked = wake end)
+    end,
+})
+maki.api.register_tool({
+    name = "moving_state", description = "reports the stop reasons", schema = empty,
+    handler = function()
+        return table.concat(reasons, ":") .. ":" .. tostring(child:cancelled())
+    end,
+})
+"#;
+
+enum MovingEnd {
+    Receipt,
+    NoReceipt,
+    QueuedResult,
+    Esc,
+}
+
+impl MovingEnd {
+    fn mode(&self) -> &'static str {
+        match self {
+            Self::Receipt => "receipt",
+            Self::NoReceipt => "none",
+            Self::QueuedResult => "result",
+            Self::Esc => "partial",
+        }
+    }
+}
+
+#[test_case::test_case(MovingEnd::Receipt, MOVING_RECEIPT, false, "background:background:false"; "hook_reply_is_the_receipt")]
+#[test_case::test_case(MovingEnd::NoReceipt, MOVED_CALL_NO_RECEIPT, false, "background:background:false"; "silent_hook_gets_the_fallback_receipt")]
+#[test_case::test_case(MovingEnd::QueuedResult, MOVING_RESULT, false, "background:background:false"; "queued_result_completes_normally")]
+#[test_case::test_case(MovingEnd::Esc, MOVING_PARTIAL, true, "cancelled:cancelled:false"; "esc_keeps_the_hook_reply")]
+fn a_stopped_lua_call_ends_with_the_reply_its_hook_gives(
+    end: MovingEnd,
+    expected: &str,
+    is_error: bool,
+    reasons: &str,
+) {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source(MOVING_JOB, MOVING_SOURCE).unwrap();
+    let mailbox = SessionMailbox::register(MakiId::generate());
+    let (_generation, owner) = CancelToken::new();
+    mailbox.publish_generation(owner.clone());
+    let (foreground_owner, foreground) = CancelToken::new();
+    let (events_tx, events) = flume::unbounded();
+    let event_tx = EventSender::new(events_tx, PROMOTED_JOB_RUN).with_owner_cancel(owner);
+    let (requests_tx, _requests) = flume::unbounded();
+    let params = promotion_params(
+        &reg,
+        &mailbox,
+        Arc::new(CallOnce {
+            tool: MOVING_JOB,
+            input: json!({ "mode": end.mode() }),
+            asked: AtomicBool::new(false),
+            requests: requests_tx,
+        }),
+    );
+    let (started_tx, started) = flume::unbounded();
+    let barrier =
+        maki_agent::tools::local_tool(maki_agent::tools::ToolAudience::all(), move |_, _| {
+            let started = started_tx.clone();
+            Box::pin(async move {
+                started.send(()).unwrap();
+                Ok(String::new())
+            })
+        });
+    let context = promotion_context(&reg);
+    smol::block_on(promotion_deadline(async {
+        let task = smol::spawn(async move {
+            let mut history = History::new(Vec::new());
+            let mut gauge = ContextGauge::default();
+            let result = Agent::new(
+                params,
+                AgentRunParams {
+                    history: &mut history,
+                    gauge: &mut gauge,
+                    event_tx,
+                    context,
+                },
+            )
+            .with_cancel(foreground)
+            .with_local_tools(Arc::new(HashMap::from([(MOVING_BARRIER.into(), barrier)])))
+            .run(AgentInput::from_defaults(
+                MOVING_JOB.into(),
+                AgentMode::Build,
+                Vec::new(),
+                SessionDefaults::default(),
+                InputSource::Tui,
+            ))
+            .await;
+            (result, history)
+        });
+        started.recv_async().await.unwrap();
+        if matches!(end, MovingEnd::Esc) {
+            foreground_owner.cancel();
+        } else {
+            assert_eq!(mailbox.background_tools(PROMOTED_JOB_RUN), 1);
+        }
+        let (result, history) = task.await;
+        assert_eq!(
+            matches!(result, Ok(DoneReason::Cancelled)),
+            matches!(end, MovingEnd::Esc),
+            "{result:?}"
+        );
+        assert!(history.as_slice().iter().any(|message| message.content.iter().any(|block| {
+            matches!(block, ContentBlock::ToolResult { content, is_error: error, .. } if content == expected && *error == is_error)
+        })), "{:?}", history.as_slice());
+        let registry = Arc::clone(&reg);
+        let state = smol::unblock(move || exec_tool(&registry, MOVING_STATE, json!({})))
+            .await
+            .unwrap();
+        assert_eq!(state, reasons);
+        let events: Vec<_> = events.drain().collect();
+        let moved = matches!(end, MovingEnd::Receipt | MovingEnd::NoReceipt);
+        let receipt = events.iter().position(|event| matches!(&event.event, AgentEvent::ToolBackgrounded(done) if done.output.as_text() == expected));
+        let detached = events.iter().position(|event| matches!(&event.event, AgentEvent::SubagentDetached { child } if child.prompt.as_deref() == Some(MOVING_PROMPT)));
+        assert_eq!(receipt.is_some(), moved);
+        assert_eq!(detached.is_some(), moved);
+        assert!(detached <= receipt);
+        let settled: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event.event {
+                AgentEvent::BackgroundMoveSettled { count, .. } => Some(count),
+                _ => None,
+            })
+            .collect();
+        let expected_settled = match end {
+            MovingEnd::Esc => Vec::new(),
+            MovingEnd::QueuedResult => vec![0],
+            MovingEnd::Receipt | MovingEnd::NoReceipt => vec![1],
+        };
+        assert_eq!(settled, expected_settled);
+        assert_eq!(
+            events.iter().any(|event| matches!(&event.event, AgentEvent::ToolDone(done) if done.tool.as_ref() == MOVING_JOB)),
+            !moved
+        );
+        assert!(mailbox.claim_wake().is_empty());
+    }));
+    host.unload(MOVING_JOB).unwrap();
 }
