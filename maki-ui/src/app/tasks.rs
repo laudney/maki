@@ -12,7 +12,7 @@ use maki_storage::id::MakiId;
 use serde::Serialize;
 use strum::IntoStaticStr;
 
-use crate::app::App;
+use crate::app::{App, PendingInput};
 use crate::chat::CANCELLED_TEXT;
 use crate::components::{Action, DisplayRole};
 
@@ -129,6 +129,30 @@ impl App {
         self.chats[self.active_chat].task_id_or_main()
     }
 
+    pub(super) fn retire_task_input(&mut self, id: &str) {
+        self.subagent_answers.remove(id);
+        self.permission_prompt.drop_subagent(id);
+        if matches!(&self.pending_input, PendingInput::AuthRetry { subagent_id: Some(owner) } if owner == id)
+        {
+            self.pending_input = PendingInput::None;
+        }
+    }
+
+    pub(crate) fn retire_session_tasks(&mut self) {
+        for chat in self.chats.iter_mut().skip(1) {
+            if !chat.is_finished() {
+                chat.flush();
+                chat.cancel_in_progress();
+                chat.mark_finished(TaskOutcome::Error, CANCELLED_TEXT);
+            }
+        }
+        self.chat_index.clear();
+        self.subagent_answers.clear();
+        self.permission_prompt.retain_subagents(|_| false);
+        self.pending_input = PendingInput::None;
+        self.sync_subagents();
+    }
+
     pub(crate) fn focus_task(&mut self, id: &str) -> Result<(), String> {
         let idx = self.chat_of_task(id)?;
         self.set_active_chat(idx);
@@ -154,8 +178,7 @@ impl App {
         chat.flush();
         chat.cancel_in_progress();
         chat.mark_finished(TaskOutcome::Error, CANCELLED_TEXT);
-        self.subagent_answers.remove(id);
-        self.permission_prompt.drop_subagent(id);
+        self.retire_task_input(id);
         Ok(action)
     }
 

@@ -5,7 +5,8 @@
 --
 -- A user stop reaches a running task as an error from its own prompt, so it
 -- keeps its partial output. A queued task has no prompt to fail, so the
--- TaskStopped event finishes it instead.
+-- TaskStopped event finishes it instead. The session owns its notice, so one
+-- that outlives its chat generation is dropped instead of delivered.
 
 local Runner = require("runner")
 
@@ -45,7 +46,7 @@ local function finish(entry, result, wake)
   local verb = result.is_error and not wake and "cancelled" or status
   local _, err = maki.session.notify(
     "Background task " .. entry.name .. " " .. status .. ":\n\n" .. result.llm_output,
-    { session = entry.chat, wake = wake, display = LINE:format(verb, entry.name) }
+    { session = entry.chat, wake = wake, owner = entry.session, display = LINE:format(verb, entry.name) }
   )
   if err then
     maki.log.warn("background task notification failed: " .. err)

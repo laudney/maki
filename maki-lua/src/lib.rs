@@ -148,7 +148,7 @@ pub mod test_support {
             use crate::runtime::Request;
             while let Ok(req) = self.0.try_recv() {
                 if let Request::RestoreToolAsync { item, .. } = req {
-                    return Some(item);
+                    return Some(*item);
                 }
             }
             None

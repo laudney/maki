@@ -973,17 +973,20 @@ events. Everything else fires under `maki -p` and sdk mode as well.
 `"SessionEnd"` is the teardown signal: it fires first so handlers can
 still inspect or stop the session's jobs, then session-owned jobs are
 reaped. `data.reason` names the path it came from: `"reset"` (TUI
-`/new`), `"load"`, `"delete"` (tab closed), `"shutdown"`, `"reload"`
-(`/reload` is rebuilding the plugin host, and the session carries on in
-the new one), `"replaced"` (an ACP client took the session's place), or
-`"completed"` (a headless run finished).
+`/new`), `"load"` (another session loaded into the tab), `"rewind"` (a
+rewind restarted the session from an earlier turn), `"delete"` (tab
+closed), `"shutdown"`, `"reload"` (`/reload` is rebuilding the plugin
+host, and the session carries on in the new one), `"replaced"` (an ACP
+client took the session's place), or `"completed"` (a headless run
+finished).
 
 On `"shutdown"`, `"reload"`, `"replaced"`, and `"completed"` the host is
 already tearing down, so the UI is detached (`maki.fn` roundtrips fail
-right away) and every handler shares one grace period. `data.deadline_ms`
-is how much of it is left at dispatch, so write state out with `maki.fs`
-and do not park. On the other reasons nothing waits and `data.deadline_ms`
-is nil.
+right away). On `"reset"`, `"load"`, and `"rewind"` the UI stays, but the
+session's next run waits for the handlers. On all of these, every
+handler shares one grace period. `data.deadline_ms` is how much of it is
+left at dispatch, so write state out with `maki.fs` and do not park. On
+`"delete"` nothing waits and `data.deadline_ms` is nil.
 
 `"SessionReset"` stays TUI-only (`/new`) and fires on the same path as
 `"SessionEnd"` with `reason = "reset"`.
@@ -1621,8 +1624,9 @@ the task that opened it: an autocmd callback when it returns, a tool
 handler with its tool call, a `maki.async.spawn` task when it finishes.
 `"session"` outlives the task. Both end at `:close()`, when the chat
 session ends (`/new`, closing the tab) and when the plugin unloads
-(`/reload`). Turn ends, Esc and rewinds leave it alone. Esc on a tool
-call still cancels a prompt that the tool's handler is waiting on.
+(`/reload`). Replacing the chat generation, including a rewind, ends it.
+Turn completion and foreground Esc leave it alone. Esc on a tool call
+still cancels a prompt that the tool's handler is waiting on.
 
 A polling monitor opens one per round inside a `maki.async.spawn` loop.
 An event-driven one opens once with `scope = "session"`, keeps the handle
@@ -1670,6 +1674,10 @@ session, so opening one fails with "session not live". The
     `"max"`), or a budget integer (token count). Inherits the parent
     setting if omitted, and is capped at it otherwise.
   - `fast` (`boolean?`) use fast mode. Inherits parent setting if omitted.
+  - `background` (`boolean?`) let the session outlive the tool call that
+    spawned it: it gets its own cancel token (still cancelable by id), a
+    generated UI id, and events that keep routing after the parent run
+    ends. Default: false.
 
 **Returns:** ([`Session?`](#maki-agent-Session), `string?`) Session handle, or `(nil, err)` on failure.
 
@@ -1781,7 +1789,7 @@ print(r.input_tokens .. " input, " .. r.output_tokens .. " output tokens")
 ### `Session:close()` {#Session-close}
 
 ```lua
-Session:close()
+Session:close({status?})
 ```
 
 Close the session and flush its history back to the parent agent. Calling
@@ -1794,6 +1802,35 @@ the VM sits idle, and the subagent's event relay stays alive until it does.
 Close cancels a running prompt before waiting to flush its history. That
 prompt returns a cancelled error and any partial text.
 
+**Parameters:**
+
+- `{status?}` (`string?`) What ended the run: `"done"` or `"error"`. A frontend with no tool call to carry the verdict, like a background child, needs it. Omit it to leave the verdict to whoever reports the result.
+
+---
+
+### `Session:cancel()` {#Session-cancel}
+
+```lua
+Session:cancel()
+```
+
+Stop the session's work. A prompt in flight ends with a cancelled error,
+and a prompt sent afterwards fails at once. This releases the native
+event relay and flushes history once the prompt unwinds.
+
+---
+
+### `Session:cancelled()` {#Session-cancelled}
+
+```lua
+Session:cancelled()
+```
+
+Whether this session was cancelled. A cancel that did not come through the
+plugin, such as the picker or a session close, is only visible here.
+
+**Returns:** (`boolean`) true once the session's token has fired.
+
 ---
 
 ### `Session:id()` {#Session-id}
@@ -1802,11 +1839,9 @@ prompt returns a cancelled error and any partial text.
 Session:id()
 ```
 
-The task id of this session. A session opened by chat session id goes by
-this id in `maki.task.list()` and the `"TaskStopped"` event, so a plugin
-can tell which of those are its own.
+The stable identity used to address this child, including after it closes.
 
-**Returns:** (`string`) Session task id.
+**Returns:** (`string`) Child session identity.
 
 
 ## maki.async {#maki-async}
@@ -5067,6 +5102,8 @@ Requires the `session_write` [plugin permission](#plugin-permissions).
     when the session's agent run accepts the report. Whitespace collapses
     to single spaces and the note is cut to 256 bytes. Defaults to
     nothing; the model reads only {text}.
+  - `owner` (`Session?`) child Session that owns this report. Its parent
+    generation must still be live when the report is queued and read.
 
 **Returns:** (`boolean|nil`, `string|nil`) true, or nil and an error.
 

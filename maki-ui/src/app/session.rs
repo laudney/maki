@@ -180,6 +180,7 @@ impl App {
                     fast: chat.opts.is_some_and(|o| o.fast),
                     plugin: chat.plugin.clone(),
                     cost: chat.cost,
+                    detached: chat.agent,
                 })
             })
             .collect();
@@ -290,6 +291,7 @@ impl App {
             chat.plugin = sa.plugin;
             chat.cost = sa.cost;
             chat.model_id = sa.model;
+            chat.agent = sa.detached;
             chat.opts = sa.thinking.map(|thinking| RequestOptions {
                 thinking: thinking.into(),
                 fast: sa.fast,
@@ -422,8 +424,6 @@ impl App {
         // that just ended needs its id, and the stamp always reads
         // whichever session is current.
         self.fire_session_event(HostEvent::SessionReset {});
-        self.lua_event_handle
-            .end_session(self.state.session.id, SessionEndReason::Reset);
         // Swapping the claim is what gives the old session back: the snapshot
         // `checkpoint_now` just queued holds its own clone until it lands.
         let OpenSession { session, claim } = self.blank_session();
@@ -435,7 +435,10 @@ impl App {
             maki_otel::emit::START_FRESH,
             Some(&self.state.session.id.to_string()),
         );
-        vec![Action::RestartAgent(self.install_local_history())]
+        vec![Action::RestartAgent(
+            self.install_local_history(),
+            SessionEndReason::Reset,
+        )]
     }
 
     /// `/fork` copies the session under a fresh id. The event loop opens the
@@ -505,7 +508,10 @@ impl App {
         self.input_box.set_input(entry.prompt_text);
         self.input_box.buffer.move_to_end();
 
-        vec![Action::RestartAgent(self.install_local_history())]
+        vec![Action::RestartAgent(
+            self.install_local_history(),
+            SessionEndReason::Rewind,
+        )]
     }
 
     /// The event loop owns the policy and the providers, so it resolves the
@@ -515,14 +521,9 @@ impl App {
         open: OpenSession,
         model: &Model,
     ) -> Vec<Message> {
-        let previous = self.state.session.id;
         self.checkpoint_now();
         self.apply_stored_permissions(&open.session.meta);
         self.state = SessionState::from_session(open, model, &self.storage);
-        if previous != self.state.session.id {
-            self.lua_event_handle
-                .end_session(previous, SessionEndReason::Load);
-        }
         for w in self.state.warnings.drain(..) {
             self.status_bar.flash(w);
         }

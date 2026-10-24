@@ -676,6 +676,10 @@ pub struct StoredSubagent {
     pub plugin: Option<Arc<str>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost: Option<f64>,
+    /// True when the child outlived the tool call that spawned it, which keeps
+    /// it a background agent after a reload.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub detached: bool,
 }
 
 #[derive(Deserialize)]
@@ -2448,6 +2452,7 @@ mod tests {
                 fast: false,
                 plugin: plugin.map(Arc::from),
                 cost: None,
+                detached: false,
             }
         }
 
@@ -2662,7 +2667,8 @@ mod tests {
         let id: MakiId = LEGACY_HEX_ID.parse().unwrap();
         let meta_line = concat!(
             r#"{"t":"meta","title":"t","token_usage":null,"updated_at":0,"fast":true,"#,
-            r#""subagents":[{"tool_use_id":"t1","name":"child"}],"#,
+            r#""subagents":[{"tool_use_id":"t1","name":"child","detached":true},"#,
+            r#"{"tool_use_id":"t2","name":"legacy"}],"#,
             r#""usage_by_model":{"m":{"input":7,"output":3}}}"#,
         );
         let json = format!(
@@ -2674,6 +2680,8 @@ mod tests {
 
         let mut loaded = TestSession::load_from(id, tmp.path()).unwrap();
         assert_eq!(loaded.subagents()[0].name, "child");
+        assert!(loaded.subagents()[0].detached);
+        assert!(!loaded.subagents()[1].detached);
         assert_eq!(loaded.usage_by_model()["m"].total(), 10);
         assert!(loaded.meta.fast, "flattened meta still parses alongside");
 

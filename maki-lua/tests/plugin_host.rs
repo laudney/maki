@@ -25,8 +25,8 @@ use maki_config::{
 };
 use maki_lua::{
     InitFiles, Interaction, KEY_WARNING, MAX_INFLIGHT_TOOLS, Missing, NO_UI_ERR,
-    PERMISSION_NAME_WARNING, PluginError, PluginHost, PluginPermissions, SKIPPED_PLUGIN_WARNING,
-    SessionEndReason, WARM_TOOL_CAP, set_allowed_private_hosts,
+    PERMISSION_NAME_WARNING, PlanActionOutcome, PluginError, PluginHost, PluginPermissions,
+    SKIPPED_PLUGIN_WARNING, SessionEndReason, UiAction, WARM_TOOL_CAP, set_allowed_private_hosts,
 };
 use maki_providers::provider::{BoxFuture, Provider};
 use maki_providers::{
@@ -3248,6 +3248,154 @@ local seen
         );
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn delayed_session_end_reaps_only_its_captured_generation() {
+    const CLEANUP_DONE: &str = "generation cleanup complete";
+    const REJECTED: &str = "rejected";
+    const OLD_REAPED: &str = "missing,running";
+    const ALL_REAPED: &str = "missing,missing";
+    const PLAN_PATH: &str = "/tmp/generation-plan.md";
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let ui = host.ui_action_rx();
+    let session = MakiId::generate();
+    let mailbox = SessionMailbox::register(session);
+    let publish = |token| {
+        let seed = stub_seed(session);
+        mailbox.publish_seed(AgentSeed::new(
+            seed.session_id,
+            token,
+            Arc::default(),
+            seed.model_slot,
+            seed.config,
+            seed.tool_output_lines,
+            seed.permissions,
+            seed.mcp,
+            seed.timeouts,
+            seed.model_policy,
+        ))
+    };
+    let (owner, token) = CancelToken::new();
+    let old = publish(token);
+    host.load_source(
+        "generation_cleanup",
+        &format!(
+            r#"
+local jobs = {{}}
+local ends = 0
+maki.api.register_tool({{
+    name = "start_generation_job",
+    description = "starts a session-owned job",
+    schema = {MINIMAL_SCHEMA},
+    audiences = {{ "main" }},
+    handler = function()
+        local job = maki.fn.jobstart({{ "sleep", "30" }}, {{ scope = {{ session = "{session}" }} }})
+        if not job then return "{REJECTED}" end
+        table.insert(jobs, job)
+        return tostring(job)
+    end,
+}})
+maki.api.register_tool({{
+    name = "probe_generation_jobs",
+    description = "reports the old and replacement jobs",
+    schema = {MINIMAL_SCHEMA},
+    audiences = {{ "main" }},
+    handler = function()
+        local states = {{}}
+        for _, id in ipairs(jobs) do
+            local info = maki.fn.jobinfo(id)
+            table.insert(states, info and info.status or "missing")
+        end
+        return table.concat(states, ",")
+    end,
+}})
+maki.api.set_slot("ui.plan_form.actions", function()
+    return {{{{ id = "generation", label = "Generation", handler = function() return false end }}}}
+end)
+maki.api.create_autocmd("SessionEnd", {{ callback = function()
+    ends = ends + 1
+    if ends == 1 then
+        assert(maki.fn.jobinfo(jobs[1]).status == "running")
+        assert(maki.ui.input())
+    end
+end }})
+maki.api.create_autocmd("GenerationCleanupComplete", {{ callback = function()
+    maki.ui.flash("{CLEANUP_DONE}")
+end }})
+"#
+        ),
+    )
+    .unwrap();
+    let handle = host.event_handle();
+    let menu = || {
+        handle
+            .open_plan_form(PLAN_PATH.into(), session.to_string(), Vec::new())
+            .recv_timeout(CANCEL_TEST_TIMEOUT)
+            .unwrap()
+            .unwrap()
+    };
+    let pick = |generation| {
+        handle
+            .run_plan_action(session.to_string(), generation, 0, PLAN_PATH.into(), false)
+            .recv_timeout(CANCEL_TEST_TIMEOUT)
+            .unwrap()
+    };
+    exec_tool(&reg, "start_generation_job", json!({})).unwrap();
+    assert_eq!(menu().rows.len(), 1);
+
+    owner.cancel();
+    drop(old);
+    handle.end_session(session, SessionEndReason::Shutdown);
+    let UiAction::Input { reply_tx, .. } = ui.recv_timeout(CANCEL_TEST_TIMEOUT).unwrap() else {
+        panic!("the retiring callback must reach its barrier")
+    };
+    assert_eq!(
+        exec_tool(&reg, "start_generation_job", json!({})).unwrap(),
+        REJECTED
+    );
+    assert!(menu().rows.is_empty());
+
+    let (replacement_owner, token) = CancelToken::new();
+    let replacement = publish(token);
+    assert_ne!(
+        exec_tool(&reg, "start_generation_job", json!({})).unwrap(),
+        REJECTED
+    );
+    let replacement_menu = menu();
+    assert_eq!(replacement_menu.rows.len(), 1);
+    handle.fire_autocmd("GenerationCleanupComplete", json!({}));
+    reply_tx.send(Ok(json!({}))).unwrap();
+    assert!(matches!(
+        ui.recv_timeout(CANCEL_TEST_TIMEOUT).unwrap(),
+        UiAction::Flash(message) if message == CLEANUP_DONE
+    ));
+    assert_eq!(
+        exec_tool(&reg, "probe_generation_jobs", json!({})).unwrap(),
+        OLD_REAPED
+    );
+    assert_eq!(pick(replacement_menu.generation), PlanActionOutcome::Vetoed);
+
+    handle.end_session(session, SessionEndReason::Shutdown);
+    handle.fire_autocmd("GenerationCleanupComplete", json!({}));
+    assert!(matches!(
+        ui.recv_timeout(CANCEL_TEST_TIMEOUT).unwrap(),
+        UiAction::Flash(message) if message == CLEANUP_DONE
+    ));
+    assert_eq!(
+        exec_tool(&reg, "probe_generation_jobs", json!({})).unwrap(),
+        ALL_REAPED
+    );
+    assert_eq!(pick(replacement_menu.generation), PlanActionOutcome::Failed);
+    replacement_owner.cancel();
+    drop(replacement);
+    assert_eq!(
+        exec_tool(&reg, "start_generation_job", json!({})).unwrap(),
+        REJECTED
+    );
+    assert!(menu().rows.is_empty());
 }
 
 #[test]
@@ -7694,6 +7842,7 @@ fn handed_over_history(
             AgentEvent::SubagentHistory {
                 tool_use_id,
                 messages,
+                ..
             } if tool_use_id == id => Some(messages),
             _ => None,
         })
@@ -7763,8 +7912,9 @@ fn cancelled_background_prompt_goes_idle_and_bills_its_paid_turn() {
 /// "cancelled", so a monitor loop knows not to reopen. What it streamed
 /// before the stop still reaches the tab's transcript: the plugin may never
 /// close a stopped session, and nothing else would write it.
-#[test]
-fn stopping_a_plugin_task_from_the_tab_ends_its_prompt_as_stopped_by_user() {
+#[test_case::test_case(false; "native_scope")]
+#[test_case::test_case(true; "with_background_option")]
+fn stopping_a_plugin_task_from_the_tab_ends_its_prompt_as_stopped_by_user(background: bool) {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     let session = MakiId::generate();
@@ -7772,11 +7922,11 @@ fn stopping_a_plugin_task_from_the_tab_ends_its_prompt_as_stopped_by_user() {
     let seed = mailbox.publish_seed(stub_seed(session));
     let parked = TurnThenPark::install(&seed);
     let ui = host.ui_action_rx();
-    host.load_source(
-        BACKGROUND_PLUGIN,
-        &background_monitor_src(&session.to_string()),
-    )
-    .unwrap();
+    let source = background_monitor_src(&session.to_string()).replace(
+        &format!("name = \"{BACKGROUND_NAME}\""),
+        &format!("name = \"{BACKGROUND_NAME}\", background = {background}"),
+    );
+    host.load_source(BACKGROUND_PLUGIN, &source).unwrap();
     assert_eq!(
         exec_tool(&reg, "open_background", json!({})).unwrap(),
         "nil"
@@ -7871,7 +8021,11 @@ fn a_retired_background_session_refuses_later_prompts() {
         .expect("a retired session must reject its next prompt");
     assert_eq!(reply, Ok(CANCELLED_MSG.to_owned()));
     assert!(parked.try_recv().is_err());
-    assert_eq!(task_events(&ui, session).count(), 0);
+    assert!(task_events(&ui, session).all(|event| match event {
+        AgentEvent::SubagentHistory { messages, .. } => messages.is_empty(),
+        AgentEvent::StreamClosed => true,
+        _ => false,
+    }));
     assert_eq!(exec_tool(&reg, "list_background", json!({})).unwrap(), "");
 }
 
@@ -7919,6 +8073,7 @@ fn cancelling_the_prompting_handler_cuts_its_background_prompt() {
     let mailbox = SessionMailbox::register(session);
     let seed = mailbox.publish_seed(stub_seed(session));
     let parked = TurnThenPark::install(&seed);
+    let ui = host.ui_action_rx();
     host.load_source(
         BACKGROUND_PLUGIN,
         &background_monitor_src(&session.to_string()),
@@ -7928,6 +8083,7 @@ fn cancelling_the_prompting_handler_cuts_its_background_prompt() {
         exec_tool(&reg, "open_background", json!({})).unwrap(),
         "nil"
     );
+    let id = exec_tool(&reg, "background_id", json!({})).unwrap();
     let (trigger, token) = CancelToken::new();
     let reply = call_on_thread(&reg, "prompt_background", token);
 
@@ -7940,6 +8096,30 @@ fn cancelling_the_prompting_handler_cuts_its_background_prompt() {
         .recv_timeout(CANCEL_TEST_TIMEOUT)
         .expect("the cancelled handler must settle");
     assert_eq!(reply, Ok(CANCELLED_MSG.to_owned()));
+    let history = ui
+        .drain()
+        .find_map(|action| match action {
+            maki_lua::UiAction::PluginTaskEvent {
+                task_id, envelope, ..
+            } if task_id == id && matches!(envelope.event, AgentEvent::SubagentHistory { .. }) => {
+                Some(envelope)
+            }
+            _ => None,
+        })
+        .expect("the completed prompt must persist its interim transcript");
+    assert!(matches!(
+        history.event,
+        AgentEvent::SubagentHistory { status: None, .. }
+    ));
+    let owner = history
+        .subagent
+        .expect("interim history must retain its session owner");
+    assert_eq!(owner.parent_tool_use_id, id);
+    assert!(
+        owner
+            .owner_cancel
+            .is_some_and(|token| !token.is_cancelled())
+    );
 }
 
 /// A spawned task holds the session in a parked prompt, so the handler queues

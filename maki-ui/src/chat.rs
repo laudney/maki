@@ -80,6 +80,9 @@ pub struct Chat {
     pub(crate) inbox: Option<Arc<SubagentInbox>>,
     /// Parked while another chat is in front, see `App::set_active_chat`.
     pub(crate) draft: Submission,
+    /// True for a background subagent: one that outlives the tool call and the
+    /// turn that spawned it, so this chat is not turn-scoped.
+    pub agent: bool,
     pending_turn_usage: Option<String>,
     messages_panel: MessagesPanel,
     /// The ending and the index of the bubble announcing it, so a later, better
@@ -111,6 +114,7 @@ impl Chat {
             opts: None,
             inbox: None,
             draft: Submission::default(),
+            agent: false,
             pending_turn_usage: None,
             messages_panel,
             finish: None,

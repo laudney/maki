@@ -61,6 +61,13 @@ pub(super) struct AgentLoop {
     subagent_cancels: Arc<CancelMap<String>>,
 }
 
+impl Drop for AgentLoop {
+    fn drop(&mut self) {
+        self.cancels.cancel_all();
+        self.subagent_cancels.cancel_all();
+    }
+}
+
 impl AgentLoop {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
@@ -84,6 +91,8 @@ impl AgentLoop {
         let mcp = mcp_handle.map(|h| McpSession::new(h, &resumed.history));
         let seed = mailbox.publish_seed(AgentSeed::new(
             resumed.id,
+            cancels.teardown().clone(),
+            Arc::clone(&subagent_cancels),
             model_slot,
             config,
             tool_output_lines,
@@ -125,7 +134,8 @@ impl AgentLoop {
                 self.process_run(run, run_id).await;
             }
             if let Some(run_id) = last_run_id {
-                let event_tx = EventSender::new(self.agent_tx.clone(), run_id);
+                let event_tx = EventSender::new(self.agent_tx.clone(), run_id)
+                    .with_owner_cancel(self.cancels.teardown().clone());
                 self.queue
                     .publish_if_empty(|| event_tx.try_send(AgentEvent::QueueDrained));
             }
@@ -138,7 +148,7 @@ impl AgentLoop {
         // A `tool_use_id` only names work inside the run that issued the call,
         // so the run ending is what stops whatever still hangs off one, rather
         // than a group emptying out.
-        self.subagent_cancels.cancel_all();
+        self.subagent_cancels.end_foreground();
 
         // A cancel arrives here as `Ok`, since esc is what the user asked for.
         // As an error it would draw a second "Cancelled." bubble under the one
@@ -155,7 +165,8 @@ impl AgentLoop {
         run_id: u64,
         cancel: &CancelToken,
     ) -> Result<(), AgentError> {
-        let event_tx = EventSender::new(self.agent_tx.clone(), run_id);
+        let event_tx = EventSender::new(self.agent_tx.clone(), run_id)
+            .with_owner_cancel(self.cancels.teardown().clone());
         match run {
             QueueRun::Compact(compaction) => {
                 self.do_compact(&event_tx, &compaction, cancel).await?;
@@ -357,7 +368,8 @@ impl AgentLoop {
 
     fn emit_error(&self, run_id: u64, error: AgentError) {
         error!(error = %error, "agent error");
-        let event_tx = EventSender::new(self.agent_tx.clone(), run_id);
+        let event_tx = EventSender::new(self.agent_tx.clone(), run_id)
+            .with_owner_cancel(self.cancels.teardown().clone());
         let _ = event_tx.send(AgentEvent::error(&error));
     }
 }

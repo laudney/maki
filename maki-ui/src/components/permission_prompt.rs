@@ -218,6 +218,14 @@ impl PermissionPrompt {
         self.queue.retain(|request| !owns(request));
     }
 
+    pub fn retain_subagents(&mut self, keep: impl Fn(&str) -> bool) {
+        let keep = |request: &Request| request.subagent_id.as_deref().is_some_and(&keep);
+        if self.queue.front().is_some_and(|request| !keep(request)) {
+            self.reset_entry();
+        }
+        self.queue.retain(keep);
+    }
+
     pub(crate) fn tool(&self) -> Option<&ToolKey> {
         self.queue.front().map(|request| &request.tool)
     }

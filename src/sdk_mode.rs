@@ -17,6 +17,7 @@ use std::time::Instant;
 use color_eyre::Result;
 use color_eyre::eyre::{Context, eyre};
 use flume::Sender;
+use maki_agent::cancel::CancelMap;
 use maki_agent::headless::{self, InteractiveHandle, InteractiveParams};
 use maki_agent::mcp;
 use maki_agent::permissions::{PermissionAnswer, PluginRuleStore, TaggedAnswer};
@@ -24,8 +25,9 @@ use maki_agent::prompt::ResolvedPrompts;
 use maki_agent::session::Resumed;
 use maki_agent::tools::QUESTION_TOOL_NAME;
 use maki_agent::{
-    AgentConfig, AgentEvent, AgentInput, AgentMode, DoneReason, Envelope, InputSource,
-    PermissionsConfig, SessionEndReason, SessionEvents, SteerKind,
+    AgentConfig, AgentEvent, AgentInput, AgentMode, AskOwner, DETACHED_RUN_ID, DoneReason,
+    Envelope, InputSource, OwnedAsks, PermissionsConfig, SessionEndReason, SessionEvents,
+    SteerKind,
 };
 use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
 use maki_lua::session_snapshot::{HeadlessMeta, HeadlessSnapshot, MODE_BUILD, MODE_PLAN};
@@ -468,17 +470,34 @@ pub struct SdkParams {
     pub project_config: ProjectConfig,
 }
 
-/// Routes permission answers between stdin and the agent.
-///
-/// Owning the outstanding ids *and* the answer channel is the point: an
-/// unanswered request parks the agent forever, so a request may only be
-/// recorded while a source that could answer it exists.
+/// Whose events a cached tool input came from: a main-agent run, or a child
+/// for as long as it lives.
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum InputOwner {
+    Run(u64),
+    Child(String),
+}
+
+struct PendingAsk {
+    ask_id: String,
+    answer_tx: Sender<String>,
+}
+
+impl PendingAsk {
+    fn answer(&self, answer: PermissionAnswer) {
+        let _ = self
+            .answer_tx
+            .send(TaggedAnswer::new(&self.ask_id, answer).encode());
+    }
+}
+
+/// Keeps the reply channel and lifetime of each outstanding wire request.
 struct Permissions {
     answer_tx: Sender<String>,
     /// Wire request id to the agent-side ask it stands for. The agent only
     /// accepts an answer naming the ask it is parked on, so the id it asked
     /// with has to survive the round trip through stdin.
-    outstanding: HashMap<String, String>,
+    outstanding: OwnedAsks<String, PendingAsk>,
     answerable: bool,
 }
 
@@ -486,50 +505,40 @@ impl Permissions {
     fn new(answer_tx: Sender<String>) -> Self {
         Self {
             answer_tx,
-            outstanding: HashMap::new(),
+            outstanding: OwnedAsks::default(),
             answerable: true,
         }
     }
 
-    fn answer(&self, ask_id: &str, answer: PermissionAnswer) {
-        let _ = self
-            .answer_tx
-            .send(TaggedAnswer::new(ask_id, answer).encode());
-    }
-
-    fn deny_unanswerable(&self, request_id: &str, ask_id: &str) {
-        warn!(%request_id, %ask_id, "denying tool permission: stdin closed");
-        self.answer(ask_id, PermissionAnswer::Deny);
+    fn deny_unanswerable(&self, request_id: &str, ask: &PendingAsk) {
+        warn!(%request_id, ask_id = %ask.ask_id, "denying tool permission: answer source closed");
+        ask.answer(PermissionAnswer::Deny);
     }
 
     /// Records an outstanding request against the ask it answers. `false` means
     /// nobody is left to answer it, so it was denied here and must not be put
     /// on the wire.
-    fn ask(&mut self, request_id: String, ask_id: String) -> bool {
+    fn ask(&mut self, request_id: String, owner: AskOwner, ask: PendingAsk) -> bool {
         if !self.answerable {
-            self.deny_unanswerable(&request_id, &ask_id);
+            self.deny_unanswerable(&request_id, &ask);
             return false;
         }
-        self.outstanding.insert(request_id, ask_id);
+        self.outstanding.insert(request_id, owner, ask);
         true
     }
 
     fn resolve(&mut self, request_id: &str, answer: PermissionAnswer) {
-        if let Some(ask_id) = self.outstanding.remove(request_id) {
-            self.answer(&ask_id, answer);
+        if let Some(ask) = self.outstanding.take(request_id) {
+            ask.answer(answer);
         }
-    }
-
-    /// The turn is over, so the agent is no longer parked on any of these.
-    fn forget_outstanding(&mut self) {
-        self.outstanding.clear();
     }
 
     /// No further answers can arrive. Idempotent.
     fn close(&mut self) {
         self.answerable = false;
-        for (request_id, ask_id) in std::mem::take(&mut self.outstanding) {
-            self.deny_unanswerable(&request_id, &ask_id);
+        let outstanding: Vec<_> = self.outstanding.drain().collect();
+        for (request_id, ask) in outstanding {
+            self.deny_unanswerable(&request_id, &ask);
         }
     }
 }
@@ -569,6 +578,7 @@ pub fn run(params: SdkParams) -> Result<()> {
 
     let (mcp_handle, mcp_config_errors) =
         smol::block_on(mcp::start_connected(&cwd, project_config.clone()));
+
     if !mcp_config_errors.is_empty() {
         eprintln!("MCP config error: {mcp_config_errors}");
     }
@@ -664,6 +674,7 @@ pub fn run(params: SdkParams) -> Result<()> {
         lua_handle: lua_handle.clone(),
         session_id: handle.session_id.to_string(),
         snapshot,
+        subagent_cancels: Arc::clone(&handle.subagent_cancels),
     }
     .spawn(events);
 
@@ -701,7 +712,7 @@ pub fn run(params: SdkParams) -> Result<()> {
                     defaults,
                     InputSource::Headless,
                 );
-                if handle.input_tx.send(input).is_err() {
+                if handle.submit(input).is_err() {
                     break;
                 }
             }
@@ -758,6 +769,7 @@ pub fn run(params: SdkParams) -> Result<()> {
         input_tx,
         task,
         session_id,
+        mailbox,
         ..
     } = handle;
     drop(input_tx);
@@ -771,6 +783,7 @@ pub fn run(params: SdkParams) -> Result<()> {
     // orphan inheriting stdout would keep an orchestrator's read blocked
     // after maki exits.
     lua_handle.end_sessions_blocking([session_id.id()], SessionEndReason::Completed);
+    drop(mailbox);
     drop(writer);
     let _ = writer_thread.join();
     Ok(())
@@ -841,7 +854,7 @@ fn handle_control_request(
             )
         }
         "interrupt" => {
-            let _ = handle.cancel_tx.try_send(());
+            handle.cancel_active();
             writer.emit_control_response(&cr.request_id, ok, None)
         }
         "set_permission_mode" => {
@@ -935,7 +948,7 @@ struct EventPump {
     shared: Arc<Mutex<Shared>>,
     include_partial_messages: bool,
     synth: StreamSynth,
-    tool_inputs: HashMap<String, (String, Value)>,
+    tool_inputs: HashMap<(InputOwner, String), (String, Value)>,
     result_text: String,
     /// Summed as the turns land: rates move mid-prompt, and only a turn knows
     /// the rate it paid.
@@ -944,26 +957,19 @@ struct EventPump {
     lua_handle: maki_lua::EventHandle,
     session_id: String,
     snapshot: HeadlessSnapshot,
+    subagent_cancels: Arc<CancelMap<String>>,
 }
 
 impl EventPump {
     fn spawn(mut self, mut events: SessionEvents) -> smol::Task<()> {
         smol::spawn(async move {
             while let Some(envelope) = events.next().await {
-                // Folded in first, so a plugin handling `TurnEnd` finds the
-                // finished totals when it calls `maki.session.read()`.
-                self.snapshot.observe(&envelope);
-                maki_lua::agent_autocmd::dispatch(
-                    &self.lua_handle,
-                    &self.session_id,
-                    &envelope,
-                    envelope.subagent.is_some(),
-                );
                 if let Err(e) = self.handle(envelope) {
                     warn!(error = %e, "sdk event pump stopped");
                     break;
                 }
             }
+            self.shared.lock().unwrap().permissions.close();
         })
     }
 
@@ -978,16 +984,25 @@ impl EventPump {
         })
     }
 
-    fn reset_turn(&mut self) {
+    fn reset_turn(&mut self, run_id: u64) {
         self.synth.reset();
-        self.tool_inputs.clear();
         self.result_text.clear();
         self.cost = None;
-        self.shared.lock().unwrap().permissions.forget_outstanding();
+        self.retire(&InputOwner::Run(run_id));
+    }
+
+    fn retire(&mut self, owner: &InputOwner) {
+        self.tool_inputs.retain(|(key, _), _| key != owner);
+        let outstanding = &mut self.shared.lock().unwrap().permissions.outstanding;
+        match owner {
+            InputOwner::Run(run_id) => outstanding.end_run(*run_id),
+            InputOwner::Child(child) => outstanding.end_child(child),
+        }
     }
 
     fn emit_turn_result(
         &mut self,
+        run_id: u64,
         is_error: bool,
         result: String,
         num_turns: u32,
@@ -1011,7 +1026,7 @@ impl EventPump {
             usage,
             permission_denials: Vec::new(),
         }))?;
-        self.reset_turn();
+        self.reset_turn(run_id);
         Ok(())
     }
 
@@ -1020,17 +1035,53 @@ impl EventPump {
             .subagent
             .as_ref()
             .map(|s| s.parent_tool_use_id.clone());
-
+        let owner = match &parent_tool_use_id {
+            Some(child) => InputOwner::Child(child.clone()),
+            None => InputOwner::Run(envelope.run_id),
+        };
+        let main = parent_tool_use_id.is_none() && envelope.run_id != DETACHED_RUN_ID;
+        // The client knows a child by the call that spawned it, and a
+        // background child routes under an id the client never saw.
+        let spawn_row = envelope
+            .subagent
+            .as_ref()
+            .map(|info| info.spawn_row_id().to_owned());
+        // The SDK runs one generation, so a child of an ended one still
+        // reports what it did before the end. Only its asks are gone.
+        if envelope
+            .subagent
+            .as_ref()
+            .and_then(|child| child.owner_cancel.as_ref())
+            .is_some_and(|cancel| cancel.is_cancelled())
+        {
+            self.shared
+                .lock()
+                .unwrap()
+                .permissions
+                .outstanding
+                .end_cancelled();
+            if matches!(envelope.event, AgentEvent::PermissionRequest { .. }) {
+                return Ok(());
+            }
+        }
+        // Plugins handling TurnEnd must read the totals from that event.
+        self.snapshot.observe(&envelope);
+        maki_lua::agent_autocmd::dispatch(
+            &self.lua_handle,
+            &self.session_id,
+            &envelope,
+            envelope.subagent.is_some(),
+        );
         match &envelope.event {
             AgentEvent::TextDelta { text } => {
-                if self.include_partial_messages {
+                if self.include_partial_messages && main {
                     let model = self.model_id();
                     let events = self.synth.text_delta(&model, text);
                     self.emit_stream(events)?;
                 }
             }
             AgentEvent::ThinkingDelta { text } => {
-                if self.include_partial_messages {
+                if self.include_partial_messages && main {
                     let model = self.model_id();
                     let events = self.synth.thinking_delta(&model, text);
                     self.emit_stream(events)?;
@@ -1040,7 +1091,7 @@ impl EventPump {
                 let name = ts.tool.to_string();
                 let input = ts.raw_input.clone().unwrap_or(Value::Null);
 
-                if self.include_partial_messages {
+                if self.include_partial_messages && main {
                     let model = self.model_id();
                     let events = self.synth.tool_use(
                         &model,
@@ -1050,18 +1101,18 @@ impl EventPump {
                     );
                     self.emit_stream(events)?;
                 }
-                self.tool_inputs.insert(ts.id.clone(), (name, input));
+                self.tool_inputs
+                    .insert((owner.clone(), ts.id.clone()), (name, input));
             }
             AgentEvent::ToolPending { .. }
             | AgentEvent::ToolOutput { .. }
             | AgentEvent::ToolDone(_)
             | AgentEvent::QueueItemConsumed { .. }
             | AgentEvent::QueueDrained
+            | AgentEvent::AuthRequired
             | AgentEvent::AutoCompacting { .. }
             | AgentEvent::CompactionDone { .. }
-            | AgentEvent::AuthRequired
             | AgentEvent::AllowedByPlugin { .. }
-            | AgentEvent::SubagentHistory { .. }
             | AgentEvent::ToolSnapshot { .. }
             | AgentEvent::ToolHeaderSnapshot { .. }
             | AgentEvent::LiveToolBuf { .. }
@@ -1074,9 +1125,9 @@ impl EventPump {
             AgentEvent::Steered {
                 kind: SteerKind::MessageDropped,
                 text,
-            } if parent_tool_use_id.is_none() => self.result_text.clone_from(text),
+            } if main => self.result_text.clone_from(text),
             AgentEvent::Steered { .. } => {}
-            AgentEvent::ObservationLine { text } if parent_tool_use_id.is_none() => {
+            AgentEvent::ObservationLine { text } if main => {
                 self.writer
                     .emit_system(NOTICE_SUBTYPE, serde_json::json!({ "text": text }))?;
             }
@@ -1086,6 +1137,9 @@ impl EventPump {
                 message,
                 delay_ms,
             } => {
+                if !main {
+                    return Ok(());
+                }
                 self.writer.emit_system(
                     "api_retry",
                     serde_json::json!({
@@ -1096,14 +1150,16 @@ impl EventPump {
                 )?;
             }
             AgentEvent::TurnComplete(tc) => {
+                // A background child's turn spends session money too, and one
+                // landing between results counts on the next.
                 add_cost(&mut self.cost, tc.cost);
-                if self.include_partial_messages {
+                if self.include_partial_messages && main {
                     let events = self.synth.finish_message(&tc.usage);
                     self.emit_stream(events)?;
                 }
 
                 let content_value = serde_json::to_value(&tc.message.content)?;
-                if parent_tool_use_id.is_none() {
+                if main {
                     self.result_text = content_text(&content_value).unwrap_or_default();
                 }
                 self.writer.emit(WireInner::Assistant(AssistantPayload {
@@ -1115,7 +1171,7 @@ impl EventPump {
                         stop_reason: None,
                         usage: tc.usage,
                     },
-                    parent_tool_use_id,
+                    parent_tool_use_id: spawn_row,
                 }))?;
             }
             AgentEvent::ToolResultsSubmitted { message } => {
@@ -1124,35 +1180,46 @@ impl EventPump {
                         role: "user",
                         content: serde_json::to_value(&message.content)?,
                     },
-                    parent_tool_use_id,
+                    parent_tool_use_id: spawn_row,
                 }))?;
             }
             AgentEvent::PermissionRequest { id, tool, .. } => {
+                let answer_tx = match &envelope.subagent {
+                    Some(child) => child.answer_tx.clone(),
+                    None => Some(self.shared.lock().unwrap().permissions.answer_tx.clone()),
+                };
+                let Some(answer_tx) = answer_tx else {
+                    warn!(ask_id = %id, "subagent permission request has no answer channel");
+                    if let Some(child) = &parent_tool_use_id {
+                        self.subagent_cancels.cancel(child.clone());
+                    }
+                    return Ok(());
+                };
+                let ask = PendingAsk {
+                    ask_id: id.clone(),
+                    answer_tx,
+                };
                 {
                     let shared = self.shared.lock().unwrap();
                     if shared.permission_mode == PermissionMode::BypassPermissions {
-                        shared
-                            .permissions
-                            .answer(id, PermissionAnswer::AllowSession);
+                        ask.answer(PermissionAnswer::AllowSession);
                         return Ok(());
                     }
                 }
 
                 let (tool_name, input) = self
                     .tool_inputs
-                    .get(id)
+                    .get(&(owner.clone(), id.clone()))
                     .cloned()
                     .unwrap_or_else(|| (tool.to_string(), Value::Null));
 
                 self.request_counter += 1;
                 let req_id = format!("req_{}", self.request_counter);
-                if !self
-                    .shared
-                    .lock()
-                    .unwrap()
-                    .permissions
-                    .ask(req_id.clone(), id.clone())
-                {
+                if !self.shared.lock().unwrap().permissions.ask(
+                    req_id.clone(),
+                    AskOwner::of(&envelope),
+                    ask,
+                ) {
                     return Ok(());
                 }
 
@@ -1173,6 +1240,10 @@ impl EventPump {
                 reason,
                 ..
             } => {
+                if !main {
+                    self.retire(&owner);
+                    return Ok(());
+                }
                 // An interrupted run leaves a partial answer and a dropped one
                 // never ran, so neither is a success.
                 let is_error = match reason {
@@ -1183,10 +1254,23 @@ impl EventPump {
                     | DoneReason::Compact => false,
                 };
                 let result = mem::take(&mut self.result_text);
-                self.emit_turn_result(is_error, result, *num_turns, *usage)?;
+                self.emit_turn_result(envelope.run_id, is_error, result, *num_turns, *usage)?;
             }
             AgentEvent::Error { message, .. } => {
-                self.emit_turn_result(true, message.clone(), 0, TokenUsage::default())?;
+                if main {
+                    self.emit_turn_result(
+                        envelope.run_id,
+                        true,
+                        message.clone(),
+                        0,
+                        TokenUsage::default(),
+                    )?;
+                } else {
+                    self.retire(&owner);
+                }
+            }
+            AgentEvent::SubagentHistory { tool_use_id, .. } => {
+                self.retire(&InputOwner::Child(tool_use_id.clone()));
             }
         }
         Ok(())
@@ -1218,8 +1302,10 @@ fn map_tool_names_in_content(content: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use flume::Receiver;
-    use maki_agent::SubagentInfo;
+    use maki_agent::cancel::CancelToken;
+    use maki_agent::{SubagentInfo, ToolStartEvent, TurnCompleteEvent};
     use maki_config::ToolKey;
+    use maki_providers::{ContentBlock, Message, Role};
     use test_case::test_case;
 
     use super::*;
@@ -1613,21 +1699,37 @@ mod tests {
     const TEST_TOOL_USE_ID: &str = "toolu_1";
     const CONTROL_REQUEST_TYPE: &str = "control_request";
     const SYSTEM_TYPE: &str = "system";
-    const RESULT_TYPE: &str = "result";
+    const ASSISTANT_TYPE: &str = "assistant";
     const NOTICE_LINE: &str = "Background agent finished: find auth";
     const CHILD_NOTICE_LINE: &str = "a child's own notice";
     const HOST_NOTICE: &str = "the prompt changed, so the cache starts over";
+    const NOTICE_REPLY: &str = "the build is green";
+    const NOTICE_TURN_COST: f64 = 0.5;
     const NOTICE_CHILD: &str = "child-1";
     const NO_CONTROL_REQUEST: &str = "a request nobody can answer must not go on the wire";
     const NO_ANSWER: &str = "answer sent with nobody parked on it";
     const SOURCE_OPEN: &str = "a turn end must not close the answer source";
     const OUTSTANDING_REQ: &str = "req_1";
     const LATE_REQ: &str = "req_2";
+    const TEST_CHILD_ID: &str = "child-1";
+    const OTHER_CHILD_ID: &str = "child-2";
+    const MAIN_TEXT: &str = "main result";
+    const CHILD_TEXT: &str = "child result";
+    const MAIN_COST: f64 = 0.25;
+    const CHILD_COST: f64 = 2.0;
 
     /// Every answer in these tests belongs to the one ask `permission_request`
     /// makes, and the agent only takes an answer naming it.
     fn tagged(answer: PermissionAnswer) -> String {
         TaggedAnswer::new(TEST_TOOL_USE_ID, answer).encode()
+    }
+
+    fn ask(permissions: &mut Permissions, request_id: &str) -> bool {
+        let ask = PendingAsk {
+            ask_id: TEST_TOOL_USE_ID.into(),
+            answer_tx: permissions.answer_tx.clone(),
+        };
+        permissions.ask(request_id.to_owned(), AskOwner::run(0), ask)
     }
 
     fn test_pump(
@@ -1656,6 +1758,7 @@ mod tests {
             lua_handle: maki_lua::EventHandle::disconnected_for_test(),
             session_id: session_id.to_string(),
             snapshot: HeadlessSnapshot::default(),
+            subagent_cancels: Arc::new(CancelMap::new()),
         };
         (pump, out_rx)
     }
@@ -1671,6 +1774,390 @@ mod tests {
             subagent: None,
             run_id: 0,
         }
+    }
+
+    fn child_event(event: AgentEvent, child: &str, answer_tx: Option<Sender<String>>) -> Envelope {
+        child_event_in_run(event, child, answer_tx, DETACHED_RUN_ID)
+    }
+
+    fn child_event_in_run(
+        event: AgentEvent,
+        child: &str,
+        answer_tx: Option<Sender<String>>,
+        run_id: u64,
+    ) -> Envelope {
+        Envelope {
+            event,
+            run_id,
+            subagent: Some(SubagentInfo {
+                parent_tool_use_id: child.into(),
+                name: child.into(),
+                prompt: None,
+                model: None,
+                detached: run_id == DETACHED_RUN_ID,
+                owner_cancel: None,
+                spawn_tool_use_id: None,
+                opts: None,
+                answer_tx,
+                inbox: None,
+            }),
+        }
+    }
+
+    fn tool_start(input: &str) -> AgentEvent {
+        AgentEvent::ToolStart(Box::new(ToolStartEvent {
+            id: TEST_TOOL_USE_ID.into(),
+            tool: TEST_TOOL.into(),
+            summary: String::new(),
+            render_header: None,
+            annotation: None,
+            input: None,
+            raw_input: Some(Value::String(input.into())),
+            output: None,
+        }))
+    }
+
+    fn done(reason: DoneReason) -> AgentEvent {
+        AgentEvent::Done {
+            usage: TokenUsage::default(),
+            cost: None,
+            list_cost: None,
+            context_size: 0,
+            context_window: 0,
+            num_turns: 1,
+            reason,
+        }
+    }
+
+    fn turn_complete(text: &str, cost: f64) -> AgentEvent {
+        AgentEvent::TurnComplete(Box::new(TurnCompleteEvent {
+            message: Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text { text: text.into() }],
+                ..Default::default()
+            },
+            usage: TokenUsage::default(),
+            model: MODEL.into(),
+            cost: Some(cost),
+            subsidised_list_cost: None,
+            context_size: None,
+            context_window: 0,
+        }))
+    }
+
+    fn wire(out_rx: &Receiver<String>) -> Value {
+        serde_json::from_str(&out_rx.try_recv().unwrap()).unwrap()
+    }
+
+    #[test_case(DoneReason::EndTurn; "completed")]
+    #[test_case(DoneReason::Cancelled; "cancelled")]
+    fn foreground_end_keeps_child_requests_and_their_reply_channels(reason: DoneReason) {
+        let (main_tx, main_rx) = flume::unbounded();
+        let (child_tx, child_rx) = flume::unbounded();
+        let (other_tx, other_rx) = flume::unbounded();
+        let (mut pump, out_rx) = test_pump(PermissionMode::Default, main_tx);
+
+        pump.handle(top_level(tool_start(MAIN_TEXT))).unwrap();
+        pump.handle(child_event(tool_start(CHILD_TEXT), TEST_CHILD_ID, None))
+            .unwrap();
+        pump.handle(child_event(
+            tool_start(OTHER_CHILD_ID),
+            OTHER_CHILD_ID,
+            None,
+        ))
+        .unwrap();
+        pump.handle(permission_request()).unwrap();
+        let main_request = wire(&out_rx);
+        pump.handle(child_event(
+            permission_request().event,
+            TEST_CHILD_ID,
+            Some(child_tx),
+        ))
+        .unwrap();
+        let child_request = wire(&out_rx);
+        pump.handle(child_event(
+            permission_request().event,
+            OTHER_CHILD_ID,
+            Some(other_tx.clone()),
+        ))
+        .unwrap();
+        let other_request = wire(&out_rx);
+        assert_eq!(main_request["request"]["input"], MAIN_TEXT);
+        assert_eq!(child_request["request"]["input"], CHILD_TEXT);
+        assert_eq!(other_request["request"]["input"], OTHER_CHILD_ID);
+
+        pump.handle(top_level(done(reason))).unwrap();
+        let result = wire(&out_rx);
+        assert_eq!(result["type"], "result");
+        assert_eq!(result["is_error"], reason == DoneReason::Cancelled);
+        {
+            let mut shared = pump.shared.lock().unwrap();
+            shared.permissions.resolve(
+                main_request["request_id"].as_str().unwrap(),
+                PermissionAnswer::AllowOnce,
+            );
+            shared.permissions.resolve(
+                child_request["request_id"].as_str().unwrap(),
+                PermissionAnswer::AllowOnce,
+            );
+        }
+        assert!(main_rx.is_empty());
+        assert_eq!(child_rx.try_recv(), Ok(tagged(PermissionAnswer::AllowOnce)));
+        pump.shared.lock().unwrap().permissions.close();
+        assert_eq!(other_rx.try_recv(), Ok(tagged(PermissionAnswer::Deny)));
+        pump.handle(child_event(
+            permission_request().event,
+            OTHER_CHILD_ID,
+            Some(other_tx),
+        ))
+        .unwrap();
+        assert_eq!(other_rx.try_recv(), Ok(tagged(PermissionAnswer::Deny)));
+        assert!(out_rx.is_empty());
+    }
+
+    #[test_case(0; "attached")]
+    #[test_case(DETACHED_RUN_ID; "detached")]
+    fn child_history_retires_only_that_childs_outstanding_requests(run_id: u64) {
+        let (main_tx, main_rx) = flume::unbounded();
+        let (child_tx, child_rx) = flume::unbounded();
+        let (sibling_tx, sibling_rx) = flume::unbounded();
+        let (mut pump, out_rx) = test_pump(PermissionMode::Default, main_tx);
+        pump.handle(permission_request()).unwrap();
+        let main_request = wire(&out_rx);
+        pump.handle(child_event_in_run(
+            permission_request().event,
+            TEST_CHILD_ID,
+            Some(child_tx),
+            run_id,
+        ))
+        .unwrap();
+        let child_request = wire(&out_rx);
+        pump.handle(child_event_in_run(
+            permission_request().event,
+            OTHER_CHILD_ID,
+            Some(sibling_tx.clone()),
+            run_id,
+        ))
+        .unwrap();
+        let sibling_request = wire(&out_rx);
+        pump.handle(top_level(AgentEvent::SubagentHistory {
+            tool_use_id: TEST_CHILD_ID.into(),
+            messages: Vec::new(),
+            status: None,
+        }))
+        .unwrap();
+        {
+            let mut shared = pump.shared.lock().unwrap();
+            shared.permissions.resolve(
+                child_request["request_id"].as_str().unwrap(),
+                PermissionAnswer::AllowOnce,
+            );
+            shared.permissions.resolve(
+                main_request["request_id"].as_str().unwrap(),
+                PermissionAnswer::AllowOnce,
+            );
+        }
+        assert!(child_rx.is_empty());
+        assert_eq!(main_rx.try_recv(), Ok(tagged(PermissionAnswer::AllowOnce)));
+        assert!(out_rx.is_empty());
+        pump.shared.lock().unwrap().permissions.resolve(
+            sibling_request["request_id"].as_str().unwrap(),
+            PermissionAnswer::AllowOnce,
+        );
+        assert_eq!(
+            sibling_rx.try_recv(),
+            Ok(tagged(PermissionAnswer::AllowOnce))
+        );
+        pump.handle(child_event_in_run(
+            permission_request().event,
+            OTHER_CHILD_ID,
+            Some(sibling_tx),
+            run_id,
+        ))
+        .unwrap();
+        let sibling_request = wire(&out_rx);
+        pump.handle(top_level(done(DoneReason::Cancelled))).unwrap();
+        assert_eq!(wire(&out_rx)["type"], "result");
+        pump.shared.lock().unwrap().permissions.resolve(
+            sibling_request["request_id"].as_str().unwrap(),
+            PermissionAnswer::AllowOnce,
+        );
+        if run_id == DETACHED_RUN_ID {
+            assert_eq!(
+                sibling_rx.try_recv(),
+                Ok(tagged(PermissionAnswer::AllowOnce))
+            );
+        } else {
+            assert!(sibling_rx.is_empty());
+        }
+        assert!(out_rx.is_empty());
+    }
+
+    #[test]
+    fn an_ended_generation_reports_its_queued_turns_but_takes_no_asks() {
+        let (main_tx, main_rx) = flume::unbounded();
+        let (child_tx, child_rx) = flume::unbounded();
+        let (mut pump, out_rx) = test_pump(PermissionMode::Default, main_tx);
+        let (trigger, token) = CancelToken::new();
+        let ended = |event| {
+            let mut envelope = child_event(event, TEST_CHILD_ID, Some(child_tx.clone()));
+            envelope.subagent.as_mut().unwrap().owner_cancel = Some(token.clone());
+            envelope
+        };
+        pump.handle(ended(permission_request().event)).unwrap();
+        let child_request = wire(&out_rx);
+        trigger.cancel();
+        pump.handle(ended(permission_request().event)).unwrap();
+        pump.shared.lock().unwrap().permissions.resolve(
+            child_request["request_id"].as_str().unwrap(),
+            PermissionAnswer::AllowOnce,
+        );
+        assert!(child_rx.is_empty());
+        assert!(main_rx.is_empty());
+        assert!(out_rx.is_empty());
+        pump.handle(ended(turn_complete(CHILD_TEXT, CHILD_COST)))
+            .unwrap();
+        assert_eq!(wire(&out_rx)["parent_tool_use_id"], TEST_CHILD_ID);
+        pump.handle(top_level(turn_complete(MAIN_TEXT, MAIN_COST)))
+            .unwrap();
+        assert_eq!(wire(&out_rx)["type"], "assistant");
+        pump.handle(top_level(done(DoneReason::EndTurn))).unwrap();
+        let result = wire(&out_rx);
+        assert_eq!(result["result"], MAIN_TEXT);
+        assert_eq!(result["total_cost_usd"], MAIN_COST + CHILD_COST);
+    }
+
+    #[test]
+    fn child_events_keep_the_main_stream_and_result_separate() {
+        let (mut pump, out_rx) = test_pump(PermissionMode::Default, flume::unbounded().0);
+        pump.include_partial_messages = true;
+        pump.handle(top_level(AgentEvent::TextDelta {
+            text: MAIN_TEXT.into(),
+        }))
+        .unwrap();
+        for _ in 0..3 {
+            assert_eq!(wire(&out_rx)["type"], "stream_event");
+        }
+        pump.handle(child_event(
+            AgentEvent::TextDelta {
+                text: CHILD_TEXT.into(),
+            },
+            TEST_CHILD_ID,
+            None,
+        ))
+        .unwrap();
+        assert!(out_rx.is_empty());
+        pump.handle(child_event(
+            turn_complete(CHILD_TEXT, CHILD_COST),
+            TEST_CHILD_ID,
+            None,
+        ))
+        .unwrap();
+        let assistant = wire(&out_rx);
+        assert_eq!(assistant["type"], "assistant");
+        assert_eq!(assistant["parent_tool_use_id"], TEST_CHILD_ID);
+        let mut background =
+            child_event(turn_complete(CHILD_TEXT, CHILD_COST), OTHER_CHILD_ID, None);
+        background.subagent.as_mut().unwrap().spawn_tool_use_id = Some(TEST_TOOL_USE_ID.into());
+        pump.handle(background).unwrap();
+        assert_eq!(wire(&out_rx)["parent_tool_use_id"], TEST_TOOL_USE_ID);
+        assert!(out_rx.is_empty());
+        pump.handle(child_event(
+            AgentEvent::Error {
+                message: PUMP_ERROR.into(),
+                auth: false,
+            },
+            TEST_CHILD_ID,
+            None,
+        ))
+        .unwrap();
+        pump.handle(child_event(done(DoneReason::EndTurn), TEST_CHILD_ID, None))
+            .unwrap();
+        assert!(out_rx.is_empty());
+
+        pump.handle(top_level(turn_complete(MAIN_TEXT, MAIN_COST)))
+            .unwrap();
+        let events: Vec<Value> = out_rx
+            .try_iter()
+            .map(|line| serde_json::from_str(&line).unwrap())
+            .collect();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["event"]["type"] == "message_stop")
+                .count(),
+            1
+        );
+        assert_eq!(events.last().unwrap()["type"], "assistant");
+        pump.handle(top_level(done(DoneReason::EndTurn))).unwrap();
+        let result = wire(&out_rx);
+        assert_eq!(result["result"], MAIN_TEXT);
+        assert_eq!(result["total_cost_usd"], MAIN_COST + 2.0 * CHILD_COST);
+        assert_eq!(result["is_error"], false);
+        assert!(out_rx.is_empty());
+    }
+
+    #[test]
+    fn a_detached_turn_between_results_counts_once_on_the_next() {
+        let (mut pump, out_rx) = test_pump(PermissionMode::Default, flume::unbounded().0);
+        pump.handle(top_level(turn_complete(MAIN_TEXT, MAIN_COST)))
+            .unwrap();
+        pump.handle(top_level(done(DoneReason::EndTurn))).unwrap();
+        pump.handle(child_event(
+            turn_complete(CHILD_TEXT, CHILD_COST),
+            TEST_CHILD_ID,
+            None,
+        ))
+        .unwrap();
+        pump.handle(top_level(turn_complete(MAIN_TEXT, MAIN_COST)))
+            .unwrap();
+        pump.handle(top_level(done(DoneReason::EndTurn))).unwrap();
+        let totals: Vec<Value> = out_rx
+            .try_iter()
+            .map(|line| serde_json::from_str::<Value>(&line).unwrap())
+            .filter(|event| event["type"] == "result")
+            .map(|result| result["total_cost_usd"].clone())
+            .collect();
+        assert_eq!(
+            totals,
+            [Value::from(MAIN_COST), Value::from(MAIN_COST + CHILD_COST)]
+        );
+    }
+
+    #[test]
+    fn child_auth_failure_retires_child_requests_without_retiring_main_requests() {
+        let (main_tx, main_rx) = flume::unbounded();
+        let (mut pump, out_rx) = test_pump(PermissionMode::Default, main_tx);
+        let (child_tx, child_rx) = flume::unbounded();
+        pump.handle(permission_request()).unwrap();
+        let main_request = wire(&out_rx);
+        pump.handle(child_event(
+            permission_request().event,
+            TEST_CHILD_ID,
+            Some(child_tx),
+        ))
+        .unwrap();
+        let child_request = wire(&out_rx);
+        pump.handle(child_event(
+            AgentEvent::Error {
+                message: PUMP_ERROR.into(),
+                auth: true,
+            },
+            TEST_CHILD_ID,
+            None,
+        ))
+        .unwrap();
+        pump.shared.lock().unwrap().permissions.resolve(
+            child_request["request_id"].as_str().unwrap(),
+            PermissionAnswer::AllowOnce,
+        );
+        assert!(child_rx.is_empty());
+        assert!(out_rx.is_empty());
+        pump.shared.lock().unwrap().permissions.resolve(
+            main_request["request_id"].as_str().unwrap(),
+            PermissionAnswer::AllowOnce,
+        );
+        assert_eq!(main_rx.try_recv(), Ok(tagged(PermissionAnswer::AllowOnce)));
     }
 
     /// The SDK hang: `retained` is the Lua tool context that keeps a sender
@@ -1704,13 +2191,13 @@ mod tests {
         let (answer_tx, answer_rx) = flume::unbounded();
         let mut permissions = Permissions::new(answer_tx);
 
-        assert!(permissions.ask(OUTSTANDING_REQ.to_owned(), TEST_TOOL_USE_ID.to_owned()));
+        assert!(ask(&mut permissions, OUTSTANDING_REQ));
         assert!(answer_rx.is_empty());
 
         permissions.close();
         assert_eq!(answer_rx.try_recv(), Ok(tagged(PermissionAnswer::Deny)));
 
-        assert!(!permissions.ask(LATE_REQ.to_owned(), TEST_TOOL_USE_ID.to_owned()));
+        assert!(!ask(&mut permissions, LATE_REQ));
         assert_eq!(answer_rx.try_recv(), Ok(tagged(PermissionAnswer::Deny)));
 
         permissions.close();
@@ -1725,7 +2212,7 @@ mod tests {
     fn only_requests_the_agent_waits_on_get_answered() {
         let (answer_tx, answer_rx) = flume::unbounded();
         let mut permissions = Permissions::new(answer_tx);
-        assert!(permissions.ask(OUTSTANDING_REQ.to_owned(), TEST_TOOL_USE_ID.to_owned()));
+        assert!(ask(&mut permissions, OUTSTANDING_REQ));
 
         permissions.resolve(LATE_REQ, PermissionAnswer::AllowOnce);
         assert!(answer_rx.is_empty(), "{NO_ANSWER}");
@@ -1739,16 +2226,13 @@ mod tests {
         permissions.resolve(OUTSTANDING_REQ, PermissionAnswer::AllowOnce);
         assert!(answer_rx.is_empty(), "{NO_ANSWER}");
 
-        assert!(permissions.ask(LATE_REQ.to_owned(), TEST_TOOL_USE_ID.to_owned()));
-        permissions.forget_outstanding();
+        assert!(ask(&mut permissions, LATE_REQ));
+        permissions.outstanding.end_run(0);
         permissions.resolve(LATE_REQ, PermissionAnswer::AllowOnce);
         assert!(answer_rx.is_empty(), "{NO_ANSWER}");
 
-        assert!(
-            permissions.ask(OUTSTANDING_REQ.to_owned(), TEST_TOOL_USE_ID.to_owned()),
-            "{SOURCE_OPEN}"
-        );
-        permissions.forget_outstanding();
+        assert!(ask(&mut permissions, OUTSTANDING_REQ), "{SOURCE_OPEN}");
+        permissions.outstanding.end_run(0);
         permissions.close();
         assert!(answer_rx.is_empty(), "{NO_ANSWER}");
     }
@@ -1756,18 +2240,28 @@ mod tests {
     /// Bypass answers on the spot, so recording the id or emitting a control
     /// request would leave an answer nobody is parked on: stdin's reply (or
     /// the deny on exit) would land on whatever the agent asks next.
-    #[test]
-    fn bypass_answers_immediately_without_recording_or_emitting() {
+    #[test_case(false; "main")]
+    #[test_case(true; "background_child")]
+    fn bypass_answers_immediately_without_recording_or_emitting(child: bool) {
         let (answer_tx, answer_rx) = flume::unbounded();
-        let (mut pump, out_rx) = test_pump(PermissionMode::BypassPermissions, answer_tx);
-
-        pump.handle(permission_request()).unwrap();
+        let (main_tx, main_rx) = flume::unbounded();
+        let (mut pump, out_rx) = test_pump(
+            PermissionMode::BypassPermissions,
+            if child { main_tx } else { answer_tx.clone() },
+        );
+        let event = if child {
+            child_event(permission_request().event, TEST_CHILD_ID, Some(answer_tx))
+        } else {
+            permission_request()
+        };
+        pump.handle(event).unwrap();
 
         assert_eq!(
             answer_rx.try_recv(),
             Ok(tagged(PermissionAnswer::AllowSession))
         );
         assert!(answer_rx.is_empty(), "{NO_ANSWER}");
+        assert!(main_rx.is_empty(), "{NO_ANSWER}");
         assert!(out_rx.is_empty(), "{NO_CONTROL_REQUEST}");
         assert!(
             pump.shared
@@ -1850,10 +2344,12 @@ mod tests {
     }
 
     /// The SDK has no history replay, so the line goes out live as a system
-    /// message. A host notice and a child's line stay out.
+    /// message. A host notice and a child's line stay out, and the turn's own
+    /// answer and permission routing are unchanged.
     #[test]
     fn an_accepted_notice_is_a_live_system_message() {
-        let (mut pump, out_rx) = test_pump(PermissionMode::Default, flume::unbounded().0);
+        let (answer_tx, answer_rx) = flume::unbounded();
+        let (mut pump, out_rx) = test_pump(PermissionMode::Default, answer_tx);
 
         pump.handle(top_level(AgentEvent::ObservationLine {
             text: NOTICE_LINE.into(),
@@ -1863,45 +2359,35 @@ mod tests {
             text: HOST_NOTICE.into(),
         }))
         .unwrap();
-        pump.handle(Envelope {
-            event: AgentEvent::ObservationLine {
+        pump.handle(child_event(
+            AgentEvent::ObservationLine {
                 text: CHILD_NOTICE_LINE.into(),
             },
-            subagent: Some(SubagentInfo {
-                parent_tool_use_id: NOTICE_CHILD.into(),
-                name: NOTICE_CHILD.into(),
-                prompt: None,
-                model: None,
-                opts: None,
-                answer_tx: None,
-                inbox: None,
-            }),
-            run_id: 0,
-        })
+            NOTICE_CHILD,
+            None,
+        ))
         .unwrap();
-        pump.handle(top_level(AgentEvent::Done {
-            usage: TokenUsage::default(),
-            cost: None,
-            list_cost: None,
-            context_size: 0,
-            context_window: 0,
-            num_turns: 1,
-            reason: DoneReason::EndTurn,
-        }))
-        .unwrap();
+        pump.handle(permission_request()).unwrap();
+        pump.handle(top_level(turn_complete(NOTICE_REPLY, NOTICE_TURN_COST)))
+            .unwrap();
+        pump.handle(top_level(done(DoneReason::EndTurn))).unwrap();
 
-        let wire: Vec<Value> = out_rx
-            .try_iter()
-            .map(|line| serde_json::from_str(&line).unwrap())
-            .collect();
-        assert_eq!(wire.len(), 2, "{wire:?}");
-        assert_eq!(wire[0]["type"], SYSTEM_TYPE);
-        assert_eq!(wire[0]["subtype"], NOTICE_SUBTYPE);
-        assert_eq!(wire[0]["text"], NOTICE_LINE);
+        let notice = wire(&out_rx);
+        assert_eq!(notice["type"], SYSTEM_TYPE);
+        assert_eq!(notice["subtype"], NOTICE_SUBTYPE);
+        assert_eq!(notice["text"], NOTICE_LINE);
         assert_eq!(
-            wire[0]["session_id"],
+            notice["session_id"],
             pump.writer.session_id.to_string().as_str()
         );
-        assert_eq!(wire[1]["type"], RESULT_TYPE);
+        let request = wire(&out_rx);
+        assert_eq!(request["type"], CONTROL_REQUEST_TYPE);
+        assert_eq!(request["request"]["tool_use_id"], TEST_TOOL_USE_ID);
+        assert!(answer_rx.is_empty(), "{NO_ANSWER}");
+        assert_eq!(wire(&out_rx)["type"], ASSISTANT_TYPE);
+        let result = wire(&out_rx);
+        assert_eq!(result["result"], NOTICE_REPLY);
+        assert_eq!(result["is_error"], false);
+        assert!(out_rx.is_empty());
     }
 }

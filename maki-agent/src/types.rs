@@ -15,6 +15,8 @@ use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
 use strum::Display;
 
+use crate::CancelToken;
+
 pub const NO_FILES_FOUND: &str = "No files found";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -612,7 +614,8 @@ pub enum SteerKind {
 
 /// Why a session ended, as `SessionEnd` handlers see it in `data.reason`.
 /// `Shutdown`, `Reload`, `Replaced`, and `Completed` tear the host down: no
-/// UI is left to talk to and every handler shares one grace period.
+/// UI is left to talk to. Every reason but `Delete` gives the handlers one
+/// shared grace period.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Display)]
 #[strum(serialize_all = "snake_case")]
 pub enum SessionEndReason {
@@ -620,6 +623,8 @@ pub enum SessionEndReason {
     Reset,
     /// Another session was loaded into this tab.
     Load,
+    /// A rewind restarted the session from an earlier turn.
+    Rewind,
     /// The tab was closed.
     Delete,
     /// The process is exiting.
@@ -742,6 +747,11 @@ pub enum AgentEvent {
     SubagentHistory {
         tool_use_id: String,
         messages: Vec<Message>,
+        /// What ended the child, when its owner knows. A foreground task
+        /// leaves this to the `ToolDone` that refines its placeholder; a
+        /// detached agent has no tool call to carry that verdict.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<SubagentVerdict>,
     },
     ToolSnapshot {
         id: String,
@@ -1123,6 +1133,18 @@ impl RunLedger {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubagentVerdict {
+    Done,
+    Error,
+}
+
+/// Run id for events from a child that outlives the run that spawned it.
+/// A frontend must route these to the child's own chat instead of treating
+/// them as stale: the parent run may have ended long ago.
+pub const DETACHED_RUN_ID: u64 = u64::MAX - 1;
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SubagentInfo {
     pub parent_tool_use_id: String,
@@ -1132,6 +1154,18 @@ pub struct SubagentInfo {
     pub prompt: Option<String>,
     #[serde(rename = "parent_model", skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// True when the child outlives the tool call that spawned it, which makes
+    /// its chat outlive the turn too.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub detached: bool,
+    /// Teardown of the generation that owns this live child.
+    #[serde(skip)]
+    pub owner_cancel: Option<CancelToken>,
+    /// The tool call that spawned this child, set for a detached one: it routes
+    /// its events under an id of its own, and the parent transcript still has a
+    /// row for the spawn that has to carry the child's usage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawn_tool_use_id: Option<String>,
     /// What the subagent actually runs with, already reconciled against its
     /// model. `None` means unknown (a restore predating it), which reads as
     /// the parent's settings.
@@ -1145,15 +1179,71 @@ pub struct SubagentInfo {
     pub inbox: Option<Arc<crate::SubagentInbox>>,
 }
 
+impl SubagentInfo {
+    /// The tool call whose row stands for this child in the parent transcript.
+    pub fn spawn_row_id(&self) -> &str {
+        self.spawn_tool_use_id
+            .as_deref()
+            .unwrap_or(&self.parent_tool_use_id)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct EventSender {
     tx: Sender<Envelope>,
     run_id: u64,
+    owner_cancel: Option<CancelToken>,
+    root_tx: Option<Sender<Envelope>>,
+    session_cancel: Option<CancelToken>,
 }
 
 impl EventSender {
     pub fn new(tx: Sender<Envelope>, run_id: u64) -> Self {
-        Self { tx, run_id }
+        Self {
+            tx,
+            run_id,
+            owner_cancel: None,
+            root_tx: None,
+            session_cancel: None,
+        }
+    }
+
+    pub fn with_owner_cancel(mut self, cancel: CancelToken) -> Self {
+        self.owner_cancel = Some(cancel);
+        self
+    }
+
+    pub fn owner_cancel(&self) -> Option<CancelToken> {
+        self.owner_cancel.clone()
+    }
+
+    pub fn session_cancel(&self) -> Option<CancelToken> {
+        self.session_cancel.clone()
+    }
+
+    pub fn child_sender(
+        &self,
+        stream: &EventStreamGuard,
+        run_id: u64,
+        session_cancel: CancelToken,
+    ) -> Self {
+        Self {
+            tx: stream.tx.clone(),
+            run_id,
+            owner_cancel: self.owner_cancel.clone(),
+            root_tx: Some(self.root_tx.as_ref().unwrap_or(&self.tx).clone()),
+            session_cancel: Some(session_cancel),
+        }
+    }
+
+    pub fn root_sender(&self) -> Self {
+        Self {
+            tx: self.root_tx.as_ref().unwrap_or(&self.tx).clone(),
+            run_id: self.run_id,
+            owner_cancel: self.owner_cancel.clone(),
+            root_tx: None,
+            session_cancel: None,
+        }
     }
 
     pub fn send(&self, event: impl Into<AgentEvent>) -> Result<(), AgentError> {
@@ -1188,6 +1278,9 @@ impl EventSender {
         Self {
             tx: self.tx.clone(),
             run_id,
+            owner_cancel: self.owner_cancel.clone(),
+            root_tx: self.root_tx.clone(),
+            session_cancel: self.session_cancel.clone(),
         }
     }
 }

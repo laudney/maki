@@ -722,12 +722,13 @@ pub enum UiAction {
         reply_tx: flume::Sender<Result<(), String>>,
     },
     /// An event from a subagent session a plugin opened on a chat session,
-    /// which shows it as a task. A tab keeps its channels across `/new`, so
-    /// the chat session id is the only way to tell if the tab still shows the
-    /// session that owns it.
+    /// which shows it as a task. The native root identity stays separate from
+    /// the child carried by a nested event. The envelope also retains the
+    /// parent generation's cancellation token for stale-event rejection.
     PluginTaskEvent {
         session: MakiId,
         plugin: Arc<str>,
+        task_id: String,
         envelope: Box<Envelope>,
     },
     PluginTaskOpened {

@@ -10,14 +10,15 @@ use std::sync::Arc;
 
 use maki_agent::agent::{SessionExport, live_header, live_history, live_snapshot};
 use maki_agent::session::{StoredSession, store_new};
-use maki_agent::{SessionMailbox, Transcript};
+use maki_agent::{Notice, SessionMailbox, Transcript};
 use maki_lua_macro::{lua_fn, lua_table};
 use maki_providers::{ContentBlock, Message};
 use maki_storage::StateDir;
 use maki_storage::id::MakiId;
-use mlua::{IntoLua, Lua, LuaSerdeExt, Result as LuaResult, Table, Value};
+use mlua::{AnyUserData, IntoLua, Lua, LuaSerdeExt, Result as LuaResult, Table, Value};
 use serde_json::{Map, Value as JsonValue};
 
+use crate::api::agent::notification_owner;
 use crate::api::image::LuaImage;
 use crate::api::util::command::{
     NO_UI_ERR, SessionRequest, UiAction, ui_json_roundtrip, ui_reachable, ui_roundtrip,
@@ -701,6 +702,8 @@ async fn prompt(
 ///     when the session's agent run accepts the report. Whitespace collapses
 ///     to single spaces and the note is cut to 256 bytes. Defaults to
 ///     nothing; the model reads only {text}.
+///   `owner` (Session?) child Session that owns this report. Its parent
+///     generation must still be live when the report is queued and read.
 /// @return (boolean|nil, string|nil) true, or nil and an error.
 /// @example
 /// maki.session.notify("[monitor] deploy failed", { session = id, wake = true })
@@ -722,12 +725,21 @@ fn notify(
         return Ok(err_pair(BLANK_NOTIFY_ERR));
     }
     let session_id = try_pair!(required_session(opts.as_ref())?);
-    let display = opts
+    let Some(opts) = opts else {
+        return Ok(err_pair(SESSION_REQUIRED_ERR));
+    };
+    let mut message = Message::observation(text);
+    message.display_text = opts.opt("display")?;
+    let owner_cancel = opts
+        .opt::<AnyUserData>("owner")?
         .as_ref()
-        .map(|t| t.opt::<String>("display"))
-        .transpose()?
-        .flatten();
-    if let Err(error) = SessionMailbox::notify(session_id, text, display.as_deref(), wake) {
+        .map(notification_owner)
+        .transpose()?;
+    let notice = Notice {
+        message,
+        owner_cancel,
+    };
+    if let Err(error) = SessionMailbox::notify(session_id, notice, wake) {
         return Ok(err_pair(error));
     }
     Ok((Some(true), None))
@@ -952,11 +964,11 @@ mod tests {
 
         assert!(value);
         assert_eq!(error, None);
-        let messages = mailbox.drain();
-        assert_eq!(messages.len(), 1);
-        assert!(messages[0].is_observation());
-        assert_eq!(messages[0].first_text_content(), Some("built"));
-        assert_eq!(messages[0].display_text, None);
+        let notices = mailbox.drain();
+        assert_eq!(notices.len(), 1);
+        assert!(notices[0].message.is_observation());
+        assert_eq!(notices[0].message.first_text_content(), Some("built"));
+        assert_eq!(notices[0].message.display_text, None);
         assert!(rx.try_recv().is_err());
     }
 
@@ -984,9 +996,9 @@ mod tests {
 
         assert!(value);
         assert_eq!(error, None);
-        let messages = mailbox.claim_wake();
-        assert_eq!(messages[0].display_text.as_deref(), expected);
-        assert_eq!(messages[0].first_text_content(), Some(TEXT));
+        let notices = mailbox.claim_wake();
+        assert_eq!(notices[0].message.display_text.as_deref(), expected);
+        assert_eq!(notices[0].message.first_text_content(), Some(TEXT));
     }
 
     #[test]

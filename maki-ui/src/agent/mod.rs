@@ -3,6 +3,7 @@ mod model_slots;
 mod run_cancels;
 pub(crate) mod shared_queue;
 
+use std::future::{Future, ready};
 use std::mem;
 use std::sync::Arc;
 use std::time::Duration;
@@ -12,10 +13,10 @@ use maki_agent::permissions::PermissionManager;
 use maki_agent::session::Resumed;
 use maki_agent::{
     AgentConfig, CancelMap, Envelope, HistorySnapshot, McpCommand, McpConfigErrors, McpHandle,
-    McpSnapshotReader, SessionMailbox, SharedMessages, ToolOutputLines,
+    McpSnapshotReader, Notice, SessionMailbox, SharedMessages, ToolOutputLines,
 };
 use maki_config::ModelPolicy;
-use maki_lua::EventHandle;
+use maki_lua::{EventHandle, SessionEndReason};
 use maki_storage::id::SessionRef;
 
 use self::run_cancels::RunCancels;
@@ -78,6 +79,7 @@ impl AgentHandles {
             timeouts,
             lua_handle,
             model_policy,
+            ready(()),
         )
     }
 
@@ -132,7 +134,7 @@ impl AgentHandles {
         }
     }
 
-    pub(crate) fn claim_mailbox_wake(&self) -> Vec<Message> {
+    pub(crate) fn claim_mailbox_wake(&self) -> Vec<Notice> {
         self.mailbox.claim_wake()
     }
 
@@ -140,6 +142,7 @@ impl AgentHandles {
     pub(crate) fn respawn(
         &mut self,
         history: Vec<Message>,
+        reason: SessionEndReason,
         model_slot: &Arc<ArcSwap<ModelSlot>>,
         config: AgentConfig,
         tool_output_lines: ToolOutputLines,
@@ -151,6 +154,10 @@ impl AgentHandles {
         // thing that makes the old loop's in-flight envelopes stale. It lives
         // here so no caller can respawn without it.
         app.run_id += 1;
+        self.cancel_all();
+        let ended = lua_handle.end_session_wait(self.mailbox.session_id(), reason);
+        app.retire_session_tasks();
+        self.mailbox.drain();
         let slot = model_slot.load();
         if let Err(e) = smol::block_on(slot.provider.reload_auth()) {
             warn!(error = %e, "failed to reload auth, continuing with existing credentials");
@@ -175,13 +182,14 @@ impl AgentHandles {
             self.timeouts,
             lua_handle,
             Arc::clone(&self.model_policy),
+            ended,
         );
         let old = mem::replace(self, new);
         // Repoint the app at the new queue before dropping `old`, otherwise the app keeps
         // the last old `QueueSender` alive and the old loop parks in `recv_notify` forever.
         self.apply_to_app(app);
         app.flush_restored_queue();
-        old.cancel_all();
+        drop(old);
     }
 
     pub(crate) fn is_finished(&self) -> bool {
@@ -236,6 +244,7 @@ fn spawn_agent_internal(
     timeouts: maki_providers::Timeouts,
     lua_handle: EventHandle,
     model_policy: Arc<ModelPolicy>,
+    previous_ended: impl Future<Output = ()> + Send + 'static,
 ) -> AgentHandles {
     let (answer_tx, answer_rx) = flume::unbounded::<String>();
     let (queue_tx, queue_rx) = shared_queue::queue();
@@ -268,7 +277,12 @@ fn spawn_agent_internal(
         Arc::clone(&model_policy),
     );
 
-    let task = smol::spawn(agent_loop.run());
+    // The same session id may still be ending its previous generation, and
+    // a late `SessionEnd` handler must not reach this one's work.
+    let task = smol::spawn(async move {
+        previous_ended.await;
+        agent_loop.run().await
+    });
 
     AgentHandles {
         agent_rx,
@@ -292,9 +306,17 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::Instant;
 
+    use crate::app::Msg;
+    use crate::components::{Action, key};
+    use crossterm::event::KeyCode;
     use maki_agent::live_session::BACKGROUND_PLAN_WRITE_DENIED;
-    use maki_agent::{AgentEvent, AgentInput, AgentMode, AgentSeed, InputSource};
+    use maki_agent::tools::ToolRegistry;
+    use maki_agent::{
+        AgentEvent, AgentInput, AgentMode, AgentSeed, CancelToken, DETACHED_RUN_ID, InputSource,
+        SubagentInfo,
+    };
     use maki_config::{PermissionsConfig, ProjectConfig};
+    use maki_lua::{PluginHost, UiAction};
     use maki_providers::provider::{BoxFuture, Provider};
     use maki_providers::{
         AgentError, Model, ModelInfo, ProviderEvent, RequestOptions, StreamResponse, ThinkingConfig,
@@ -316,6 +338,12 @@ mod tests {
     const RECORDER_TOOL: &str = "recording-provider";
     const TURN_OVER: &str = "model recorded, nothing left to stream";
     const NO_CALL: &str = "the agent never reached the provider";
+    const NO_SESSION_END: &str = "the old generation's SessionEnd handler never ran";
+    const EARLY_RUN: &str = "the new loop ran before the old generation ended";
+    const ENDING_PLUGIN: &str = "slow_session_end";
+    const ENDING_SOURCE: &str = r#"
+maki.api.create_autocmd("SessionEnd", { callback = function() maki.ui.input() end })
+"#;
     const NO_TURN_END: &str = "the run never reported that it was over";
     const GATE_CLOSED: &str = "the in-flight call is no longer waiting to be released";
     const SEED_NOT_LIVE: &str = "the respawned loop publishes a seed for the app's session";
@@ -400,6 +428,7 @@ mod tests {
     ) {
         handles.respawn(
             Vec::new(),
+            SessionEndReason::Replaced,
             model_slot,
             AgentConfig::default(),
             ToolOutputLines::default(),
@@ -660,12 +689,177 @@ mod tests {
         assert_eq!(snapshot.messages[0].user_text(), Some(RESUMED_HISTORY_TEXT));
     }
 
+    const CHILD_ID: &str = "rewind-child";
+    const OLD_NOTICE: &str = "old-generation-notice";
+    const LATE_CHILD_TEXT: &str = "old-generation-text";
+
+    /// A rewind keeps the session id, so the old generation's `SessionEnd`
+    /// handlers have to run before the new loop starts work they could end.
+    #[test]
+    fn a_respawn_starts_no_run_until_the_old_generation_ended() {
+        let (provider, reported) = recorder();
+        let model_slot = Arc::new(ArcSwap::new(slot(MODEL_A, &provider)));
+        let (mut handles, permissions) = spawn_on(&model_slot, Vec::new());
+        let mut app = crate::app::tests::test_app();
+        handles.apply_to_app(&mut app);
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source(ENDING_PLUGIN, ENDING_SOURCE).unwrap();
+        handles.respawn(
+            Vec::new(),
+            SessionEndReason::Replaced,
+            &model_slot,
+            AgentConfig::default(),
+            ToolOutputLines::default(),
+            &permissions,
+            &mut app,
+            host.event_handle(),
+        );
+        let UiAction::Input { reply_tx, .. } = host
+            .ui_action_rx()
+            .recv_timeout(LONG_TIMEOUT)
+            .expect(NO_SESSION_END)
+        else {
+            panic!("{NO_SESSION_END}");
+        };
+        push_prompt(&handles, app.run_id, FIRST_PROMPT);
+        assert!(reported.recv_timeout(SHORT_TIMEOUT).is_err(), "{EARLY_RUN}");
+        reply_tx.send(Ok(serde_json::json!({}))).unwrap();
+        assert_eq!(reported.recv_timeout(LONG_TIMEOUT).expect(NO_CALL), MODEL_A);
+    }
+
+    #[test]
+    fn rewind_respawn_cancels_children_drains_notices_and_rejects_late_events() {
+        let (mut handles, model_slot, permissions) = stub_spawn();
+        let mut app = crate::app::tests::test_app();
+        app.state
+            .session_mut()
+            .replace_messages(vec![Message::user(FIRST_PROMPT.into())]);
+        handles.apply_to_app(&mut app);
+        let owner = handles.cancels.teardown().clone();
+        crate::app::tests::plugin_event(
+            &mut app,
+            AgentEvent::TextDelta {
+                text: FIRST_PROMPT.into(),
+            },
+        );
+        crate::app::tests::plugin_event(
+            &mut app,
+            AgentEvent::SubagentHistory {
+                tool_use_id: crate::app::tests::MONITOR_ID.into(),
+                messages: vec![Message::user(FIRST_PROMPT.into())],
+                status: None,
+            },
+        );
+        let (trigger, child_cancel) = CancelToken::new();
+        handles
+            .subagent_cancels
+            .insert_detached(CHILD_ID.to_owned(), trigger);
+        let mailbox = handles.mailbox.clone();
+        SessionMailbox::notify(mailbox.session_id(), Notice::text(OLD_NOTICE.into()), true)
+            .unwrap();
+
+        for _ in 0..2 {
+            app.update(Msg::Key(key(KeyCode::Esc)));
+        }
+        let actions = app.update(Msg::Key(key(KeyCode::Enter)));
+        let [Action::RestartAgent(history, reason)] = actions.as_slice() else {
+            panic!("a rewind must replace the native generation");
+        };
+        handles.respawn(
+            history.clone(),
+            *reason,
+            &model_slot,
+            AgentConfig::default(),
+            ToolOutputLines::default(),
+            &permissions,
+            &mut app,
+            EventHandle::disconnected_for_test(),
+        );
+        assert!(owner.is_cancelled());
+        assert!(child_cancel.is_cancelled());
+        assert!(mailbox.claim_wake().is_empty());
+        assert!(mailbox.drain().is_empty());
+        assert!(!handles.cancels.teardown().is_cancelled());
+
+        let event = Envelope {
+            run_id: DETACHED_RUN_ID,
+            subagent: Some(SubagentInfo {
+                parent_tool_use_id: CHILD_ID.into(),
+                name: CHILD_ID.into(),
+                prompt: None,
+                model: None,
+                opts: None,
+                detached: true,
+                owner_cancel: Some(owner.clone()),
+                spawn_tool_use_id: None,
+                answer_tx: None,
+                inbox: None,
+            }),
+            event: AgentEvent::TextDelta {
+                text: LATE_CHILD_TEXT.into(),
+            },
+        };
+        app.update(Msg::Agent(Box::new(event)));
+        assert_eq!(app.chats.len(), 2);
+        assert!(app.chats[1].is_finished());
+        assert_eq!(
+            app.chats[1].last_message_text(),
+            crate::chat::CANCELLED_TEXT
+        );
+        assert!(app.state.session.messages().is_empty());
+        for event in [
+            AgentEvent::TextDelta {
+                text: LATE_CHILD_TEXT.into(),
+            },
+            AgentEvent::SubagentHistory {
+                tool_use_id: crate::app::tests::MONITOR_ID.into(),
+                messages: vec![Message::user(LATE_CHILD_TEXT.into())],
+                status: None,
+            },
+            AgentEvent::StreamClosed,
+        ] {
+            app.deliver(
+                Envelope {
+                    run_id: 0,
+                    subagent: Some(SubagentInfo {
+                        parent_tool_use_id: crate::app::tests::MONITOR_ID.into(),
+                        name: CHILD_ID.into(),
+                        prompt: None,
+                        model: None,
+                        opts: None,
+                        detached: false,
+                        owner_cancel: Some(owner.clone()),
+                        spawn_tool_use_id: None,
+                        answer_tx: None,
+                        inbox: None,
+                    }),
+                    event,
+                },
+                Some((
+                    Arc::from(crate::app::tests::MONITOR_PLUGIN),
+                    crate::app::tests::MONITOR_ID,
+                )),
+            );
+        }
+        assert_eq!(app.chats.len(), 2);
+        assert_eq!(
+            app.chats[1].last_message_text(),
+            crate::chat::CANCELLED_TEXT
+        );
+        assert_eq!(
+            app.state.session.subagent_messages()[crate::app::tests::MONITOR_ID][0].user_text(),
+            Some(FIRST_PROMPT)
+        );
+        handles.cancel_all();
+    }
+
     #[test]
     fn respawn_publishes_the_new_history_into_the_app_mirror() {
         let (mut handles, model_slot, permissions) = stub_spawn();
         let mut app = crate::app::tests::test_app();
         handles.respawn(
             vec![Message::user(RESUMED_HISTORY_TEXT.into())],
+            SessionEndReason::Replaced,
             &model_slot,
             AgentConfig::default(),
             ToolOutputLines::default(),

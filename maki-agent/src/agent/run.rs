@@ -403,8 +403,8 @@ impl<'h> Agent<'h> {
             return Ok(());
         };
         if drain_mailbox && let Some(mailbox) = &self.mailbox {
-            for message in mailbox.drain() {
-                self.land_observation(message)?;
+            for notice in mailbox.drain() {
+                self.land_observation(notice.message)?;
             }
         }
         self.tell_changes();
@@ -1167,6 +1167,7 @@ fn interrupt_message(message: String, images: Vec<ImageSource>) -> Message {
 
 #[cfg(test)]
 mod tests {
+    use crate::Notice;
     use std::collections::{BTreeMap, VecDeque};
     use std::path::Path;
     use std::sync::{Arc, Mutex};
@@ -1716,7 +1717,7 @@ mod tests {
         smol::block_on(async {
             let id = maki_storage::id::MakiId::generate();
             let mailbox = SessionMailbox::register(id);
-            SessionMailbox::notify(id, "mailbox".into(), None, false).unwrap();
+            SessionMailbox::notify(id, Notice::text("mailbox".into()), false).unwrap();
             let mut history = History::new(Vec::new());
             let (mut agent, _event_rx) = make_agent(
                 MockProvider::new(vec![text_response(StopReason::EndTurn)]),
@@ -1740,7 +1741,7 @@ mod tests {
         smol::block_on(async {
             let id = maki_storage::id::MakiId::generate();
             let mailbox = SessionMailbox::register(id);
-            SessionMailbox::notify(id, "mailbox".into(), None, false).unwrap();
+            SessionMailbox::notify(id, Notice::text("mailbox".into()), false).unwrap();
             let mut input = default_input();
             input.preamble = vec![Message::observation("preamble".into())];
             let source = MockInterruptSource::new(vec![ExtractedCommand::Interrupt(vec![input])]);
@@ -1768,7 +1769,7 @@ mod tests {
         smol::block_on(async {
             let id = maki_storage::id::MakiId::generate();
             let mailbox = SessionMailbox::register(id);
-            SessionMailbox::notify(id, "failed".into(), None, true).unwrap();
+            SessionMailbox::notify(id, Notice::text("failed".into()), true).unwrap();
             let mut history = History::new(Vec::new());
             let (mut agent, _event_rx) = make_agent(
                 MockProvider::new(vec![text_response(StopReason::EndTurn)]),
@@ -1795,6 +1796,16 @@ mod tests {
         PromptPreamble,
         NextPrompt,
         Interrupt,
+    }
+
+    fn notice(display: Option<&str>) -> Notice {
+        let mut notice = Notice::text(NOTICE_BODY.into());
+        notice.message.display_text = display.map(str::to_owned);
+        notice
+    }
+
+    fn messages(notices: Vec<Notice>) -> Vec<Message> {
+        notices.into_iter().map(|notice| notice.message).collect()
     }
 
     fn notice_lines(events: &[Envelope]) -> Vec<&str> {
@@ -1824,21 +1835,21 @@ mod tests {
         smol::block_on(async {
             let id = maki_storage::id::MakiId::generate();
             let mailbox = SessionMailbox::register(id);
-            SessionMailbox::notify(id, NOTICE_BODY.into(), Some(NOTICE_LINE), true).unwrap();
+            SessionMailbox::notify(id, notice(Some(NOTICE_LINE)), true).unwrap();
             let mut input = default_input();
             match path {
                 NoticePath::WakePreamble => {
                     input.message.clear();
-                    input.preamble = mailbox.claim_wake();
+                    input.preamble = messages(mailbox.claim_wake());
                 }
                 NoticePath::WakeBatchedWithPrompt => {
                     input.earlier = vec![EarlierInput {
                         message: String::new(),
                         images: Vec::new(),
-                        preamble: mailbox.claim_wake(),
+                        preamble: messages(mailbox.claim_wake()),
                     }];
                 }
-                NoticePath::PromptPreamble => input.preamble = mailbox.drain(),
+                NoticePath::PromptPreamble => input.preamble = messages(mailbox.drain()),
                 NoticePath::NextPrompt | NoticePath::Interrupt => {}
             }
             let mut history = History::new(Vec::new());
@@ -1874,7 +1885,7 @@ mod tests {
         smol::block_on(async {
             let id = maki_storage::id::MakiId::generate();
             let mailbox = SessionMailbox::register(id);
-            SessionMailbox::notify(id, NOTICE_BODY.into(), Some(NOTICE_LINE), false).unwrap();
+            SessionMailbox::notify(id, notice(Some(NOTICE_LINE)), false).unwrap();
             let mut history = History::new(Vec::new());
             let (agent, event_rx) = make_agent(MockProvider::new(Vec::new()), &mut history);
             let mut agent = agent.with_interrupt_source(MockInterruptSource::new(vec![
@@ -1920,7 +1931,7 @@ mod tests {
         smol::block_on(async {
             let id = maki_storage::id::MakiId::generate();
             let mailbox = SessionMailbox::register(id);
-            SessionMailbox::notify(id, NOTICE_BODY.into(), None, false).unwrap();
+            SessionMailbox::notify(id, notice(None), false).unwrap();
             let mut history = History::new(Vec::new());
             let (mut agent, event_rx) = make_agent(
                 MockProvider::new(vec![text_response(StopReason::EndTurn)]),
@@ -3478,7 +3489,9 @@ mod tests {
             trigger.cancel();
 
             let mut history = History::new(Vec::new());
-            let (agent, event_rx) = make_agent(StubStreamProvider::default(), &mut history);
+            let provider = MockProvider::new(Vec::new());
+            let requests = Arc::clone(&provider.requests);
+            let (agent, event_rx) = make_agent(provider, &mut history);
             let mut agent = agent.with_cancel(cancel);
 
             assert_eq!(
@@ -3486,6 +3499,10 @@ mod tests {
                 DoneReason::Cancelled
             );
             drop(agent);
+            assert!(
+                requests.lock().unwrap().is_empty(),
+                "a cancelled queued prompt must not reach the provider"
+            );
             assert_ends_with_cancel_marker(&history);
             assert!(has_event(&drain_events(&event_rx), |e| matches!(
                 e,

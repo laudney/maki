@@ -21,6 +21,7 @@ use maki_agent::session::Resumed;
 use maki_agent::tools::QUESTION_TOOL_NAME;
 use maki_agent::{
     AgentConfig, AgentEvent, DoneReason, Envelope, ImageSource, PermissionsConfig, SteerKind,
+    SubagentInfo,
 };
 use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
 use maki_lua::session_snapshot::{HeadlessMeta, HeadlessSnapshot, MODE_BUILD};
@@ -231,6 +232,7 @@ pub fn run(params: PrintParams) -> Result<()> {
         tool_names,
         session_id,
         cwd,
+        mailbox,
         task,
     } = handle;
     let start = Instant::now();
@@ -292,7 +294,8 @@ pub fn run(params: PrintParams) -> Result<()> {
             ref subagent,
             ..
         } = envelope;
-        let parent_tool_use_id = subagent.as_ref().map(|s| s.parent_tool_use_id.as_str());
+        // The call that spawned a child is what the reader knows it by.
+        let parent_tool_use_id = subagent.as_ref().map(SubagentInfo::spawn_row_id);
 
         match event {
             AgentEvent::TextDelta { text } => {
@@ -398,6 +401,7 @@ pub fn run(params: PrintParams) -> Result<()> {
     }
     smol::block_on(headless::await_shutdown(task));
     lua_handle.end_sessions_blocking([session_id.id()], SessionEndReason::Completed);
+    drop(mailbox);
 
     let duration_ms = start.elapsed().as_millis();
     // Zero on an unpriced model, which is what its turns reported too.

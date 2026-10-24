@@ -22,9 +22,9 @@ use maki_agent::command::{CommandScope, CustomCommand};
 use maki_agent::permissions::{PermissionAnswer, PermissionManager};
 use maki_agent::session::NOTHING_TO_STORE;
 use maki_agent::{
-    AgentMode, DoneReason, HistorySnapshot, ImageMediaType, McpConfigErrors, McpServerInfo,
-    McpServerStatus, McpSnapshot, McpSnapshotReader, SharedBuf, SteerKind, SubagentInbox,
-    ToolDoneEvent, ToolOutput, ToolStartEvent, Transcript, TurnCompleteEvent,
+    AgentMode, CancelToken, DoneReason, HistorySnapshot, ImageMediaType, McpConfigErrors,
+    McpServerInfo, McpServerStatus, McpSnapshot, McpSnapshotReader, Notice, SharedBuf, SteerKind,
+    SubagentInbox, ToolDoneEvent, ToolOutput, ToolStartEvent, Transcript, TurnCompleteEvent,
 };
 use maki_config::{Effect, PermissionRule, PermissionsConfig, ProjectConfig, ToolKey, UiConfig};
 use maki_lua::test_support::{HintWriterHandle, hint_writer_pair};
@@ -58,6 +58,10 @@ const WRITER_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 const NATIVE_OUTPUT_CAP: u32 = 8192;
 const ALL_LANDED: &str = "a drain that wrote everything reports nothing unsaved";
 const TASK_ID: &str = "task1";
+/// A background agent routes under an id of its own, so the call that spawned
+/// it is a separate row in the main transcript.
+const SPAWN_ID: &str = "toolu_spawn";
+const AGENT_ID: &str = "subagent-1";
 const PACKUPDATE: &str = "/packupdate";
 const PACK_NAME: &str = "demo";
 const PACKDEL_USAGE: &str = "/packdel: name a package, or pass ++all";
@@ -331,6 +335,9 @@ fn subagent_info_with_tx(
         prompt: None,
         model: None,
         opts: None,
+        detached: false,
+        owner_cancel: None,
+        spawn_tool_use_id: None,
         answer_tx,
         inbox: None,
     }
@@ -350,6 +357,28 @@ fn subagent_msg_with_run_id(
         event,
         subagent: Some(subagent_info(parent_id, name.unwrap_or("Agent"))),
         run_id,
+    }))
+}
+
+/// A background agent's events: they carry the detached run id, because the
+/// run that spawned the agent has no claim on it once it ends.
+fn detached_msg(event: AgentEvent, parent_id: &str) -> Msg {
+    detached_msg_with_tx(event, parent_id, None)
+}
+
+fn detached_msg_with_tx(
+    event: AgentEvent,
+    parent_id: &str,
+    answer_tx: Option<flume::Sender<String>>,
+) -> Msg {
+    let mut info = subagent_info_with_tx(parent_id, "Agent", answer_tx);
+    info.detached = true;
+    info.owner_cancel = Some(CancelToken::none());
+    info.spawn_tool_use_id = Some(SPAWN_ID.into());
+    Msg::Agent(Box::new(Envelope {
+        event,
+        subagent: Some(info),
+        run_id: DETACHED_RUN_ID,
     }))
 }
 
@@ -430,7 +459,7 @@ fn typing_and_submit() {
 #[test]
 fn mailbox_wake_starts_without_an_empty_user_bubble() {
     let mut app = test_app();
-    let actions = app.start_mailbox_run(vec![Message::observation("failed".into())]);
+    let actions = app.start_mailbox_run(vec![Notice::text("failed".into())]);
 
     assert!(matches!(
         &actions[..],
@@ -452,7 +481,21 @@ fn labelled_notice(line: &str) -> Message {
 #[test]
 fn a_notice_line_appears_when_the_loop_accepts_it() {
     let mut app = test_app();
-    app.start_mailbox_run(vec![labelled_notice(NOTICE_LINE)]);
+    let notice = Notice {
+        message: labelled_notice(NOTICE_LINE),
+        owner_cancel: None,
+    };
+    let expected = serde_json::to_value(&notice.message).unwrap();
+
+    let actions = app.start_mailbox_run(vec![notice]);
+
+    let [Action::SendMessage(input)] = actions.as_slice() else {
+        panic!("the notice must start a mailbox run");
+    };
+    assert_eq!(
+        serde_json::to_value(&input.preamble).unwrap(),
+        serde_json::json!([expected])
+    );
     assert!(
         app.main_chat().segment_search_texts().is_empty(),
         "the line waits for the loop to accept the notice"
@@ -945,6 +988,11 @@ pub(crate) fn cancel_app(app: &mut App) {
     app.update(Msg::Key(key(KeyCode::Esc)));
 }
 
+fn cancel_foreground(app: &mut App) {
+    let actions = app.handle_cancel();
+    assert!(matches!(actions.as_slice(), [Action::CancelAgent { .. }]));
+}
+
 pub(crate) fn error_app(app: &mut App) {
     app.update(agent_msg(AgentEvent::Error {
         message: AGENT_ERROR_MSG.into(),
@@ -986,7 +1034,7 @@ fn enter_executes_new_command() {
     type_slash(&mut app);
     app.update(Msg::Key(key(KeyCode::Char('n'))));
     let actions = app.update(Msg::Key(key(KeyCode::Enter)));
-    assert!(matches!(&actions[0], Action::RestartAgent(h) if h.is_empty()));
+    assert!(matches!(&actions[0], Action::RestartAgent(h, _) if h.is_empty()));
     assert!(!palette_open(&mut app));
 }
 
@@ -1025,14 +1073,19 @@ fn session_reset_names_the_session_that_ended() {
     app.lua_event_handle = handle;
     let ended = app.state.session.id.to_string();
 
-    app.reset_session();
+    let actions = app.reset_session();
 
     let (event, data) = probe.try_recv_autocmd().expect("SessionReset fired");
     assert_eq!(event, "SessionReset");
     assert_eq!(data["session_id"], serde_json::json!(ended));
-    let (ended_id, reason) = probe.try_recv_end_session().expect("SessionEnd queued");
-    assert_eq!(ended_id.to_string(), ended);
-    assert_eq!(reason, SessionEndReason::Reset);
+    assert!(matches!(
+        actions.as_slice(),
+        [Action::RestartAgent(_, SessionEndReason::Reset)]
+    ));
+    assert!(
+        probe.try_recv_end_session().is_none(),
+        "the respawn funnel owns SessionEnd"
+    );
     assert_ne!(
         app.state.session.id.to_string(),
         ended,
@@ -1053,7 +1106,7 @@ fn reset_session_clears_plan() {
     let (_tx, rx) = flume::bounded::<crate::components::btw_modal::BtwEvent>(1);
     app.btw_modal.open("q", rx);
     let actions = app.reset_session();
-    assert!(matches!(&actions[0], Action::RestartAgent(h) if h.is_empty()));
+    assert!(matches!(&actions[0], Action::RestartAgent(h, _) if h.is_empty()));
     assert_eq!(app.status, Status::Idle);
     assert_eq!(app.state.token_usage.input, 0);
     assert_eq!(app.chats[0].context_size, 0);
@@ -2175,6 +2228,26 @@ fn subagent_turn_complete_updates_matching_parent_header_with_last_turn() {
     assert_eq!(app.chats[0].tool_turn_usage("task2"), None);
 }
 
+/// A background agent's transcript is a chat of its own, so its usage has to
+/// find the spawn row that stands for it in the main transcript.
+#[test]
+fn a_detached_agents_usage_lands_on_its_spawn_row() {
+    let mut app = streaming_app();
+    app.update(agent_msg(tool_start(SPAWN_ID, "task")));
+    app.run_id = 9;
+    app.update(detached_msg(
+        turn_complete(SUB_TOKENS, "child-model", SUB_COST),
+        AGENT_ID,
+    ));
+
+    assert_eq!(app.chats[1].cost, SUB_COST);
+    assert_eq!(app.state.cost, SUB_COST);
+    assert_eq!(
+        app.chats[0].tool_turn_usage(SPAWN_ID),
+        Some(sub_usage_text().as_str())
+    );
+}
+
 #[test_case(false ; "plain_tool_takes_the_parent_turn")]
 #[test_case(true  ; "subagent_stamp_is_not_overwritten")]
 fn parent_turn_flush_stamps_the_last_unstamped_tool(subagent_ran: bool) {
@@ -2286,7 +2359,7 @@ pub(crate) fn plugin_event(app: &mut App, event: AgentEvent) {
             subagent: Some(info),
             run_id: 0,
         },
-        Some(Arc::from(MONITOR_PLUGIN)),
+        Some((Arc::from(MONITOR_PLUGIN), MONITOR_ID)),
     );
 }
 
@@ -2294,6 +2367,124 @@ pub(crate) fn app_with_plugin_task() -> App {
     let mut app = test_app();
     plugin_event(&mut app, AgentEvent::TextDelta { text: "x".into() });
     app
+}
+
+fn plugin_child_event(app: &mut App, event: AgentEvent, answer_tx: Option<flume::Sender<String>>) {
+    let mut info = subagent_info_with_tx(TASK_ID, TASK_ID, answer_tx);
+    info.owner_cancel = Some(CancelToken::none());
+    app.deliver(
+        Envelope {
+            event,
+            subagent: Some(info),
+            run_id: DETACHED_RUN_ID,
+        },
+        Some((Arc::from(MONITOR_PLUGIN), MONITOR_ID)),
+    );
+}
+
+#[test_case(end_turn; "turn_end")]
+#[test_case(cancel_foreground; "foreground_cancel")]
+fn nested_plugin_child_outlives_foreground_and_closes_on_history(end: fn(&mut App)) {
+    let mut app = streaming_app();
+    plugin_event(
+        &mut app,
+        AgentEvent::TextDelta {
+            text: MONITOR_PROMPT.into(),
+        },
+    );
+    let (answer_tx, _) = flume::unbounded();
+    plugin_child_event(
+        &mut app,
+        AgentEvent::PermissionRequest {
+            id: FIRST_ASK.into(),
+            tool: ToolKey::native("bash"),
+            scopes: vec!["ls".into()],
+            reason: None,
+        },
+        Some(answer_tx),
+    );
+    end(&mut app);
+    assert_eq!(app.chats[2].task_status(), TaskStatus::Working);
+    assert!(app.chats[2].agent);
+    assert!(app.permission_prompt.is_open());
+    plugin_child_event(
+        &mut app,
+        AgentEvent::SubagentHistory {
+            tool_use_id: TASK_ID.into(),
+            messages: vec![],
+            status: None,
+        },
+        None,
+    );
+    assert_eq!(app.chats[2].task_status(), TaskStatus::Done);
+    assert_eq!(app.chats[1].task_status(), TaskStatus::Working);
+    assert!(!app.subagent_answers.contains_key(TASK_ID));
+    assert!(!app.permission_prompt.is_open());
+}
+
+#[test]
+fn nested_plugin_child_cancel_uses_its_native_child_owner() {
+    const MISSING_CHILD: &str = "missing-child";
+    let mut app = app_with_plugin_task();
+    plugin_child_event(
+        &mut app,
+        AgentEvent::TextDelta {
+            text: MONITOR_PROMPT.into(),
+        },
+        None,
+    );
+    assert!(app.stop_task(MISSING_CHILD).is_err());
+    assert_eq!(app.chats[2].task_status(), TaskStatus::Working);
+    let action = app.stop_task(TASK_ID).unwrap();
+    assert!(matches!(action, Action::CancelSubagent { tool_use_id } if tool_use_id == TASK_ID));
+    assert_eq!(app.chats[1].task_status(), TaskStatus::Working);
+    plugin_child_event(
+        &mut app,
+        AgentEvent::SubagentHistory {
+            tool_use_id: TASK_ID.into(),
+            messages: vec![],
+            status: Some(SubagentVerdict::Done),
+        },
+        None,
+    );
+    assert_eq!(app.chats[2].task_status(), TaskStatus::Error);
+    assert_eq!(app.chats[2].last_message_text(), CANCELLED_TEXT);
+}
+
+#[test]
+fn nested_plugin_usage_is_charged_once_to_the_exact_task() {
+    let mut app = app_with_plugin_task();
+    plugin_event(&mut app, monitor_turn());
+    plugin_child_event(
+        &mut app,
+        turn_complete(SUB_TOKENS, "child-model", SUB_COST),
+        None,
+    );
+    assert_eq!(app.chats[1].cost, MONITOR_TURN.cost);
+    assert_eq!(app.chats[2].cost, SUB_COST);
+    assert_eq!(
+        app.state.cost,
+        Some(MONITOR_TURN.cost.unwrap() + SUB_COST.unwrap())
+    );
+}
+
+#[test]
+fn attached_child_in_a_background_lineage_keeps_its_detached_run() {
+    let mut app = streaming_app();
+    app.run_id = 9;
+    let mut info = subagent_info(TASK_ID, TASK_ID);
+    info.owner_cancel = Some(CancelToken::none());
+    app.update(Msg::Agent(Box::new(Envelope {
+        event: AgentEvent::TextDelta {
+            text: MONITOR_PROMPT.into(),
+        },
+        subagent: Some(info),
+        run_id: DETACHED_RUN_ID,
+    })));
+    assert_eq!(app.chats.len(), 2);
+    app.update(agent_msg_with_run_id(done(), app.run_id));
+    assert!(app.chat_index.contains_key(TASK_ID));
+    assert_eq!(app.chats[1].task_status(), TaskStatus::Working);
 }
 
 fn monitor_turn() -> AgentEvent {
@@ -2308,6 +2499,7 @@ fn monitor_history(messages: Vec<Message>) -> AgentEvent {
     AgentEvent::SubagentHistory {
         tool_use_id: MONITOR_ID.into(),
         messages,
+        status: None,
     }
 }
 
@@ -2325,6 +2517,18 @@ fn agent_error() -> AgentEvent {
     }
 }
 
+#[test]
+fn an_open_notice_from_an_ended_generation_cannot_recreate_a_task() {
+    let mut app = test_app();
+    let (owner, token) = CancelToken::new();
+    let mut info = subagent_info(MONITOR_ID, MONITOR_NAME);
+    info.owner_cancel = Some(token);
+    owner.cancel();
+    app.open_plugin_task(&info, Arc::from(MONITOR_PLUGIN));
+    assert_eq!(app.chats.len(), 1);
+    assert!(app.chat_of_task(MONITOR_ID).is_err());
+}
+
 /// A plugin task is a chat like a tool task, but routed by id: `chat_index`
 /// is the running turn's map, and the main chat is idle here.
 #[test]
@@ -2340,6 +2544,7 @@ fn plugin_task_opens_a_chat_by_id_with_its_first_prompt() {
     assert_eq!(chat.last_message_text(), MONITOR_PROMPT);
     let tasks = serde_json::to_value(app.tasks()).unwrap();
     assert_eq!(tasks[1]["plugin"], MONITOR_PLUGIN);
+    assert!(!chat.agent);
     assert_eq!(tasks[0].get("plugin"), None);
 }
 
@@ -2354,7 +2559,7 @@ fn plugin_event_without_a_task_shows_nowhere() {
             subagent: None,
             run_id: 0,
         },
-        Some(Arc::from(MONITOR_PLUGIN)),
+        Some((Arc::from(MONITOR_PLUGIN), MONITOR_ID)),
     );
     assert_eq!(app.chats.len(), 1);
     assert_eq!(app.chats[0].message_count(), 0);
@@ -2439,16 +2644,95 @@ fn esc_in_a_plugin_task_tab_stops_its_session() {
 
 /// The transcript lands after every prompt, so a monitor that dies with the
 /// process leaves what it did, and the close is its own event.
-#[test]
-fn plugin_task_stores_its_transcript_per_prompt_and_finishes_on_close() {
-    let mut app = app_with_plugin_task();
+#[test_case(None, TaskStatus::Done, DONE_TEXT; "default_close")]
+#[test_case(Some(SubagentVerdict::Error), TaskStatus::Error, ERROR_TEXT; "explicit_error")]
+fn plugin_task_stores_its_transcript_per_prompt_and_finishes_on_close(
+    final_status: Option<SubagentVerdict>,
+    expected: TaskStatus,
+    ending: &str,
+) {
+    let mut app = test_app();
+    let (answer_tx, answer_rx) = flume::unbounded();
+    app.deliver(
+        Envelope {
+            run_id: 0,
+            subagent: Some(subagent_info_with_tx(
+                MONITOR_ID,
+                MONITOR_NAME,
+                Some(answer_tx),
+            )),
+            event: AgentEvent::PermissionRequest {
+                id: FIRST_ASK.into(),
+                tool: ToolKey::native("bash"),
+                scopes: vec!["ls".into()],
+                reason: None,
+            },
+        },
+        Some((Arc::from(MONITOR_PLUGIN), MONITOR_ID)),
+    );
     plugin_event(&mut app, monitor_history(vec![Message::user("ok".into())]));
     assert_eq!(app.chats[1].task_status(), TaskStatus::Working);
     assert_eq!(app.state.session.subagent_messages()[MONITOR_ID].len(), 1);
+    assert!(app.subagent_answers.contains_key(MONITOR_ID));
+    assert!(app.permission_prompt.is_open());
 
+    if final_status.is_some() {
+        app.update(Msg::Key(key(KeyCode::Char('y'))));
+        assert_eq!(answer_rx.try_recv().unwrap(), allow_once(FIRST_ASK));
+        plugin_event(&mut app, done());
+        assert_eq!(app.chats[1].task_status(), TaskStatus::Idle);
+    }
+    plugin_event(
+        &mut app,
+        AgentEvent::SubagentHistory {
+            tool_use_id: MONITOR_ID.into(),
+            messages: vec![Message::user("ok".into())],
+            status: final_status,
+        },
+    );
     plugin_event(&mut app, AgentEvent::StreamClosed);
-    assert_eq!(app.chats[1].task_status(), TaskStatus::Done);
-    assert_eq!(app.chats[1].last_message_text(), DONE_TEXT);
+    assert_eq!(app.chats[1].task_status(), expected);
+    assert_eq!(app.chats[1].last_message_text(), ending);
+    assert!(!app.subagent_answers.contains_key(MONITOR_ID));
+    assert!(!app.permission_prompt.is_open());
+}
+
+#[test_case(end_turn; "turn_end")]
+#[test_case(cancel_foreground; "foreground_cancel")]
+#[test_case(error_app; "parent_error")]
+fn turn_end_retires_foreground_asks_and_keeps_the_plugin_ask(end: fn(&mut App)) {
+    let mut app = streaming_app();
+    let (foreground_tx, foreground_rx) = flume::unbounded();
+    let (plugin_tx, plugin_rx) = flume::unbounded();
+    for (id, ask, answer_tx, plugin) in [
+        (TASK_ID, FIRST_ASK, foreground_tx, None),
+        (
+            MONITOR_ID,
+            SECOND_ASK,
+            plugin_tx,
+            Some((Arc::from(MONITOR_PLUGIN), MONITOR_ID)),
+        ),
+    ] {
+        app.deliver(
+            Envelope {
+                run_id: app.run_id,
+                subagent: Some(subagent_info_with_tx(id, id, Some(answer_tx))),
+                event: AgentEvent::PermissionRequest {
+                    id: ask.into(),
+                    tool: ToolKey::native("bash"),
+                    scopes: vec!["ls".into()],
+                    reason: None,
+                },
+            },
+            plugin,
+        );
+    }
+
+    end(&mut app);
+    app.update(Msg::Key(key(KeyCode::Char('y'))));
+    assert!(foreground_rx.is_empty());
+    assert_eq!(plugin_rx.try_recv().unwrap(), allow_once(SECOND_ASK));
+    assert!(!app.permission_prompt.is_open());
 }
 
 /// What a finished plugin task shows after a reload: who spent it, and how
@@ -2546,12 +2830,93 @@ fn cancel_resets_all_chats_and_indices() {
     assert_eq!(app.cadence(), Cadence::IDLE);
 }
 
+#[test_case(end_turn; "turn_end")]
+#[test_case(cancel_foreground; "foreground_cancel")]
+fn foreground_end_keeps_a_background_childs_tools_and_permission(end: fn(&mut App)) {
+    let mut app = streaming_app();
+    let (answer_tx, answer_rx) = flume::unbounded();
+    app.update(detached_msg_with_tx(
+        tool_start(FIRST_ASK, "bash"),
+        AGENT_ID,
+        Some(answer_tx),
+    ));
+    app.update(detached_msg(
+        AgentEvent::PermissionRequest {
+            id: FIRST_ASK.into(),
+            tool: ToolKey::native("bash"),
+            scopes: vec!["ls".into()],
+            reason: None,
+        },
+        AGENT_ID,
+    ));
+
+    end(&mut app);
+
+    assert_eq!(app.chats[1].in_progress_count(), 1);
+    assert_eq!(app.chats[1].task_status(), TaskStatus::Working);
+    assert!(app.chat_index.contains_key(AGENT_ID));
+    assert!(app.chats[1].agent);
+    assert!(app.permission_prompt.is_open());
+    app.update(Msg::Key(key(KeyCode::Char('y'))));
+    assert_eq!(answer_rx.try_recv().unwrap(), allow_once(FIRST_ASK));
+    assert!(!app.permission_prompt.is_open());
+}
+
+#[test]
+fn child_close_retires_only_its_permission_and_answer_owner() {
+    const CHILD_RESULT: &str = "child result";
+    let mut app = streaming_app();
+    let (first_tx, first_rx) = flume::unbounded();
+    let (second_tx, second_rx) = flume::unbounded();
+    for (child, ask, tx) in [
+        (AGENT_ID, FIRST_ASK, first_tx),
+        (TASK_ID, SECOND_ASK, second_tx),
+    ] {
+        app.update(detached_msg_with_tx(
+            AgentEvent::PermissionRequest {
+                id: ask.into(),
+                tool: ToolKey::native("bash"),
+                scopes: vec!["ls".into()],
+                reason: None,
+            },
+            child,
+            Some(tx),
+        ));
+    }
+
+    app.update(detached_msg(AgentEvent::AuthRequired, AGENT_ID));
+    app.update(detached_msg(
+        AgentEvent::SubagentHistory {
+            tool_use_id: AGENT_ID.into(),
+            messages: vec![Message::user(CHILD_RESULT.into())],
+            status: Some(SubagentVerdict::Error),
+        },
+        AGENT_ID,
+    ));
+
+    assert_eq!(app.chats[1].task_status(), TaskStatus::Error);
+    assert_eq!(app.chats[1].last_message_text(), ERROR_TEXT);
+    assert_eq!(
+        app.state.session.subagent_messages()[AGENT_ID][0].user_text(),
+        Some(CHILD_RESULT)
+    );
+    assert_eq!(app.pending_input, PendingInput::None);
+    assert!(!app.subagent_answers.contains_key(AGENT_ID));
+    assert!(app.subagent_answers.contains_key(TASK_ID));
+    assert!(app.permission_prompt.is_open());
+    app.update(Msg::Key(key(KeyCode::Char('y'))));
+    assert!(first_rx.is_empty());
+    assert_eq!(second_rx.try_recv().unwrap(), allow_once(SECOND_ASK));
+    assert!(!app.permission_prompt.is_open());
+}
+
 /// What a subagent's own session sends when it closes, which the `task` tool
 /// does before it reports success or failure.
 pub(crate) fn close_subagent_transcript(app: &mut App, id: &str) {
     app.update(agent_msg(AgentEvent::SubagentHistory {
         tool_use_id: id.into(),
         messages: vec![],
+        status: None,
     }));
 }
 
@@ -4428,7 +4793,7 @@ fn run_cmdline_executes_builtin(cmdline: &str) {
         .run_cmdline(cmdline, 0, &only(Permission::SessionWrite))
         .unwrap();
 
-    assert!(matches!(&actions[..], [Action::RestartAgent(h)] if h.is_empty()));
+    assert!(matches!(&actions[..], [Action::RestartAgent(h, _)] if h.is_empty()));
 }
 
 #[test]
@@ -4671,7 +5036,7 @@ fn rewind_to_middle_truncates_and_populates_input() {
     assert_eq!(app.input_box.buffer.value(), "second prompt");
     assert_eq!(app.run_id, old_run_id);
 
-    let Action::RestartAgent(ref history) = actions[0] else {
+    let Action::RestartAgent(ref history, SessionEndReason::Rewind) = actions[0] else {
         panic!("{RESTART_EXPECTED}");
     };
     assert_eq!(history.len(), 2);
@@ -4736,7 +5101,7 @@ fn rewind_to_first_turn_clears_everything() {
     assert_eq!(app.state.token_usage.output, 200);
     assert_eq!(app.state.context_size, 0);
     assert_eq!(app.chats[0].context_size, 0);
-    assert!(matches!(&actions[0], Action::RestartAgent(_)));
+    assert!(matches!(&actions[0], Action::RestartAgent(_, _)));
 }
 
 #[test_case(Duration::ZERO,          true  ; "keeps_fresh_error")]
@@ -4947,7 +5312,7 @@ fn stale_auth_required_after_cancel_is_dropped() {
 }
 
 #[test]
-fn send_to_agent_unknown_subagent_falls_back_to_main() {
+fn unknown_child_auth_retry_cannot_answer_the_main_agent() {
     let (main_tx, main_rx) = flume::unbounded();
     let mut app = test_app();
     app.status = Status::Streaming;
@@ -4959,7 +5324,7 @@ fn send_to_agent_unknown_subagent_falls_back_to_main() {
     };
     app.update(Msg::Key(key(KeyCode::Enter)));
 
-    assert_eq!(main_rx.try_recv().unwrap(), "");
+    assert!(main_rx.is_empty());
     assert_eq!(app.pending_input, PendingInput::None);
 }
 
@@ -5609,7 +5974,7 @@ fn plan_form_menu_options(
     assert_eq!(
         actions
             .iter()
-            .any(|a| matches!(a, Action::RestartAgent(h) if h.is_empty())),
+            .any(|a| matches!(a, Action::RestartAgent(h, _) if h.is_empty())),
         has_new_session
     );
     let expected_msg = implement_msg(PlanForm::new().parallel());
@@ -6012,7 +6377,7 @@ fn the_command_palette_outranks_the_keys_a_popup_claimed() {
 
     let actions = app.update(Msg::Key(key(KeyCode::Enter)));
     assert!(
-        matches!(&actions[0], Action::RestartAgent(h) if h.is_empty()),
+        matches!(&actions[0], Action::RestartAgent(h, _) if h.is_empty()),
         "Enter ran the command the user was typing"
     );
     assert!(!took_a_key(&events), "{CLAIM_NOT_DELIVERED}");
@@ -6336,6 +6701,7 @@ fn subagent_history_finishes_workflow_chat() {
         AgentEvent::SubagentHistory {
             tool_use_id: "session-abc".into(),
             messages: vec![],
+            status: None,
         },
         1,
     ));
@@ -7968,6 +8334,18 @@ fn fork_opens_a_copy_and_leaves_the_original_alone() {
     let _live = attach_live_history(&mut app, vec![Message::user(LIVE_AGENT_TEXT.into())]);
     app.recoverable_queue = vec![RECOVERED_PROMPT.into()];
     let original = app.state.session.id;
+    plugin_event(
+        &mut app,
+        AgentEvent::TextDelta {
+            text: MONITOR_PROMPT.into(),
+        },
+    );
+    app.update(detached_msg(
+        AgentEvent::TextDelta {
+            text: MONITOR_PROMPT.into(),
+        },
+        AGENT_ID,
+    ));
 
     let fork = opened_fork(type_and_submit(&mut app, "/fork"));
     assert_ne!(fork.id, original);
@@ -7986,6 +8364,10 @@ fn fork_opens_a_copy_and_leaves_the_original_alone() {
         "the original runs its own queue, the copy must not run it again",
     );
     assert_eq!(app.state.session.id, original);
+    assert_eq!(app.chats.len(), 3);
+    assert_eq!(app.chats[1].task_status(), TaskStatus::Working);
+    assert_eq!(app.chats[2].task_status(), TaskStatus::Working);
+    assert!(app.chat_index.contains_key(AGENT_ID));
     assert_eq!(
         app.state.session.messages().len(),
         1,
@@ -8047,7 +8429,7 @@ const RESTART_MATCHES_SESSION: &str =
 const MIRROR_SURVIVED: &str = "a history the agent did not produce must drop the mirror with it";
 
 fn restart_history(actions: Vec<Action>) -> Vec<Message> {
-    let Ok([Action::RestartAgent(history)]) = <[Action; 1]>::try_from(actions) else {
+    let Ok([Action::RestartAgent(history, _)]) = <[Action; 1]>::try_from(actions) else {
         panic!("{ONE_RESTART}");
     };
     history
@@ -8120,17 +8502,14 @@ fn restarting_the_agent_installs_a_local_history(
     assert_eq!(history.first().and_then(|m| m.user_text()), first_prompt);
 }
 
-const RELOAD_ENDS_NOTHING: &str =
-    "only a switch to another session ends the one that was on screen";
+const RELOAD_ENDS_NOTHING: &str = "the respawn funnel must dispatch SessionEnd once";
 
-/// Plugins tear down whatever belonged to the session that ended, so firing
-/// this when the picker reopens the session already on screen would wipe the
-/// state out from under the user still sitting in it.
+/// Session adoption does not enqueue an event that could race the replacement
+/// generation. The respawn funnel ends the old generation before it starts.
 #[test_case(true  ; "same_session_reopened")]
 #[test_case(false ; "switched_session")]
-fn loading_ends_the_previous_session_only_when_the_id_changes(same: bool) {
+fn loading_leaves_session_end_to_the_respawn_funnel(same: bool) {
     let mut app = test_app();
-    let previous = app.state.session.id;
     let (handle, probe) = maki_lua::test_support::probed_event_handle();
     app.lua_event_handle = handle;
     // Reopening the session a tab holds shares its claim, as every holder in
@@ -8146,11 +8525,7 @@ fn loading_ends_the_previous_session_only_when_the_id_changes(same: bool) {
 
     app.apply_loaded_session(tab, &test_model());
 
-    assert_eq!(
-        probe.try_recv_end_session(),
-        (!same).then_some((previous, SessionEndReason::Load)),
-        "{RELOAD_ENDS_NOTHING}"
-    );
+    assert_eq!(probe.try_recv_end_session(), None, "{RELOAD_ENDS_NOTHING}");
 }
 
 const LOADED_MODEL_IGNORED: &str =

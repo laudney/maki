@@ -637,6 +637,7 @@ pub mod test_support {
     use maki_providers::Timeouts;
     use maki_storage::id::MakiId;
 
+    use crate::cancel::CancelMap;
     use crate::live_session::AgentSeed;
     use crate::{Envelope, EventSender, ModelSlot, ToolOutput};
 
@@ -787,6 +788,11 @@ pub mod test_support {
     }
 
     pub fn stub_seed(id: MakiId) -> AgentSeed {
+        stub_seed_owned_by(id, CancelToken::none())
+    }
+
+    /// A seed whose generation ends when the test drops or fires `owner`.
+    pub fn stub_seed_owned_by(id: MakiId, owner: CancelToken) -> AgentSeed {
         let ctx = stub_ctx(&AgentMode::Build);
         let slot = ModelSlot {
             model: (*ctx.model).clone(),
@@ -794,6 +800,8 @@ pub mod test_support {
         };
         AgentSeed::new(
             SessionRef::from(id),
+            owner,
+            Arc::new(CancelMap::new()),
             Arc::new(ArcSwap::from_pointee(slot)),
             AgentConfig::default(),
             ToolOutputLines::default(),

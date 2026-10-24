@@ -60,8 +60,8 @@ use arc_swap::ArcSwapOption;
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use maki_agent::permissions::{PermissionManager, TaggedAnswer};
 use maki_agent::{
-    AgentEvent, Envelope, ImageSource, McpConfigErrors, McpPromptInfo, McpSnapshotReader,
-    SharedMessages, SubagentInfo,
+    AgentEvent, CancelToken, DETACHED_RUN_ID, Envelope, ImageSource, McpConfigErrors,
+    McpPromptInfo, McpSnapshotReader, SharedMessages, SubagentInfo, SubagentVerdict,
 };
 use maki_config::project::{self, GatedFile, TrustQuestion};
 use maki_config::{ModelPolicy, UiConfig};
@@ -881,18 +881,13 @@ impl App {
         }
     }
 
-    fn send_answer(&self, answer: String) {
-        if let Some(tx) = &self.answer_tx {
-            let _ = tx.try_send(answer);
-        }
-    }
-
     fn send_to_agent(&self, subagent_id: Option<&str>, answer: String) {
-        let routed = subagent_id.and_then(|id| self.subagent_answers.get(id));
-        if let Some(tx) = routed {
+        let target = match subagent_id {
+            Some(id) => self.subagent_answers.get(id),
+            None => self.answer_tx.as_ref(),
+        };
+        if let Some(tx) = target {
             let _ = tx.try_send(answer);
-        } else {
-            self.send_answer(answer);
         }
     }
 
@@ -1514,14 +1509,16 @@ impl App {
         let cancelled_run = self.run_id;
         self.run_id += 1;
         self.retry_info = None;
+        let permission_prompt = mem::replace(&mut self.permission_prompt, PermissionPrompt::new());
         self.close_all_overlays();
-        self.pending_input = PendingInput::None;
+        self.permission_prompt = permission_prompt;
         self.finish_subagents(TaskOutcome::Error, CANCELLED_TEXT);
-        self.subagent_answers.clear();
         self.shell.cancel_all();
         for chat in self.chats.iter_mut().filter(|c| c.plugin.is_none()) {
             chat.flush();
-            chat.cancel_in_progress();
+            if !chat.agent || chat.is_finished() {
+                chat.cancel_in_progress();
+            }
         }
         self.main_chat()
             .push(DisplayMessage::new(DisplayRole::Error, CANCEL_MSG.into()));
@@ -1584,7 +1581,17 @@ impl App {
             }
             return vec![];
         }
-        if envelope.run_id != self.run_id {
+        let detached = envelope.run_id == DETACHED_RUN_ID;
+        if detached
+            && !envelope.subagent.as_ref().is_some_and(|info| {
+                info.owner_cancel
+                    .as_ref()
+                    .is_some_and(|owner| !owner.is_cancelled())
+            })
+        {
+            return vec![];
+        }
+        if !detached && envelope.run_id != self.run_id {
             // A snapshot dropped here degrades the tool body to llm_output.
             if let AgentEvent::ToolSnapshot { id, .. }
             | AgentEvent::ToolHeaderSnapshot { id, .. }
@@ -1602,11 +1609,27 @@ impl App {
         self.deliver(envelope, None)
     }
 
-    /// `plugin` names the plugin whose session sent the event, which the chat
-    /// shows as a task of that plugin. Those events skip the run gate above:
-    /// the session outlives turns, Esc and rewinds, so the only gate is the
-    /// chat session, which the event loop already matched.
-    pub(crate) fn deliver(&mut self, envelope: Envelope, plugin: Option<Arc<str>>) -> Vec<Action> {
+    /// `plugin_task` names the native plugin session that relayed the event.
+    /// Only its own identity uses plugin task lifecycle; nested children keep
+    /// their own verdict and cancellation. The generation owner rejects old
+    /// runtime events after the event loop has matched the chat session.
+    pub(crate) fn deliver(
+        &mut self,
+        envelope: Envelope,
+        plugin_task: Option<(Arc<str>, &str)>,
+    ) -> Vec<Action> {
+        if plugin_task.is_some() && envelope.subagent.is_none() {
+            return vec![];
+        }
+        if envelope
+            .subagent
+            .as_ref()
+            .and_then(|info| info.owner_cancel.as_ref())
+            .is_some_and(|owner| owner.is_cancelled())
+        {
+            return vec![];
+        }
+        let background = plugin_task.is_some() || envelope.run_id == DETACHED_RUN_ID;
         let task_id = match &envelope.event {
             AgentEvent::SubagentHistory { tool_use_id, .. } => Some(tool_use_id),
             _ => envelope.subagent.as_ref().map(|s| &s.parent_tool_use_id),
@@ -1615,19 +1638,28 @@ impl App {
             return vec![];
         }
 
+        let plugin = plugin_task.and_then(|(plugin, native_id)| {
+            task_id.is_some_and(|id| id == native_id).then_some(plugin)
+        });
+
         if let AgentEvent::SubagentHistory {
             tool_use_id,
             messages,
+            status,
         } = envelope.event
         {
-            // Workflow sessions use synthetic ids that no ToolDone will match,
-            // so we finish them here on SubagentHistory. This event only knows
-            // that the transcript closed, so say Unknown and leave the verdict
-            // to the ToolDone that follows elsewhere. A plugin task is never in
-            // `chat_index`, and rightly stays open here: it writes its
-            // transcript after every prompt, and its close is `StreamClosed`.
-            if let Some(&sub_idx) = self.chat_index.get(tool_use_id.as_str()) {
-                self.chats[sub_idx].mark_finished(TaskOutcome::Unknown, DONE_TEXT);
+            // Native prompt histories are not terminal. An explicit final
+            // verdict also applies to a native task before StreamClosed.
+            if plugin.is_none() || status.is_some() {
+                let (outcome, text) = match status {
+                    Some(SubagentVerdict::Done) => (TaskOutcome::Done, DONE_TEXT),
+                    Some(SubagentVerdict::Error) => (TaskOutcome::Error, ERROR_TEXT),
+                    None => (TaskOutcome::Unknown, DONE_TEXT),
+                };
+                if let Ok(sub_idx) = self.chat_of_task(&tool_use_id) {
+                    self.chats[sub_idx].mark_finished(outcome, text);
+                }
+                self.retire_task_input(&tool_use_id);
             }
             self.state
                 .session_mut()
@@ -1646,11 +1678,13 @@ impl App {
             .subagent
             .as_ref()
             .map(|s| s.parent_tool_use_id.clone());
+        // A detached child routes under an id of its own, so its usage finds no
+        // row unless the call that spawned it is read from here.
+        let spawn_row = envelope.subagent.as_ref().map(SubagentInfo::spawn_row_id);
 
         let is_plugin_task = plugin.is_some();
         let chat_idx = match envelope.subagent {
-            Some(ref subagent) => self.resolve_or_create_chat(subagent, &plugin),
-            // A plugin event without its task must never land in the main chat.
+            Some(ref subagent) => self.resolve_or_create_chat(subagent, &plugin, background),
             None if is_plugin_task => return vec![],
             None => MAIN_CHAT,
         };
@@ -1660,6 +1694,9 @@ impl App {
             // without a result, and nothing after this would settle them.
             self.chats[chat_idx].cancel_in_progress();
             self.chats[chat_idx].mark_finished(TaskOutcome::Done, DONE_TEXT);
+            if let Some(id) = subagent_id.as_deref() {
+                self.retire_task_input(id);
+            }
             return vec![];
         }
 
@@ -1714,9 +1751,9 @@ impl App {
             let ctx_size = tc.context_size.unwrap_or_else(|| tc.usage.context_tokens());
             self.set_context_size(chat_idx, ctx_size);
             self.chats[chat_idx].set_pending_turn_usage(tc.usage.format(tc.cost));
-            if let Some(tool_id) = &subagent_id {
+            if let Some(row) = spawn_row {
                 let formatted = tc.usage.format_sum_cost(self.chats[chat_idx].cost);
-                self.chats[MAIN_CHAT].set_tool_turn_usage(tool_id, formatted);
+                self.chats[MAIN_CHAT].set_tool_turn_usage(row, formatted);
             }
         }
 
@@ -1818,8 +1855,7 @@ impl App {
                 ChatEventResult::Done => {
                     self.status_bar.clear_flash();
                     self.terminalize_turn(MISSING_TOOL_COMPLETION);
-                    self.chat_index.clear();
-                    self.subagent_answers.clear();
+                    self.retain_agents();
                     self.status = Status::Idle;
                     if self.exit_on_done {
                         self.exit_request = ExitRequest::Success;
@@ -1832,11 +1868,10 @@ impl App {
                         DisplayRole::Error,
                         cap_error_text(&message),
                     ));
-                    self.subagent_answers.clear();
                     self.terminalize_turn(&message);
                     self.recoverable_queue = self.queue.text_messages();
                     self.queue.clear();
-                    self.chat_index.clear();
+                    self.retain_agents();
                     if self.exit_on_done {
                         self.exit_request = ExitRequest::Error;
                     }
@@ -1859,13 +1894,13 @@ impl App {
         }
     }
 
-    /// A tool task is found through `chat_index`, a plugin task by id: the
-    /// index is wiped every turn, and a plugin task would come back as a
-    /// second chat at the main chat's next turn end.
+    /// Delegated children use `chat_index`; plugin tasks are found by id,
+    /// independently of the main chat's turn routing.
     fn resolve_or_create_chat(
         &mut self,
         subagent: &SubagentInfo,
         plugin: &Option<Arc<str>>,
+        background: bool,
     ) -> usize {
         let id = &subagent.parent_tool_use_id;
         let known = match plugin {
@@ -1878,9 +1913,10 @@ impl App {
         let idx = self.chats.len();
         if plugin.is_none() {
             self.chat_index.insert(id.clone(), idx);
-            self.chats[MAIN_CHAT].update_tool_summary(id, &subagent.name);
+            let row = subagent.spawn_row_id();
+            self.chats[MAIN_CHAT].update_tool_summary(row, &subagent.name);
             if let Some(ref model) = subagent.model {
-                self.chats[MAIN_CHAT].update_tool_model(id, model);
+                self.chats[MAIN_CHAT].update_tool_model(row, model);
             }
         }
         if let Some(ref tx) = subagent.answer_tx {
@@ -1898,6 +1934,7 @@ impl App {
         chat.model_id = subagent.model.clone();
         chat.opts = subagent.opts;
         chat.inbox = subagent.inbox.clone();
+        chat.agent = plugin.is_none() && (background || subagent.detached);
         if let Some(ref prompt) = subagent.prompt {
             chat.push_user_message(prompt);
         }
@@ -1910,10 +1947,16 @@ impl App {
     /// it is rather than turning idle again.
     pub(crate) fn open_plugin_task(&mut self, info: &SubagentInfo, plugin: Arc<str>) {
         let id = &info.parent_tool_use_id;
-        if self.deleted_tasks.contains(id) || self.chat_of_task(id).is_ok() {
+        if info
+            .owner_cancel
+            .as_ref()
+            .is_some_and(CancelToken::is_cancelled)
+            || self.deleted_tasks.contains(id)
+            || self.chat_of_task(id).is_ok()
+        {
             return;
         }
-        let idx = self.resolve_or_create_chat(info, &Some(plugin));
+        let idx = self.resolve_or_create_chat(info, &Some(plugin), false);
         self.chats[idx].idle = true;
     }
 
@@ -2489,7 +2532,33 @@ impl App {
 
     fn finish_subagents(&mut self, outcome: TaskOutcome, text: &str) {
         self.retain_resolved_subagents(outcome, text);
-        self.chat_index.clear();
+        self.retain_agents();
+    }
+
+    /// Background agent chats are not turn-scoped: whatever ends the turn,
+    /// they keep their routing and their answer channel until they end.
+    fn retain_agents(&mut self) {
+        self.chat_index
+            .retain(|_, &mut sub_idx| self.chats[sub_idx].agent);
+        let chat_index = &self.chat_index;
+        let chats = &self.chats;
+        self.subagent_answers.retain(|id, _| {
+            chat_index
+                .get(id.as_str())
+                .is_some_and(|&idx| chats[idx].agent && !chats[idx].is_finished())
+                || chats.iter().any(|chat| {
+                    chat.plugin.is_some()
+                        && !chat.is_finished()
+                        && chat.task_id().is_some_and(|task_id| &**task_id == id)
+                })
+        });
+        let answers = &self.subagent_answers;
+        self.permission_prompt
+            .retain_subagents(|id| answers.contains_key(id));
+        if !matches!(&self.pending_input, PendingInput::AuthRetry { subagent_id: Some(id) } if answers.contains_key(id))
+        {
+            self.pending_input = PendingInput::None;
+        }
     }
 
     /// Terminalizes every tool left in progress when a turn ends, sparing
@@ -2498,7 +2567,9 @@ impl App {
         self.retain_resolved_subagents(TaskOutcome::Error, ERROR_TEXT);
         self.chats[MAIN_CHAT].fail_in_progress_except(message.into(), self.shell.active_ids());
         for chat in self.chats.iter_mut().skip(1).filter(|c| c.plugin.is_none()) {
-            chat.fail_in_progress_with_message(message.into());
+            if !chat.agent || chat.is_finished() {
+                chat.fail_in_progress_with_message(message.into());
+            }
         }
     }
 
@@ -2507,6 +2578,9 @@ impl App {
     fn retain_resolved_subagents(&mut self, outcome: TaskOutcome, text: &str) {
         self.chat_index.retain(|_, &mut sub_idx| {
             if self.chats[sub_idx].is_finished() {
+                true
+            } else if self.chats[sub_idx].agent {
+                // A background agent is nobody's child turn: leave it running.
                 true
             } else {
                 self.chats[sub_idx].mark_finished(outcome, text);

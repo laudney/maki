@@ -495,7 +495,7 @@ pub enum Request {
     },
     Shutdown,
     RestoreToolAsync {
-        item: RestoreItem,
+        item: Box<RestoreItem>,
         event_tx: maki_agent::EventSender,
     },
     RestoreComplete {
@@ -549,9 +549,11 @@ enum HostHook {
     EndSession(EndSession),
 }
 
-/// Reap session-owned jobs and fire `SessionEnd`.
+/// Fire `SessionEnd`, then reap its generation's resources.
 pub struct EndSession {
     pub session: MakiId,
+    /// Captured before queueing, since a hook can outlive its session loop.
+    pub generation: Option<CancelToken>,
     pub reason: SessionEndReason,
     /// Set on the paths that block on the dispatch: the instant the caller
     /// stops waiting, and where to answer it. Absent on the queued paths.
@@ -1681,10 +1683,11 @@ async fn run_host_hook(lua: &Lua, hook: HostHook) {
             let data =
                 json_to_lua(lua, &event.payload(Some(&end.session))).unwrap_or(LuaValue::Nil);
             crate::api::autocmd::dispatch(lua.clone(), event.name().to_owned(), None, data).await;
-            with_jobs(lua, |store| store.kill_session(lua, end.session));
-            BackgroundSessions::of(lua).end_session(end.session);
-            // Nothing can pick from this session's plan form again.
-            clear_session_rows(lua, &end.session.to_string());
+            with_jobs(lua, |store| {
+                store.kill_session(lua, end.session, end.generation.as_ref())
+            });
+            BackgroundSessions::of(lua).retire_cancelled_owners(end.session);
+            clear_session_rows(lua, &end.session.to_string(), end.generation.as_ref());
             if let Some((_, reply)) = end.wait {
                 let _ = reply.send(());
             }
@@ -1940,6 +1943,44 @@ pub(crate) fn enqueue_spawned_task(
         })
         .ok();
     Ok(handle)
+}
+
+pub(crate) struct PluginLifetimeRegistration {
+    plugin: Arc<str>,
+    slot: CancelSlot,
+    cancels: Arc<CancelMap<Arc<str>>>,
+    token: CancelToken,
+}
+
+impl PluginLifetimeRegistration {
+    pub(crate) fn token(&self) -> &CancelToken {
+        &self.token
+    }
+}
+
+impl Drop for PluginLifetimeRegistration {
+    fn drop(&mut self) {
+        self.cancels.retire(&self.plugin, self.slot);
+    }
+}
+
+pub(crate) fn register_plugin_lifetime(
+    lua: &Lua,
+    plugin: Arc<str>,
+) -> mlua::Result<PluginLifetimeRegistration> {
+    let cancels = Arc::clone(
+        &lua.app_data_ref::<SpawnedTasks>()
+            .ok_or_else(|| mlua::Error::runtime(NO_PLUGIN_HOST))?
+            .0,
+    );
+    let (trigger, token) = CancelToken::new();
+    let slot = cancels.insert(Arc::clone(&plugin), trigger);
+    Ok(PluginLifetimeRegistration {
+        plugin,
+        slot,
+        cancels,
+        token,
+    })
 }
 
 /// Caps concurrent coroutines to avoid blowing the Lua stack.
@@ -2287,7 +2328,13 @@ pub(crate) struct DeferQueue {
 /// can still run on the way out, like an `on_cancel` hook or a queued job
 /// callback, and the mark stops it from spawning a task nothing would end.
 #[derive(Default)]
-pub(crate) struct SpawnedTasks(CancelMap<Arc<str>>);
+pub(crate) struct SpawnedTasks(Arc<CancelMap<Arc<str>>>);
+
+impl SpawnedTasks {
+    pub(crate) fn cancel_plugin(&self, plugin: &Arc<str>) {
+        self.0.cancel(Arc::clone(plugin));
+    }
+}
 
 impl DeferQueue {
     pub(crate) fn new() -> Self {
@@ -2816,6 +2863,9 @@ impl LuaRuntime {
 
     fn drop_plugin_keys(&mut self, name: &str) -> Option<Arc<maki_pack::lock::Lock>> {
         self.warm_tools.borrow_mut().clear();
+        if let Some(spawned) = self.lua.app_data_ref::<SpawnedTasks>() {
+            spawned.cancel_plugin(&Arc::from(name));
+        }
         with_jobs(&self.lua, |store| {
             store.kill_owner(&self.lua, &JobOwner::Plugin(Arc::from(name)));
             store.detach_plugin_callbacks(&self.lua, name);
@@ -3299,7 +3349,7 @@ impl LuaRuntime {
             queue.cancel_plugin(plugin);
         }
         if let Some(spawned) = self.lua.app_data_ref::<SpawnedTasks>() {
-            spawned.0.cancel(Arc::from(plugin));
+            spawned.cancel_plugin(&Arc::from(plugin));
         }
         crate::api::top::clear_notify_handler(&self.lua, plugin);
         if let Some(mut envs) = self.lua.app_data_mut::<PluginEnvs>() {
@@ -4978,7 +5028,7 @@ pub fn spawn(
                             let _ = reply.send(result);
                         }
                         Request::RestoreToolAsync { item, event_tx } => {
-                            spawn_restore(&ex, &gate, &restores, &rt, item, event_tx);
+                            spawn_restore(&ex, &gate, &restores, &rt, *item, event_tx);
                         }
                         Request::RestoreComplete { flag } => {
                             restores.complete(flag);

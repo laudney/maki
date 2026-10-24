@@ -3,7 +3,7 @@
 
 use std::borrow::Cow;
 
-use maki_agent::{AgentInput, AgentMode, ImageSource, InputSource};
+use maki_agent::{AgentInput, AgentMode, ImageSource, InputSource, Notice};
 use maki_lua::agent_autocmd::HostEvent;
 
 use super::{Action, App, Status};
@@ -283,15 +283,12 @@ impl App {
         self.start_run(input, msg.text.clone())
     }
 
-    pub(crate) fn start_mailbox_run(
-        &mut self,
-        preamble: Vec<maki_providers::Message>,
-    ) -> Vec<Action> {
+    pub(crate) fn start_mailbox_run(&mut self, notices: Vec<Notice>) -> Vec<Action> {
         let mut input = self.build_agent_input(&QueuedMessage {
             text: String::new(),
             images: Vec::new(),
         });
-        input.preamble = preamble;
+        input.preamble = notices.into_iter().map(|notice| notice.message).collect();
         self.start_run(input, String::new())
     }
 

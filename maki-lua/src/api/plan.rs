@@ -6,6 +6,7 @@ use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use maki_agent::{AgentSeed, CancelToken};
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Function, Lua, RegistryKey, Result as LuaResult, Table, Value};
 
@@ -21,6 +22,7 @@ const LABEL_KEY: &str = "label";
 const DESC_KEY: &str = "desc";
 const ACTION_KEY: &str = "action";
 const HANDLER_KEY: &str = "handler";
+const SESSION_ENDED_ERR: &str = "plan form: session has ended";
 
 /// Rows past this are dropped, so a runaway layer costs its own overflow and
 /// not the built-in rows the user knows.
@@ -108,6 +110,7 @@ pub(crate) struct RowHandler {
 /// on a pick.
 struct SessionMenu {
     generation: u64,
+    owner: Option<CancelToken>,
     rows: Vec<Option<RowHandler>>,
 }
 
@@ -159,12 +162,22 @@ pub(crate) fn install_row_handlers(
     session: String,
     rows: Vec<Option<RowHandler>>,
 ) -> LuaResult<u64> {
+    let owner = session.parse().ok().and_then(AgentSeed::generation);
+    if owner.as_ref().is_some_and(CancelToken::is_cancelled) {
+        drop_keys(lua, rows.into_iter());
+        return Err(mlua::Error::runtime(SESSION_ENDED_ERR));
+    }
     let mut store = handlers_mut(lua)?;
     store.next_generation += 1;
     let generation = store.next_generation;
-    let replaced = store
-        .menus
-        .insert(session, SessionMenu { generation, rows });
+    let replaced = store.menus.insert(
+        session,
+        SessionMenu {
+            generation,
+            owner,
+            rows,
+        },
+    );
     drop(store);
     drop_keys(lua, replaced.into_iter().flat_map(|m| m.rows));
     Ok(generation)
@@ -206,13 +219,21 @@ pub(crate) fn clear_menu_generation(lua: &Lua, session: &str, generation: u64) {
     drop_keys(lua, removed.into_iter().flat_map(|m| m.rows));
 }
 
-/// Reap a session's menu, or its handlers outlive every tab that could run
-/// them.
-pub(crate) fn clear_session_rows(lua: &Lua, session: &str) {
+/// Reap the retiring generation's menu, leaving a replacement's handlers alone.
+pub(crate) fn clear_session_rows(lua: &Lua, session: &str, generation: Option<&CancelToken>) {
     let Some(mut store) = lua.app_data_mut::<PlanRowHandlers>() else {
         return;
     };
-    let removed = store.menus.remove(session);
+    let owned =
+        store
+            .menus
+            .get(session)
+            .is_some_and(|menu| match (menu.owner.as_ref(), generation) {
+                (Some(owner), Some(ending)) => owner.same_token(ending),
+                (None, None) => true,
+                _ => false,
+            });
+    let removed = owned.then(|| store.menus.remove(session)).flatten();
     drop(store);
     drop_keys(lua, removed.into_iter().flat_map(|m| m.rows));
 }
@@ -760,7 +781,7 @@ mod tests {
         lua.set_app_data(PlanRowHandlers::default());
         let generation = install(&lua, PLUGIN);
 
-        clear_session_rows(&lua, SESSION);
+        clear_session_rows(&lua, SESSION, None);
         assert_eq!(
             lua.app_data_ref::<PlanRowHandlers>()
                 .unwrap()

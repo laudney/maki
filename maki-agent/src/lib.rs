@@ -1,6 +1,8 @@
 //! Async agent loop with tools.
 
 pub mod agent;
+pub mod asks;
+pub use asks::{AskOwner, OwnedAsks};
 pub mod cancel;
 pub mod child_guard;
 pub use child_guard::ChildGuard;
@@ -30,7 +32,7 @@ pub use agent::{
     is_instruction_file, observation_line,
 };
 pub use cancel::{CancelMap, CancelToken, CancelTrigger};
-pub use live_session::{AgentSeed, MailboxError, SessionMailbox};
+pub use live_session::{AgentSeed, MailboxError, Notice, SessionMailbox};
 pub use maki_config::{AgentConfig, PermissionsConfig, SessionDefaults, ToolOutputLines};
 pub mod command;
 pub mod diff;
@@ -48,11 +50,11 @@ pub use maki_providers::AgentError;
 use maki_providers::Message;
 pub use maki_providers::{EMPTY_RESPONSE_MARKER, ImageMediaType, ImageSource, ThinkingConfig};
 pub use types::{
-    AgentEvent, BufferSnapshot, CallRecord, DoneReason, Envelope, EventSender, EventStreamGuard,
-    GrepFileEntry, GrepLine, GrepMatchGroup, InstructionBlock, NO_FILES_FOUND, RunLedger,
-    RunTotals, SessionEndReason, SessionEvents, SharedBuf, SnapshotLine, SnapshotSpan, SpanColor,
-    SpanStyle, SteerKind, SubagentInfo, TextOutput, ToolDoneEvent, ToolInput, ToolOutput,
-    ToolStartEvent, TurnCompleteEvent, UiWaker, event_stream,
+    AgentEvent, BufferSnapshot, CallRecord, DETACHED_RUN_ID, DoneReason, Envelope, EventSender,
+    EventStreamGuard, GrepFileEntry, GrepLine, GrepMatchGroup, InstructionBlock, NO_FILES_FOUND,
+    RunLedger, RunTotals, SessionEndReason, SessionEvents, SharedBuf, SnapshotLine, SnapshotSpan,
+    SpanColor, SpanStyle, SteerKind, SubagentInfo, SubagentVerdict, TextOutput, ToolDoneEvent,
+    ToolInput, ToolOutput, ToolStartEvent, TurnCompleteEvent, UiWaker, event_stream,
 };
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]

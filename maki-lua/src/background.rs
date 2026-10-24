@@ -1,15 +1,14 @@
 //! Subagent sessions a plugin opened by chat session id instead of a tool
 //! ctx. One lives until the first of: the Lua task that opened it ends (only
 //! under task scope), its chat session ends, its plugin unloads, Esc in its
-//! task's tab stops it, or it is closed.
-//! The agent loop never knows about them, so a turn ending or a rewind that
-//! respawns the loop leaves them running.
+//! task's tab stops it, or it is closed. Turn completion leaves it running;
+//! replacing the chat generation ends it.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use maki_agent::AgentSeed;
-use maki_agent::cancel::CancelTrigger;
+use maki_agent::cancel::{CancelToken, CancelTrigger};
 use maki_storage::id::MakiId;
 use mlua::Lua;
 
@@ -23,6 +22,7 @@ pub(crate) struct BackgroundSession {
     /// Shared with the session handle, so a `:prompt()` cut short can tell
     /// Esc in the task's tab from the end of its task.
     pub(crate) stopped: Arc<AtomicBool>,
+    pub(crate) owner_cancel: CancelToken,
     /// The subagent's cancel parent. Dropping the entry fires it.
     pub(crate) _cancel: CancelTrigger,
 }
@@ -59,7 +59,7 @@ impl BackgroundSessions {
     /// outlive its chat session.
     pub(crate) fn register(&self, entry: BackgroundSession) -> Result<(), String> {
         let mut entries = self.locked();
-        if AgentSeed::live(entry.session).is_none() {
+        if entry.owner_cancel.is_cancelled() || AgentSeed::live(entry.session).is_none() {
             return Err(not_live(entry.session));
         }
         entries.push(entry);
@@ -89,6 +89,10 @@ impl BackgroundSessions {
 
     pub(crate) fn end_session(&self, session: MakiId) {
         self.retire(|e| e.session == session);
+    }
+
+    pub(crate) fn retire_cancelled_owners(&self, session: MakiId) {
+        self.retire(|e| e.session == session && e.owner_cancel.is_cancelled());
     }
 
     pub(crate) fn end_task(&self, task: u64) {
@@ -150,6 +154,7 @@ mod tests {
             session,
             task,
             stopped: Arc::default(),
+            owner_cancel: CancelToken::none(),
             _cancel: cancel,
         };
         (entry, token)
@@ -211,5 +216,40 @@ mod tests {
         assert_eq!(registry.register(late), Err(not_live(session)));
         assert!(token.is_cancelled());
         assert_eq!(registry.list(session).len(), 0);
+    }
+
+    #[test]
+    fn delayed_cleanup_keeps_the_replacement_generation() {
+        let session = MakiId::generate();
+        let _live = live(session);
+        let registry = BackgroundSessions::default();
+        let (owner, owner_cancel) = CancelToken::new();
+        let (mut old, old_child) = entry(session, None);
+        old.owner_cancel = owner_cancel;
+        registry.register(old).unwrap();
+        owner.cancel();
+        let (new, new_child) = entry(session, None);
+        registry.register(new).unwrap();
+
+        registry.retire_cancelled_owners(session);
+
+        assert!(old_child.is_cancelled());
+        assert!(!new_child.is_cancelled());
+        assert_eq!(registry.list(session).len(), 1);
+    }
+
+    #[test]
+    fn a_retired_generation_cannot_register_against_a_live_replacement() {
+        let session = MakiId::generate();
+        let _live = live(session);
+        let registry = BackgroundSessions::default();
+        let (owner, owner_cancel) = CancelToken::new();
+        let (mut late, child) = entry(session, None);
+        late.owner_cancel = owner_cancel;
+        owner.cancel();
+
+        assert_eq!(registry.register(late), Err(not_live(session)));
+        assert!(child.is_cancelled());
+        assert!(registry.list(session).is_empty());
     }
 }

@@ -1,6 +1,7 @@
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
@@ -15,7 +16,7 @@ use smol::lock::Mutex;
 use tracing::error;
 
 use crate::agent::{self, RunContext, RunContextBuilder};
-use crate::cancel::{CancelMap, CancelToken};
+use crate::cancel::{CancelMap, CancelToken, CancelTrigger};
 use crate::permissions::{PermissionManager, PluginRuleStore};
 use crate::prompt::ResolvedPrompts;
 use crate::session::{Resumed, SessionTrack};
@@ -29,6 +30,21 @@ use crate::{
 };
 
 const SESSION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+struct SessionCleanup {
+    _owner: CancelTrigger,
+    children: Arc<CancelMap<String>>,
+    runs: Option<Arc<CancelMap<u64>>>,
+}
+
+impl Drop for SessionCleanup {
+    fn drop(&mut self) {
+        self.children.cancel_all();
+        if let Some(runs) = &self.runs {
+            runs.cancel_all();
+        }
+    }
+}
 
 /// Resolve a provider, or report the failure on the event stream and let the
 /// caller give up. Every site that reaches a provider comes through here, so a
@@ -79,6 +95,8 @@ pub struct HeadlessHandle {
     pub tool_names: Vec<String>,
     pub session_id: SessionRef,
     pub cwd: String,
+    /// Keeps generation identity available after the run exits, through cleanup.
+    pub mailbox: SessionMailbox,
     pub task: smol::Task<()>,
 }
 
@@ -184,15 +202,25 @@ pub fn spawn(params: HeadlessParams) -> (HeadlessHandle, SessionEvents) {
     let tool_names = advertised_tool_names(initial.tools.definitions(), mcp.as_ref());
 
     let (guard, events) = event_stream();
-    let event_tx = guard.sender(0);
+    let (owner, owner_cancel) = CancelToken::new();
+    let event_tx = guard.sender(0).with_owner_cancel(owner_cancel.clone());
+    let subagent_cancels = Arc::new(CancelMap::new());
+    let cleanup = SessionCleanup {
+        _owner: owner,
+        children: Arc::clone(&subagent_cancels),
+        runs: None,
+    };
 
     let session_ref = params.resumed.id.clone();
     let mailbox = SessionMailbox::register(session_ref.id());
+    mailbox.publish_generation(owner_cancel);
+    let handle_mailbox = mailbox.clone();
     let run_session_ref = session_ref.clone();
     let defaults = params.defaults;
     let working_dir_path = params.initial_wd.clone();
     let task_working_dir = working_dir.clone();
     let task = smol::spawn(run_session(guard, params.mcp_handle.clone(), async move {
+        let _cleanup = cleanup;
         let mut model = params.model;
         let Some(provider) = connect(&mut model, params.timeouts, &event_tx).await else {
             return;
@@ -234,7 +262,7 @@ pub fn spawn(params: HeadlessParams) -> (HeadlessHandle, SessionEvents) {
                 timeouts: params.timeouts,
                 file_access: FileAccess::fresh(),
                 prompt_slots: Arc::clone(&prompt_slots),
-                subagent_cancels: Arc::new(CancelMap::new()),
+                subagent_cancels: Arc::clone(&subagent_cancels),
                 ledger: turn.ledger(),
                 registry: Arc::clone(ToolRegistry::global_arc()),
                 audience: ToolAudience::MAIN,
@@ -258,6 +286,7 @@ pub fn spawn(params: HeadlessParams) -> (HeadlessHandle, SessionEvents) {
             tool_names,
             session_id: session_ref,
             cwd: working_dir,
+            mailbox: handle_mailbox,
             task,
         },
         events,
@@ -294,13 +323,75 @@ pub struct InteractiveParams {
 
 pub struct InteractiveHandle {
     pub tool_names: Vec<String>,
-    pub input_tx: flume::Sender<AgentInput>,
+    pub input_tx: flume::Sender<(u64, AgentInput, CancelToken)>,
+    pub run_ids: Arc<AtomicU64>,
+    pub run_cancels: Arc<CancelMap<u64>>,
+    /// The last ticket whose run ended. Prompts run in ticket order, so the
+    /// next one is the run in flight or the one about to start.
+    pub finished_run: Arc<AtomicU64>,
+    pub subagent_cancels: Arc<CancelMap<String>>,
     pub answer_tx: flume::Sender<String>,
-    pub cancel_tx: flume::Sender<()>,
     pub model_tx: flume::Sender<Model>,
     pub session_id: SessionRef,
     pub permissions: Arc<PermissionManager>,
+    /// Keeps generation identity available after the run exits, through cleanup.
+    pub mailbox: SessionMailbox,
     pub task: smol::Task<()>,
+}
+
+impl InteractiveHandle {
+    /// Assigns the prompt's identity and cancellation before it can be run.
+    pub fn submit(&self, input: AgentInput) -> Result<u64, flume::SendError<()>> {
+        let ticket = self.run_ids.fetch_add(1, Ordering::Relaxed) + 1;
+        let (trigger, cancel) = CancelToken::new();
+        self.run_cancels.insert(ticket, trigger);
+        if self.input_tx.send((ticket, input, cancel)).is_err() {
+            self.run_cancels.remove(&ticket);
+            return Err(flume::SendError(()));
+        }
+        Ok(ticket)
+    }
+
+    pub fn cancel_run(&self, ticket: u64) {
+        self.run_cancels.cancel(ticket);
+    }
+
+    /// Cancels the prompt in flight, or the next one when none has started
+    /// yet, so an interrupt sent right after a prompt is not lost. A prompt
+    /// queued behind it keeps running.
+    pub fn cancel_active(&self) {
+        let ticket = self.finished_run.load(Ordering::Acquire) + 1;
+        if ticket <= self.run_ids.load(Ordering::Acquire) {
+            self.run_cancels.cancel(ticket);
+        }
+    }
+}
+
+/// Records the prompt's run as ended when it drops, on every path out of the
+/// loop body.
+struct ActiveRun<'a> {
+    ticket: u64,
+    finished: &'a AtomicU64,
+    cancels: &'a CancelMap<u64>,
+}
+
+impl Drop for ActiveRun<'_> {
+    fn drop(&mut self) {
+        self.cancels.remove(&self.ticket);
+        self.finished.fetch_max(self.ticket, Ordering::AcqRel);
+    }
+}
+
+fn start_run<'a>(
+    ticket: u64,
+    run_cancels: &'a CancelMap<u64>,
+    finished_run: &'a AtomicU64,
+) -> ActiveRun<'a> {
+    ActiveRun {
+        ticket,
+        finished: finished_run,
+        cancels: run_cancels,
+    }
 }
 
 pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, SessionEvents) {
@@ -328,14 +419,28 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
     let tool_names = advertised_tool_names(initial.tools.definitions(), mcp.as_ref());
 
     let (guard, events) = event_stream();
-    let base_tx = guard.sender(0);
-    let (input_tx, input_rx) = flume::unbounded::<AgentInput>();
+    let (owner, owner_cancel) = CancelToken::new();
+    let base_tx = guard.sender(0).with_owner_cancel(owner_cancel.clone());
+    let (input_tx, input_rx) = flume::unbounded::<(u64, AgentInput, CancelToken)>();
+    let run_ids = Arc::new(AtomicU64::new(0));
+    let run_cancels = Arc::new(CancelMap::new());
+    let finished_run = Arc::new(AtomicU64::new(0));
+    let subagent_cancels = Arc::new(CancelMap::new());
+    let task_run_cancels = Arc::clone(&run_cancels);
+    let task_finished_run = Arc::clone(&finished_run);
+    let task_subagent_cancels = Arc::clone(&subagent_cancels);
+    let cleanup = SessionCleanup {
+        _owner: owner,
+        children: Arc::clone(&subagent_cancels),
+        runs: Some(Arc::clone(&run_cancels)),
+    };
     let (answer_tx, answer_rx) = flume::unbounded::<String>();
-    let (cancel_tx, cancel_rx) = flume::bounded::<()>(1);
     let (model_tx, model_rx) = flume::unbounded::<Model>();
 
     let session_ref = params.resumed.id.clone();
     let mailbox = SessionMailbox::register(session_ref.id());
+    mailbox.publish_generation(owner_cancel);
+    let handle_mailbox = mailbox.clone();
 
     let working_dir = params.initial_wd.to_string_lossy().into_owned();
     let mut permissions_config = params.permissions_config;
@@ -353,24 +458,15 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
     let session_ref_clone = session_ref.clone();
     let task_permissions = Arc::clone(&permissions);
     let task = smol::spawn(run_session(guard, params.mcp_handle.clone(), async move {
+        let _cleanup = cleanup;
         let mut model = params.model;
         let Some(mut provider) = connect(&mut model, params.timeouts, &base_tx).await else {
             return;
         };
         let mut track =
             SessionTrack::open(params.resumed, params.claim, params.storage, &working_dir);
-        let mut run_id: u64 = 0;
-
-        while let Ok(input) = input_rx.recv_async().await {
-            let (trigger, cancel) = CancelToken::new();
-            let cancel_task = smol::spawn({
-                let cancel_rx = cancel_rx.clone();
-                async move {
-                    if cancel_rx.recv_async().await.is_ok() {
-                        trigger.cancel();
-                    }
-                }
-            });
+        while let Ok((run_id, input, cancel)) = input_rx.recv_async().await {
+            let active = start_run(run_id, &task_run_cancels, &task_finished_run);
 
             // MCP connects in the background, so a prompt that beats it waits
             // here instead of shipping a turn without the MCP tools. The wait
@@ -390,7 +486,6 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
             {
                 let Some(switched) = connect(&mut new_model, params.timeouts, &error_tx).await
                 else {
-                    run_id += 1;
                     continue;
                 };
                 provider = switched;
@@ -416,7 +511,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
                     timeouts: params.timeouts,
                     file_access: Arc::clone(&file_access),
                     prompt_slots: Arc::clone(&params.prompt_slots),
-                    subagent_cancels: Arc::new(CancelMap::new()),
+                    subagent_cancels: Arc::clone(&task_subagent_cancels),
                     ledger: turn.ledger(),
                     registry: Arc::clone(ToolRegistry::global_arc()),
                     audience: ToolAudience::MAIN,
@@ -432,14 +527,17 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
 
             let result = agent.run(input).await;
             drop(agent);
-            cancel_task.cancel().await;
+            // The client already holds the result, so the run counts as ended
+            // before its turn is saved: an interrupt sent on seeing the result
+            // reaches the next prompt.
+            drop(active);
 
             if let Err(ref e) = result {
                 error!(error = %e, "agent error");
                 let _ = error_tx.send(AgentEvent::error(e));
             }
 
-            run_id += 1;
+            task_subagent_cancels.end_foreground();
         }
     }));
 
@@ -447,11 +545,15 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
         InteractiveHandle {
             tool_names,
             input_tx,
+            run_ids,
+            run_cancels,
+            finished_run,
+            subagent_cancels,
             answer_tx,
-            cancel_tx,
             model_tx,
             session_id: session_ref,
             permissions,
+            mailbox: handle_mailbox,
             task,
         },
         events,
@@ -513,6 +615,8 @@ mod tests {
     const BODY_EVENT: &str = "the body's event must be delivered before the close";
     const STILL_WORKING: &str = "await_shutdown must not return while the task still works";
     const TASK_DROPPED: &str = "await_shutdown dropped a task that had work left";
+    const ACTIVE_PROMPT: &str = "active";
+    const QUEUED_PROMPT: &str = "queued";
 
     /// A host-written prompt never had maki's facts in it. If the frame
     /// claimed it did, a later edit would be announced to a model that never
@@ -677,5 +781,85 @@ mod tests {
             shutdown.await;
         });
         assert!(finished.load(Ordering::SeqCst), "{TASK_DROPPED}");
+    }
+
+    fn input(text: &str) -> AgentInput {
+        AgentInput::from_defaults(
+            text.to_owned(),
+            AgentMode::Build,
+            Vec::new(),
+            SessionDefaults::default(),
+            InputSource::Headless,
+        )
+    }
+
+    fn interactive_handle() -> (
+        InteractiveHandle,
+        flume::Receiver<(u64, AgentInput, CancelToken)>,
+    ) {
+        let (input_tx, input_rx) = flume::unbounded();
+        let ctx = crate::tools::test_support::stub_ctx(&AgentMode::Build);
+        let session_id = Resumed::fresh().id;
+        let handle = InteractiveHandle {
+            tool_names: Vec::new(),
+            input_tx,
+            run_ids: Arc::new(AtomicU64::new(0)),
+            run_cancels: Arc::new(CancelMap::new()),
+            finished_run: Arc::new(AtomicU64::new(0)),
+            subagent_cancels: Arc::new(CancelMap::new()),
+            answer_tx: flume::unbounded().0,
+            model_tx: flume::unbounded().0,
+            mailbox: SessionMailbox::register(session_id.id()),
+            session_id,
+            permissions: ctx.permissions,
+            task: smol::spawn(std::future::pending()),
+        };
+        (handle, input_rx)
+    }
+
+    #[test_case(false; "before_it_starts")]
+    #[test_case(true; "while_it_runs")]
+    fn native_cancel_reaches_the_oldest_unfinished_prompt_only(started: bool) {
+        let (handle, input_rx) = interactive_handle();
+        let first = handle.submit(input(ACTIVE_PROMPT)).unwrap();
+        assert_ne!(first, 0, "startup events have no prompt ticket");
+        handle.submit(input(QUEUED_PROMPT)).unwrap();
+        let (ticket, prompt, first_cancel) = input_rx.try_recv().unwrap();
+        assert_eq!((ticket, prompt.message.as_str()), (first, ACTIVE_PROMPT));
+        let (_, prompt, queued_cancel) = input_rx.try_recv().unwrap();
+        assert_eq!(prompt.message, QUEUED_PROMPT);
+        let run = started.then(|| start_run(first, &handle.run_cancels, &handle.finished_run));
+
+        handle.cancel_active();
+        assert!(first_cancel.is_cancelled());
+        assert!(!queued_cancel.is_cancelled());
+
+        drop(run.unwrap_or_else(|| start_run(first, &handle.run_cancels, &handle.finished_run)));
+        handle.cancel_active();
+        assert!(queued_cancel.is_cancelled());
+    }
+
+    #[test]
+    fn session_drop_cancels_background_children_and_queued_runs() {
+        let (owner, owner_cancel) = CancelToken::new();
+        let children = Arc::new(CancelMap::new());
+        let runs = Arc::new(CancelMap::new());
+        let cleanup = SessionCleanup {
+            _owner: owner,
+            children: Arc::clone(&children),
+            runs: Some(Arc::clone(&runs)),
+        };
+        let (child_trigger, child_cancel) = CancelToken::new();
+        let (run_trigger, run_cancel) = CancelToken::new();
+        children.insert_detached("child".to_owned(), child_trigger);
+        runs.insert(RUN_ID, run_trigger);
+        children.end_foreground();
+        assert!(!child_cancel.is_cancelled());
+
+        drop(cleanup);
+
+        assert!(owner_cancel.is_cancelled());
+        assert!(child_cancel.is_cancelled());
+        assert!(run_cancel.is_cancelled());
     }
 }

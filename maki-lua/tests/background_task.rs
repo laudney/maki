@@ -4,7 +4,7 @@
 use std::sync::Arc;
 use std::thread;
 
-use maki_agent::tools::test_support::stub_seed;
+use maki_agent::tools::test_support::stub_seed_owned_by;
 use maki_agent::tools::{ToolContext, ToolExecResult, ToolRegistry};
 use maki_agent::{AgentSeed, CancelToken, ModelSlot, SessionMailbox, ToolOutput};
 use maki_lua::agent_autocmd::HostEvent;
@@ -154,7 +154,15 @@ fn seed(
     mailbox: &SessionMailbox,
     session: MakiId,
 ) -> (Arc<AgentSeed>, flume::Receiver<()>, flume::Sender<()>) {
-    let seed = mailbox.publish_seed(stub_seed(session));
+    owned_seed(mailbox, session, CancelToken::none())
+}
+
+fn owned_seed(
+    mailbox: &SessionMailbox,
+    session: MakiId,
+    generation: CancelToken,
+) -> (Arc<AgentSeed>, flume::Receiver<()>, flume::Sender<()>) {
+    let seed = mailbox.publish_seed(stub_seed_owned_by(session, generation));
     let (started, started_rx) = flume::bounded(1);
     let (release, release_rx) = flume::bounded(1);
     seed.model_slot.store(Arc::new(ModelSlot {
@@ -226,7 +234,7 @@ fn next_notice(
     let woke = !woken.is_empty();
     let mut notices = if woke { woken } else { mailbox.drain() };
     assert_eq!(notices.len(), 1);
-    let notice = notices.remove(0);
+    let notice = notices.remove(0).message;
     let body = notice.first_text_content().unwrap().to_owned();
     (body, notice.display_text, woke)
 }
@@ -339,7 +347,8 @@ fn teardown_stops_background_work_without_notifying_a_gone_chat(reload: bool) {
     let (reg, host) = host();
     let session = MakiId::generate();
     let mailbox = SessionMailbox::register(session);
-    let (seed, started, _release) = seed(&mailbox, session);
+    let (generation, owner) = CancelToken::new();
+    let (seed, started, _release) = owned_seed(&mailbox, session, owner);
     let ctx = seed.tool_context(CancelToken::none());
     start(&reg, &ctx, FIRST);
     started.recv().unwrap();
@@ -348,6 +357,8 @@ fn teardown_stops_background_work_without_notifying_a_gone_chat(reload: bool) {
         host.unload(PLUGIN).unwrap();
         load(&host);
     } else {
+        // A frontend ends the chat generation before its sessions.
+        generation.cancel();
         host.event_handle()
             .end_sessions_blocking([session], SessionEndReason::Shutdown);
     }

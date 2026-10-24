@@ -1051,11 +1051,14 @@ impl<'t> EventLoop<'t> {
             UiAction::PluginTaskEvent {
                 session,
                 plugin,
+                task_id,
                 envelope,
             } => {
                 // A straggler after `/new` finds no tab and is dropped.
                 if let Some(idx) = self.sessions.iter().position(|rt| rt.id() == session) {
-                    let actions = self.sessions[idx].app.deliver(*envelope, Some(plugin));
+                    let actions = self.sessions[idx]
+                        .app
+                        .deliver(*envelope, Some((plugin, &task_id)));
                     self.dispatch(idx, actions);
                 }
             }
@@ -1229,14 +1232,14 @@ impl<'t> EventLoop<'t> {
                 if !runtime.quiescent() {
                     return None;
                 }
-                let preamble = runtime.handles.claim_mailbox_wake();
-                (!preamble.is_empty()).then_some((index, preamble))
+                let notices = runtime.handles.claim_mailbox_wake();
+                (!notices.is_empty()).then_some((index, notices))
             })
             .collect();
 
         let dirty = Dirty::from(!ready.is_empty());
-        for (index, preamble) in ready {
-            let actions = self.sessions[index].app.start_mailbox_run(preamble);
+        for (index, notices) in ready {
+            let actions = self.sessions[index].app.start_mailbox_run(notices);
             self.dispatch(index, actions);
         }
         dirty
@@ -1620,7 +1623,7 @@ impl<'t> EventLoop<'t> {
                 .app
                 .apply_loaded_session(open, &slot.model);
             self.apply_model(idx, slot);
-            self.respawn_agent(idx, history);
+            self.respawn_agent(idx, history, SessionEndReason::Load);
         } else {
             self.focused = self.push_runtime(self.ctx.spawn_runtime(open, slot));
         }
@@ -1781,7 +1784,7 @@ impl<'t> EventLoop<'t> {
         }
     }
 
-    fn respawn_agent(&mut self, idx: usize, history: Vec<Message>) {
+    fn respawn_agent(&mut self, idx: usize, history: Vec<Message>, reason: SessionEndReason) {
         let rt = &mut self.sessions[idx];
         rt.reset_run_notifications();
         let lua_handle = rt.app.lua_event_handle.clone();
@@ -1789,6 +1792,7 @@ impl<'t> EventLoop<'t> {
         let slot = Arc::clone(&rt.slot);
         rt.handles.respawn(
             history,
+            reason,
             &slot,
             self.ctx.config.clone(),
             self.ctx.ui_config.tool_output_lines,
@@ -1839,7 +1843,7 @@ impl<'t> EventLoop<'t> {
                 self.ctx.lua_event_handle.cancel_plugin_session(&id);
                 self.emit_task_stopped(idx, &id);
             }
-            Action::RestartAgent(history) => self.respawn_agent(idx, history),
+            Action::RestartAgent(history, reason) => self.respawn_agent(idx, history, reason),
             Action::OpenFork(open) => self.open_fork(idx, *open),
             Action::ChangeModel(spec) => {
                 if let Err(e) = self.change_model(&spec) {

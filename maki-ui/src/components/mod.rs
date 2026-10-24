@@ -33,6 +33,8 @@ pub(crate) mod usage_modal;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use maki_agent::SessionEndReason;
+
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use maki_agent::AgentInput;
 use maki_agent::{BufferSnapshot, ToolInput, ToolOutput};
@@ -220,7 +222,7 @@ pub enum Action {
     },
     /// The history under this runtime changed (reset, load, rewind), so the
     /// agent has to be respawned on it.
-    RestartAgent(Vec<Message>),
+    RestartAgent(Vec<Message>, SessionEndReason),
     /// A copy of this session, to run beside it and take the focus.
     OpenFork(Box<OpenSession>),
     ChangeModel(String),
@@ -405,6 +407,9 @@ pub enum DisplayRole {
     Done,
     /// One dim line about what the host told the model on the user's behalf.
     Notice,
+    /// A note the host draws for the reader, such as why a run was woken.
+    /// Never part of the transcript the model sees.
+    Note,
 }
 
 impl DisplayRole {

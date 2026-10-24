@@ -11,6 +11,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
+use maki_agent::{AgentSeed, CancelToken};
 use maki_config::ShellPreference;
 use maki_lua_macro::{lua_fn, lua_table};
 use maki_providers::{shell_command, strip_provider_keys};
@@ -42,6 +43,7 @@ const JOB_WAIT_TIMEOUT_ERR: &str = "jobwait: timed out";
 const BLANK_NAME_ERR: &str = "jobstart: name must be non-blank";
 const EMPTY_ARGV_ERR: &str = "jobstart: argv table must not be empty";
 const CMD_TYPE_ERR: &str = "jobstart: cmd must be a shell string or an argv table";
+const SESSION_ENDED_ERR: &str = "jobstart: session has ended";
 
 /// `agent.shell`, set once from config at startup. Jobs get built far away
 /// from any config, on whatever Lua thread runs the plugin, so they read it here.
@@ -161,6 +163,7 @@ impl JobSpec {
 
 struct JobMeta {
     owner: JobOwner,
+    generation: Option<CancelToken>,
     command: String,
     /// A reloaded plugin looks its job up by this instead of matching on the
     /// command string. See [`JobStore::find_named`].
@@ -293,6 +296,13 @@ impl JobStore {
             on_stderr,
             on_exit,
         } = spec;
+        let generation = match &owner {
+            JobOwner::Session { session, .. } => AgentSeed::generation(*session),
+            _ => None,
+        };
+        if generation.as_ref().is_some_and(CancelToken::is_cancelled) {
+            return Err(SESSION_ENDED_ERR.to_owned());
+        }
         let mut command = cmd.build();
         strip_provider_keys(&mut command)
             .stdout(stdout.stdio()?)
@@ -382,6 +392,7 @@ impl JobStore {
             id,
             JobMeta {
                 owner,
+                generation,
                 command: cmd.display(),
                 name,
                 pid,
@@ -544,11 +555,18 @@ impl JobStore {
         }
     }
 
-    pub fn kill_session(&mut self, lua: &Lua, session: MakiId) {
+    pub fn kill_session(&mut self, lua: &Lua, session: MakiId, generation: Option<&CancelToken>) {
         let ids: Vec<u32> = self
             .jobs
             .iter()
-            .filter(|(_, job)| job.session() == Some(session))
+            .filter(|(_, job)| {
+                job.session() == Some(session)
+                    && match (job.generation.as_ref(), generation) {
+                        (Some(owner), Some(ending)) => owner.same_token(ending),
+                        (None, None) => true,
+                        _ => false,
+                    }
+            })
             .map(|(&id, _)| id)
             .collect();
         for id in ids {
@@ -1480,6 +1498,7 @@ mod tests {
     ) -> JobMeta {
         JobMeta {
             owner,
+            generation: None,
             command: String::new(),
             name: None,
             pid: 0,
@@ -1948,7 +1967,7 @@ mod tests {
             snap.stderr_lines
         );
 
-        store.kill_session(&lua, session);
+        store.kill_session(&lua, session, None);
         assert!(store.snapshot(id, None, TEST_PLUGIN).is_none());
     }
 
@@ -1965,10 +1984,10 @@ mod tests {
         let second = store
             .start(JobSpec::new(session_owner(b), "sleep 30"))
             .unwrap();
-        store.kill_session(&lua, a);
+        store.kill_session(&lua, a, None);
         assert!(store.snapshot(first, None, TEST_PLUGIN).is_none());
         assert!(store.snapshot(second, None, TEST_PLUGIN).is_some());
-        store.kill_session(&lua, b);
+        store.kill_session(&lua, b, None);
     }
 
     #[test]
@@ -2350,6 +2369,6 @@ mod tests {
                 .any(|listed| listed.id == id && listed.exit_code == Some(0)),
             "exited session job must stay listed"
         );
-        store.kill_session(&lua, session);
+        store.kill_session(&lua, session, None);
     }
 }

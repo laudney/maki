@@ -1,15 +1,16 @@
 use std::collections::HashMap;
 use std::fmt::Display;
 use std::fs;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use include_dir::{Dir, File, include_dir};
-use maki_agent::SessionEndReason;
 use maki_agent::permissions::{PluginRuleStore, carries_builtin_defaults};
 use maki_agent::tools::{ToolRegistry, ToolSource};
+use maki_agent::{AgentSeed, SessionEndReason};
 use maki_config::{GatedFile, PluginFileConfig, PluginsConfig, ProjectConfig, RawConfig};
 use maki_providers::plugin::DeclAuthority;
 
@@ -1191,7 +1192,10 @@ impl EventHandle {
     }
 
     pub fn request_restore(&self, item: RestoreItem, event_tx: maki_agent::EventSender) {
-        let _ = self.tx.send(Request::RestoreToolAsync { item, event_tx });
+        let _ = self.tx.send(Request::RestoreToolAsync {
+            item: Box::new(item),
+            event_tx,
+        });
     }
 
     /// `row` is the 1-based line in the tool's live buffer, 0 for clicks
@@ -1272,18 +1276,48 @@ impl EventHandle {
             .try_send(Request::InstallSessionSnapshot { provider });
     }
 
-    /// Queue the kill of session-owned jobs and the `SessionEnd` dispatch,
-    /// then return. Call from every session-end path so a Lua monitor can
-    /// stay a plugin. Process exit wants [`Self::end_sessions_blocking`].
+    /// Stop current native sessions, then queue `SessionEnd` and the reap of
+    /// that generation's jobs. Call before publishing the next session
+    /// generation. Process exit wants [`Self::end_sessions_blocking`].
     ///
     /// Nothing waits here, so handlers get no deadline and the UI is still
     /// there to answer them.
     pub fn end_session(&self, session: MakiId, reason: SessionEndReason) {
+        let generation = AgentSeed::generation(session);
+        self.background.end_session(session);
         let _ = self.tx.try_send(Request::EndSession(EndSession {
             session,
+            generation,
             reason,
             wait: None,
         }));
+    }
+
+    /// [`Self::end_session`] for a session a new generation replaces under
+    /// the same id. The returned wait ends once the handlers ran or the
+    /// deadline passed, so the next generation starts no work that a late
+    /// handler for the old one would end. Nothing blocks here, so the UI is
+    /// still there to answer handlers.
+    pub fn end_session_wait(
+        &self,
+        session: MakiId,
+        reason: SessionEndReason,
+    ) -> impl Future<Output = ()> + Send + 'static {
+        let deadline = Instant::now() + SHUTDOWN_TIMEOUT;
+        let reply = self.send_end_session(session, reason, deadline);
+        async move {
+            if let Some(reply) = reply {
+                futures_lite::future::or(
+                    async {
+                        let _ = reply.recv_async().await;
+                    },
+                    async {
+                        smol::Timer::at(deadline).await;
+                    },
+                )
+                .await;
+            }
+        }
     }
 
     /// [`Self::end_session`] for process exit: block until the handlers ran
@@ -1315,12 +1349,24 @@ impl EventHandle {
         }
     }
 
-    /// [`Self::end_sessions_blocking`] parked on a spare thread. ACP calls
+    /// Queue teardown before parking its wait on a spare thread. ACP calls
     /// this from its executor, where blocking would freeze stdin for the
     /// whole grace period.
     pub async fn end_session_async(&self, session: MakiId, reason: SessionEndReason) {
-        let handle = self.clone();
-        smol::unblock(move || handle.end_sessions_blocking([session], reason)).await;
+        let deadline = Instant::now() + SHUTDOWN_TIMEOUT;
+        let Some(reply) = self.send_end_session(session, reason, deadline) else {
+            return;
+        };
+        smol::unblock(move || {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if reply.recv_timeout(left).is_err() {
+                tracing::warn!(
+                    session = %session,
+                    "SessionEnd did not finish within timeout, continuing teardown"
+                );
+            }
+        })
+        .await;
     }
 
     fn send_end_session(
@@ -1329,10 +1375,13 @@ impl EventHandle {
         reason: SessionEndReason,
         deadline: Instant,
     ) -> Option<flume::Receiver<()>> {
+        let generation = AgentSeed::generation(session);
+        self.background.end_session(session);
         let (reply_tx, reply_rx) = flume::bounded(1);
         self.tx
             .send(Request::EndSession(EndSession {
                 session,
+                generation,
                 reason,
                 wait: Some((deadline, reply_tx)),
             }))

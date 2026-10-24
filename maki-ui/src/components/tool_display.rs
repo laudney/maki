@@ -114,6 +114,18 @@ pub fn done_style() -> RoleStyle {
     }
 }
 
+/// A host note, dim so it reads as chrome rather than something a participant
+/// said. No prefix: its text is the whole message.
+pub fn note_style() -> RoleStyle {
+    RoleStyle {
+        prefix: "",
+        text_style: theme::current().status_dim,
+        prefix_style: theme::current().status_dim,
+        use_markdown: false,
+        max_line_bytes: None,
+    }
+}
+
 pub struct ToolLines {
     pub lines: Vec<Line<'static>>,
     pub highlight: Option<HighlightRequest>,

@@ -2,12 +2,13 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError, Weak};
 
 use arc_swap::ArcSwap;
+use event_listener::{Event, EventListener};
 use maki_config::ModelPolicy;
 use maki_providers::{Message, RequestOptions, Timeouts};
 use maki_storage::id::{MakiId, SessionRef};
 use thiserror::Error;
 
-use crate::cancel::CancelToken;
+use crate::cancel::{CancelMap, CancelToken};
 use crate::mcp::McpSession;
 use crate::permissions::PermissionManager;
 use crate::tools::{FileAccess, ToolContext, ToolRegistry, interpreter_ctx};
@@ -30,18 +31,54 @@ static LIVE_SESSIONS: LazyLock<Mutex<HashMap<MakiId, Weak<LiveSession>>>> =
 #[derive(Default)]
 struct LiveSession {
     mailbox: Mutex<Mailbox>,
-    seed: Mutex<Weak<AgentSeed>>,
+    seed: Mutex<SeedRegistration>,
+}
+
+#[derive(Default)]
+struct SeedRegistration {
+    seed: Weak<AgentSeed>,
+    generation: Option<CancelToken>,
+}
+
+/// One queued report for a live session: the observation the model will read
+/// at the next run. Its `display_text`, if any, is the transcript line shown
+/// once the loop accepts it.
+#[derive(Clone, Debug)]
+pub struct Notice {
+    pub message: Message,
+    pub owner_cancel: Option<CancelToken>,
+}
+
+impl Notice {
+    fn is_live(&self) -> bool {
+        self.owner_cancel
+            .as_ref()
+            .is_none_or(|owner| !owner.is_cancelled())
+    }
+
+    pub fn text(text: String) -> Self {
+        Self {
+            message: Message::observation(text),
+            owner_cancel: None,
+        }
+    }
 }
 
 #[derive(Default)]
 struct Mailbox {
-    pending: VecDeque<Message>,
-    wake: bool,
+    pending: VecDeque<(Notice, bool)>,
+    /// Pinged by a wake-flagged notify, so a waiter acts on it without
+    /// polling.
+    signal: Event,
 }
 
 #[derive(Debug, Error)]
-#[error("session not live: {0}")]
-pub struct MailboxError(MakiId);
+pub enum MailboxError {
+    #[error("session not live: {0}")]
+    NotLive(MakiId),
+    #[error("notification owner ended")]
+    OwnerEnded,
+}
 
 #[derive(Clone)]
 pub struct SessionMailbox {
@@ -53,6 +90,8 @@ pub struct SessionMailbox {
 /// to clone, so it builds one from this.
 pub struct AgentSeed {
     pub session_id: SessionRef,
+    owner_cancel: CancelToken,
+    subagent_cancels: Arc<CancelMap<String>>,
     pub model_slot: Arc<ArcSwap<ModelSlot>>,
     pub config: AgentConfig,
     pub tool_output_lines: ToolOutputLines,
@@ -81,6 +120,10 @@ fn notice_label(text: &str) -> Option<String> {
 }
 
 impl SessionMailbox {
+    pub fn session_id(&self) -> MakiId {
+        self.session_id
+    }
+
     pub fn register(session_id: MakiId) -> Self {
         let mut sessions = lock(&LIVE_SESSIONS);
         if let Some(live) = sessions.get(&session_id).and_then(Weak::upgrade) {
@@ -92,46 +135,57 @@ impl SessionMailbox {
         Self { session_id, live }
     }
 
-    /// `display` becomes the observation's transcript line, shown and saved
-    /// once an agent run accepts it. The model only ever reads `text`.
-    pub fn notify(
-        session_id: MakiId,
-        text: String,
-        display: Option<&str>,
-        wake: bool,
-    ) -> Result<(), MailboxError> {
+    /// The notice's `display_text` becomes its transcript line, shown and
+    /// saved once an agent run accepts it. The model only ever reads its body.
+    pub fn notify(session_id: MakiId, mut notice: Notice, wake: bool) -> Result<(), MailboxError> {
+        if !notice.is_live() {
+            return Err(MailboxError::OwnerEnded);
+        }
         let live = {
             let mut sessions = lock(&LIVE_SESSIONS);
             let Some(live) = sessions.get(&session_id).and_then(Weak::upgrade) else {
                 sessions.remove(&session_id);
-                return Err(MailboxError(session_id));
+                return Err(MailboxError::NotLive(session_id));
             };
             live
         };
-        let mut message = Message::observation(text);
-        message.display_text = display.and_then(notice_label);
-        let mut mailbox = lock(&live.mailbox);
-        if mailbox.pending.len() == MAILBOX_CAPACITY {
-            mailbox.pending.pop_front();
+        let label = notice.message.display_text.take();
+        notice.message.display_text = label.as_deref().and_then(notice_label);
+        let mut state = lock(&live.mailbox);
+        if state.pending.len() == MAILBOX_CAPACITY {
+            state.pending.pop_front();
         }
-        mailbox.pending.push_back(message);
-        mailbox.wake |= wake;
+        state.pending.push_back((notice, wake));
+        if wake {
+            state.signal.notify(usize::MAX);
+        }
         Ok(())
     }
 
-    pub fn drain(&self) -> Vec<Message> {
-        let mut mailbox = lock(&self.live.mailbox);
-        mailbox.wake = false;
-        mailbox.pending.drain(..).collect()
+    pub fn drain(&self) -> Vec<Notice> {
+        let mut state = lock(&self.live.mailbox);
+        state
+            .pending
+            .drain(..)
+            .map(|(notice, _)| notice)
+            .filter(Notice::is_live)
+            .collect()
     }
 
-    pub fn claim_wake(&self) -> Vec<Message> {
-        let mut mailbox = lock(&self.live.mailbox);
-        if !mailbox.wake {
+    pub fn claim_wake(&self) -> Vec<Notice> {
+        let mut state = lock(&self.live.mailbox);
+        state.pending.retain(|(notice, _)| notice.is_live());
+        if !state.pending.iter().any(|(_, wake)| *wake) {
             return Vec::new();
         }
-        mailbox.wake = false;
-        mailbox.pending.drain(..).collect()
+        state.pending.drain(..).map(|(notice, _)| notice).collect()
+    }
+
+    /// Registers interest in the next wake-flagged notice. Register it before
+    /// checking the mailbox: a notify landing between the check and the wait
+    /// would otherwise be missed.
+    pub fn wake_listener(&self) -> EventListener {
+        lock(&self.live.mailbox).signal.listen()
     }
 
     /// The registry only keeps a weak link, so the caller has to hold on to
@@ -142,17 +196,31 @@ impl SessionMailbox {
     /// ones, and their edits have to keep taking turns with the new loop's.
     pub fn publish_seed(&self, mut seed: AgentSeed) -> Arc<AgentSeed> {
         let mut published = lock(&self.live.seed);
-        if let Some(previous) = published.upgrade() {
+        if let Some(previous) = published.seed.upgrade() {
             *lock(&seed.chat_settings) = *lock(&previous.chat_settings);
             seed.file_access = previous.file_access.sharing_locks();
         }
         let seed = Arc::new(seed);
-        *published = Arc::downgrade(&seed);
+        *published = SeedRegistration {
+            seed: Arc::downgrade(&seed),
+            generation: Some(seed.owner_cancel.clone()),
+        };
         seed
     }
 
+    /// Headless loops have a generation owner without an interactive seed.
+    pub fn publish_generation(&self, generation: CancelToken) {
+        *lock(&self.live.seed) = SeedRegistration {
+            seed: Weak::new(),
+            generation: Some(generation),
+        };
+    }
+
     pub fn seed(&self) -> Option<Arc<AgentSeed>> {
-        lock(&self.live.seed).upgrade()
+        lock(&self.live.seed)
+            .seed
+            .upgrade()
+            .filter(|seed| !seed.owner_cancel.is_cancelled())
     }
 }
 
@@ -177,6 +245,8 @@ impl AgentSeed {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         session_id: SessionRef,
+        owner_cancel: CancelToken,
+        subagent_cancels: Arc<CancelMap<String>>,
         model_slot: Arc<ArcSwap<ModelSlot>>,
         config: AgentConfig,
         tool_output_lines: ToolOutputLines,
@@ -187,6 +257,8 @@ impl AgentSeed {
     ) -> Self {
         Self {
             session_id,
+            owner_cancel,
+            subagent_cancels,
             model_slot,
             config,
             tool_output_lines,
@@ -202,8 +274,18 @@ impl AgentSeed {
     /// `None` when the session is closed or has no interactive loop, like a
     /// headless or ACP run.
     pub fn live(session_id: MakiId) -> Option<Arc<Self>> {
+        Self::registered(session_id).filter(|seed| !seed.owner_cancel.is_cancelled())
+    }
+
+    /// Teardown needs the retired token too, while admission must use `live`.
+    pub fn generation(session_id: MakiId) -> Option<CancelToken> {
         let live = lock(&LIVE_SESSIONS).get(&session_id)?.upgrade()?;
-        lock(&live.seed).upgrade()
+        lock(&live.seed).generation.clone()
+    }
+
+    fn registered(session_id: MakiId) -> Option<Arc<Self>> {
+        let live = lock(&LIVE_SESSIONS).get(&session_id)?.upgrade()?;
+        lock(&live.seed).seed.upgrade()
     }
 
     pub fn set_chat_settings(&self, opts: RequestOptions, mode: &AgentMode) {
@@ -222,7 +304,7 @@ impl AgentSeed {
     /// that is gone can't say it isn't planning, so that is a no too.
     pub fn background_write_block(chat: MakiId) -> Option<String> {
         let Some(seed) = Self::live(chat) else {
-            return Some(MailboxError(chat).to_string());
+            return Some(MailboxError::NotLive(chat).to_string());
         };
         let (_, planning) = *lock(&seed.chat_settings);
         planning.then(|| BACKGROUND_PLAN_WRITE_DENIED.to_owned())
@@ -245,9 +327,11 @@ impl AgentSeed {
             timeouts: self.timeouts,
             opts: self.chat_opts(),
             model_policy: Arc::clone(&self.model_policy),
+            subagent_cancels: Arc::clone(&self.subagent_cancels),
             ..interpreter_ctx(
                 &AgentMode::Build,
-                &EventSender::new(sink, UNATTENDED_RUN_ID),
+                &EventSender::new(sink, UNATTENDED_RUN_ID)
+                    .with_owner_cancel(self.owner_cancel.clone()),
                 cancel,
                 Arc::clone(&self.permissions),
                 self.file_access.sharing_locks(),
@@ -280,8 +364,8 @@ mod tests {
     const LABEL_HEAD: &str = "Background agent finished:";
     const WIDE_CHAR: &str = "é";
 
-    fn text(message: &Message) -> &str {
-        message.first_text_content().unwrap()
+    fn text(notice: &Notice) -> &str {
+        notice.message.first_text_content().unwrap()
     }
 
     #[test]
@@ -296,13 +380,14 @@ mod tests {
             NOTICE_DISPLAY_MAX_BYTES - 1,
             "the byte limit must fall inside a character"
         );
-        let label = format!("{LABEL_HEAD}\n {wide}");
+        let mut notice = Notice::text(NOTICE_BODY.into());
+        notice.message.display_text = Some(format!("{LABEL_HEAD}\n {wide}"));
 
-        SessionMailbox::notify(id, NOTICE_BODY.into(), Some(&label), false).unwrap();
+        SessionMailbox::notify(id, notice, false).unwrap();
 
-        let message = mailbox.drain().remove(0);
-        assert_eq!(message.display_text, Some(expected));
-        assert_eq!(text(&message), NOTICE_BODY);
+        let notice = mailbox.drain().remove(0);
+        assert_eq!(notice.message.display_text, Some(expected));
+        assert_eq!(text(&notice), NOTICE_BODY);
     }
 
     #[test_case(None ; "absent")]
@@ -310,27 +395,109 @@ mod tests {
     fn notify_leaves_a_notice_without_a_label_unlabelled(label: Option<&str>) {
         let id = MakiId::generate();
         let mailbox = SessionMailbox::register(id);
+        let mut notice = Notice::text(NOTICE_BODY.into());
+        notice.message.display_text = label.map(str::to_owned);
 
-        SessionMailbox::notify(id, NOTICE_BODY.into(), label, false).unwrap();
+        SessionMailbox::notify(id, notice, false).unwrap();
 
-        let message = mailbox.drain().remove(0);
-        assert_eq!(message.display_text, None);
-        assert_eq!(text(&message), NOTICE_BODY);
+        let notice = mailbox.drain().remove(0);
+        assert_eq!(notice.message.display_text, None);
+        assert_eq!(text(&notice), NOTICE_BODY);
+    }
+
+    #[test]
+    fn background_context_keeps_its_exact_session_generation() {
+        let id = MakiId::generate();
+        let mailbox = SessionMailbox::register(id);
+        let (owner, owner_cancel) = CancelToken::new();
+        let mut initial = stub_seed(id);
+        initial.owner_cancel = owner_cancel;
+        let seed = mailbox.publish_seed(initial);
+        let ctx = seed.tool_context(CancelToken::none());
+        let original_owner = ctx.event_tx.owner_cancel().unwrap();
+        assert!(!original_owner.is_cancelled());
+        let child_id = "plugin-child".to_owned();
+        let (child_trigger, child_cancel) = CancelToken::new();
+        ctx.subagent_cancels
+            .insert_detached(child_id.clone(), child_trigger);
+        seed.subagent_cancels.cancel(child_id);
+        assert!(child_cancel.is_cancelled());
+
+        owner.cancel();
+        drop(seed);
+        assert!(original_owner.is_cancelled());
+        assert!(mailbox.seed().is_none());
+        assert!(AgentSeed::live(id).is_none());
+        assert!(
+            AgentSeed::generation(id)
+                .unwrap()
+                .same_token(&original_owner)
+        );
+
+        let replacement = mailbox.publish_seed(stub_seed(id));
+        let live = AgentSeed::live(id).unwrap();
+        assert!(Arc::ptr_eq(&live, &replacement));
+        assert!(original_owner.is_cancelled());
+        assert!(
+            !live
+                .tool_context(CancelToken::none())
+                .event_tx
+                .owner_cancel()
+                .unwrap()
+                .is_cancelled()
+        );
+    }
+
+    #[test]
+    fn same_session_replacement_rejects_notices_before_delayed_cleanup() {
+        let id = MakiId::generate();
+        let old = SessionMailbox::register(id);
+        let (owner, owner_cancel) = CancelToken::new();
+        let mut stale = Notice::text("old child finished".into());
+        stale.owner_cancel = Some(owner_cancel);
+        SessionMailbox::notify(id, stale.clone(), true).unwrap();
+        SessionMailbox::notify(id, Notice::text("quiet current notice".into()), false).unwrap();
+
+        owner.cancel();
+        let replacement = SessionMailbox::register(id);
+
+        assert!(
+            replacement.claim_wake().is_empty(),
+            "a stale wake cannot wake a live quiet notice"
+        );
+        assert!(matches!(
+            SessionMailbox::notify(id, stale, true),
+            Err(MailboxError::OwnerEnded)
+        ));
+        assert_eq!(
+            replacement.drain().iter().map(text).collect::<Vec<_>>(),
+            ["quiet current notice"]
+        );
+        assert!(old.drain().is_empty());
+        SessionMailbox::notify(id, Notice::text("current child finished".into()), true).unwrap();
+        assert_eq!(
+            replacement
+                .claim_wake()
+                .iter()
+                .map(text)
+                .collect::<Vec<_>>(),
+            ["current child finished"]
+        );
     }
 
     #[test]
     fn notifications_drain_in_order_and_clear_wake() {
         let id = MakiId::generate();
         let mailbox = SessionMailbox::register(id);
-        SessionMailbox::notify(id, "first".into(), None, true).unwrap();
-        SessionMailbox::notify(id, "second".into(), None, true).unwrap();
+        SessionMailbox::notify(id, Notice::text("first".into()), true).unwrap();
+        SessionMailbox::notify(id, Notice::text("second".into()), true).unwrap();
 
-        let messages = mailbox.drain();
+        let notices = mailbox.drain();
         assert_eq!(
-            messages.iter().map(text).collect::<Vec<_>>(),
+            notices.iter().map(text).collect::<Vec<_>>(),
             ["first", "second"]
         );
-        assert!(messages.iter().all(Message::is_observation));
+        assert!(notices.iter().all(|n| n.message.is_observation()));
         assert!(mailbox.claim_wake().is_empty());
     }
 
@@ -338,7 +505,7 @@ mod tests {
     fn quiet_notifications_do_not_claim_a_wake() {
         let id = MakiId::generate();
         let mailbox = SessionMailbox::register(id);
-        SessionMailbox::notify(id, "built".into(), None, false).unwrap();
+        SessionMailbox::notify(id, Notice::text("built".into()), false).unwrap();
 
         assert!(mailbox.claim_wake().is_empty());
         assert_eq!(mailbox.drain().len(), 1);
@@ -348,15 +515,55 @@ mod tests {
     fn waking_notification_claims_all_pending_messages() {
         let id = MakiId::generate();
         let mailbox = SessionMailbox::register(id);
-        SessionMailbox::notify(id, "quiet".into(), None, false).unwrap();
-        SessionMailbox::notify(id, "wake".into(), None, true).unwrap();
+        SessionMailbox::notify(id, Notice::text("quiet".into()), false).unwrap();
+        SessionMailbox::notify(id, Notice::text("wake".into()), true).unwrap();
 
-        let messages = mailbox.claim_wake();
+        let notices = mailbox.claim_wake();
         assert_eq!(
-            messages.iter().map(text).collect::<Vec<_>>(),
+            notices.iter().map(text).collect::<Vec<_>>(),
             ["quiet", "wake"]
         );
         assert!(mailbox.drain().is_empty());
+    }
+
+    #[test]
+    fn a_waking_notice_wakes_a_parked_listener() {
+        let id = MakiId::generate();
+        let mailbox = SessionMailbox::register(id);
+        let listener = mailbox.wake_listener();
+
+        SessionMailbox::notify(id, Notice::text("done".into()), true).unwrap();
+
+        assert!(
+            smol::block_on(async {
+                futures_lite::future::or(
+                    async {
+                        listener.await;
+                        true
+                    },
+                    async {
+                        smol::Timer::after(std::time::Duration::from_secs(5)).await;
+                        false
+                    },
+                )
+                .await
+            }),
+            "a wake-flagged notify must wake a parked frontend"
+        );
+    }
+
+    #[test]
+    fn a_quiet_notice_leaves_the_listener_parked() {
+        let id = MakiId::generate();
+        let mailbox = SessionMailbox::register(id);
+        let mut listener = mailbox.wake_listener();
+
+        SessionMailbox::notify(id, Notice::text("built".into()), false).unwrap();
+
+        assert!(
+            smol::block_on(futures_lite::future::poll_once(&mut listener)).is_none(),
+            "only a wake is worth starting a new run for"
+        );
     }
 
     #[test]
@@ -364,13 +571,13 @@ mod tests {
         let id = MakiId::generate();
         let mailbox = SessionMailbox::register(id);
         for index in 0..=MAILBOX_CAPACITY {
-            SessionMailbox::notify(id, index.to_string(), None, false).unwrap();
+            SessionMailbox::notify(id, Notice::text(index.to_string()), false).unwrap();
         }
 
-        let messages = mailbox.drain();
-        assert_eq!(messages.len(), MAILBOX_CAPACITY);
-        assert_eq!(text(&messages[0]), "1");
-        assert_eq!(text(messages.last().unwrap()), MAILBOX_CAPACITY.to_string());
+        let notices = mailbox.drain();
+        assert_eq!(notices.len(), MAILBOX_CAPACITY);
+        assert_eq!(text(&notices[0]), "1");
+        assert_eq!(text(notices.last().unwrap()), MAILBOX_CAPACITY.to_string());
     }
 
     #[test]
@@ -378,7 +585,7 @@ mod tests {
         let id = MakiId::generate();
         let first = SessionMailbox::register(id);
         let second = SessionMailbox::register(id);
-        SessionMailbox::notify(id, "built".into(), None, false).unwrap();
+        SessionMailbox::notify(id, Notice::text("built".into()), false).unwrap();
 
         assert_eq!(second.drain().len(), 1);
         assert!(first.drain().is_empty());
@@ -390,7 +597,7 @@ mod tests {
         drop(SessionMailbox::register(id));
 
         assert!(!lock(&LIVE_SESSIONS).contains_key(&id));
-        assert!(SessionMailbox::notify(id, "late".into(), None, false).is_err());
+        assert!(SessionMailbox::notify(id, Notice::text("late".into()), false).is_err());
     }
 
     #[test]
@@ -402,7 +609,7 @@ mod tests {
         drop(first);
 
         assert!(lock(&LIVE_SESSIONS).contains_key(&id));
-        SessionMailbox::notify(id, "built".into(), None, false).unwrap();
+        SessionMailbox::notify(id, Notice::text("built".into()), false).unwrap();
         assert_eq!(second.drain().len(), 1);
     }
 
@@ -417,7 +624,7 @@ mod tests {
         lock(&LIVE_SESSIONS).insert(id, Arc::downgrade(&replacement.live));
 
         drop(stale);
-        SessionMailbox::notify(id, "built".into(), None, false).unwrap();
+        SessionMailbox::notify(id, Notice::text("built".into()), false).unwrap();
 
         assert_eq!(replacement.drain().len(), 1);
     }
@@ -427,7 +634,7 @@ mod tests {
         let legacy: MakiId = "01965087-4c71-7f00-8000-000000000001".parse().unwrap();
         let canonical: MakiId = legacy.to_string().parse().unwrap();
         let mailbox = SessionMailbox::register(legacy);
-        SessionMailbox::notify(canonical, "built".into(), None, false).unwrap();
+        SessionMailbox::notify(canonical, Notice::text("built".into()), false).unwrap();
 
         assert_eq!(mailbox.drain().len(), 1);
     }
@@ -443,7 +650,7 @@ mod tests {
 
         drop(owned);
         assert!(AgentSeed::live(id).is_none());
-        SessionMailbox::notify(id, "built".into(), None, true).unwrap();
+        SessionMailbox::notify(id, Notice::text("built".into()), true).unwrap();
         assert_eq!(mailbox.claim_wake().len(), 1);
     }
 
@@ -480,7 +687,7 @@ mod tests {
         drop(seed);
         assert_eq!(
             AgentSeed::background_write_block(id),
-            Some(MailboxError(id).to_string())
+            Some(MailboxError::NotLive(id).to_string())
         );
     }
 

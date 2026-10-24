@@ -5,6 +5,7 @@
 //! A parent holds its children weakly and fires them itself, so propagation needs no background task and a dropped child leaves nothing behind.
 
 use std::collections::HashMap;
+use std::fmt::{self, Debug, Formatter};
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
@@ -38,6 +39,14 @@ pub struct CancelToken(Arc<Shared>);
 
 pub struct CancelTrigger(Arc<Shared>);
 
+impl Debug for CancelToken {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CancelToken")
+            .field("cancelled", &self.is_cancelled())
+            .finish()
+    }
+}
+
 impl CancelToken {
     pub fn new() -> (CancelTrigger, Self) {
         let shared = Arc::<Shared>::default();
@@ -50,6 +59,10 @@ impl CancelToken {
 
     pub fn is_cancelled(&self) -> bool {
         self.0.cancelled.load(Ordering::Acquire)
+    }
+
+    pub fn same_token(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
     }
 
     pub async fn race<T>(&self, future: impl Future<Output = T>) -> Result<T, String> {
@@ -121,6 +134,9 @@ struct Entry {
     /// Held, never read. Dropping a trigger is what fires the token of the
     /// session that registered it.
     registrations: Vec<(CancelSlot, CancelTrigger)>,
+    /// Registrations whose session outlives the run that opened it, so
+    /// [`CancelMap::end_foreground`] leaves them running.
+    detached: Vec<(CancelSlot, CancelTrigger)>,
     cancelled: bool,
 }
 
@@ -156,13 +172,29 @@ impl<K: Eq + std::hash::Hash> CancelMap<K> {
     /// Registers {trigger} under {id}, alongside any already there, and
     /// returns the slot to hand back to [`retire`](Self::retire).
     pub fn insert(&self, id: K, trigger: CancelTrigger) -> CancelSlot {
+        self.register(id, trigger, false)
+    }
+
+    /// Registers a trigger for a session that outlives the run that opened it.
+    /// [`end_foreground`](Self::end_foreground) keeps these, so the run ending does not
+    /// stop work that was made to outlive it.
+    pub fn insert_detached(&self, id: K, trigger: CancelTrigger) -> CancelSlot {
+        self.register(id, trigger, true)
+    }
+
+    fn register(&self, id: K, trigger: CancelTrigger, detached: bool) -> CancelSlot {
         let mut map = self.lock();
         let slot = CancelSlot(self.next_slot.fetch_add(1, Ordering::Relaxed));
         let entry = map.entry(id).or_default();
         // Under a cancelled id the trigger is dropped instead of stored, and
         // that drop is what fires the token, so the session is born cancelled.
         if !entry.cancelled {
-            entry.registrations.push((slot, trigger));
+            let registrations = if detached {
+                &mut entry.detached
+            } else {
+                &mut entry.registrations
+            };
+            registrations.push((slot, trigger));
         }
         slot
     }
@@ -174,9 +206,12 @@ impl<K: Eq + std::hash::Hash> CancelMap<K> {
         let Some(entry) = map.get_mut(id) else {
             return;
         };
-        entry
-            .registrations
-            .retain(|&(registered, _)| registered != slot);
+        for registrations in [&mut entry.registrations, &mut entry.detached] {
+            registrations.retain(|&(registered, _)| registered != slot);
+        }
+        if entry.registrations.is_empty() && entry.detached.is_empty() && !entry.cancelled {
+            map.remove(id);
+        }
     }
 
     /// Cancels every registration under {id} and marks the id, so a session
@@ -186,6 +221,7 @@ impl<K: Eq + std::hash::Hash> CancelMap<K> {
         let entry = map.entry(id).or_default();
         entry.cancelled = true;
         entry.registrations.clear();
+        entry.detached.clear();
     }
 
     /// A plugin that loads again needs this, or every task it starts would be
@@ -198,8 +234,24 @@ impl<K: Eq + std::hash::Hash> CancelMap<K> {
 
     /// The run that owned these is over: stop what is still registered and drop
     /// the marks with it, so no cancel of this run leaks into the next one.
+    /// A detached registration is not the run's to stop, so it stays, mark and
+    /// all, until the session that owns it retires it.
+    pub fn end_foreground(&self) {
+        let mut map = self.lock();
+        map.retain(|_, entry| {
+            entry.registrations.clear();
+            !entry.detached.is_empty()
+        });
+    }
+
+    /// Cancels every registration when its owner ends.
     pub fn cancel_all(&self) {
         self.lock().clear();
+    }
+
+    /// Removes a completed key whose identity will never be reused.
+    pub fn remove(&self, id: &K) {
+        self.lock().remove(id);
     }
 
     #[cfg(test)]
@@ -413,20 +465,50 @@ mod tests {
         assert!(tok2.is_cancelled());
     }
 
-    #[test]
-    fn cancel_map_retire_leaves_siblings_running() {
+    #[test_case(false; "retire_foreground_before_detached_sibling")]
+    #[test_case(true; "retire_detached_before_foreground_sibling")]
+    fn cancel_map_retirement_preserves_siblings_and_cancel_marks(detached_first: bool) {
         let map = CancelMap::new();
         let (t1, tok1) = CancelToken::new();
         let (t2, tok2) = CancelToken::new();
-        let slot1 = map.insert(key(), t1);
-        map.insert(key(), t2);
+        let (slot1, slot2) = if detached_first {
+            (map.insert_detached(key(), t1), map.insert(key(), t2))
+        } else {
+            (map.insert(key(), t1), map.insert_detached(key(), t2))
+        };
 
         map.retire(&key(), slot1);
         assert!(tok1.is_cancelled(), "retiring drops that trigger");
         assert!(!tok2.is_cancelled(), "the sibling keeps running");
+        assert!(map.has_key(&key()));
+
+        map.retire(&key(), slot2);
+        assert!(tok2.is_cancelled());
+        assert!(!map.has_key(&key()));
+
+        let (replacement, replacement_token) = CancelToken::new();
+        let replacement_slot = map.insert_detached(key(), replacement);
+        map.retire(&key(), slot1);
+        assert!(!replacement_token.is_cancelled());
+        assert!(map.has_key(&key()));
 
         map.cancel(key());
-        assert!(tok2.is_cancelled());
+        assert!(replacement_token.is_cancelled());
+        map.retire(&key(), replacement_slot);
+        assert!(map.has_key(&key()));
+
+        let (later, later_token) = CancelToken::new();
+        let later_slot = map.insert(key(), later);
+        assert!(later_token.is_cancelled(), "{LOST_CANCEL}");
+        map.retire(&key(), later_slot);
+        assert!(map.has_key(&key()));
+
+        map.revive(&key());
+        let (revived, revived_token) = CancelToken::new();
+        let revived_slot = map.insert(key(), revived);
+        assert!(!revived_token.is_cancelled());
+        map.retire(&key(), revived_slot);
+        assert!(!map.has_key(&key()));
     }
 
     /// After a reload, handles from the old instance can still retire their
@@ -452,5 +534,43 @@ mod tests {
 
         map.cancel(key());
         assert!(token.is_cancelled(), "a revived id can be cancelled again");
+    }
+
+    /// A background session outlives the run that spawned it, so the run
+    /// ending must not fire its token.
+    #[test]
+    fn cancel_map_detached_registration_survives_a_run_ending() {
+        let map = CancelMap::new();
+        let (run_trigger, run_token) = CancelToken::new();
+        let (detached_trigger, detached_token) = CancelToken::new();
+        map.insert(key(), run_trigger);
+        map.insert_detached(key(), detached_trigger);
+
+        map.end_foreground();
+        map.end_foreground();
+
+        assert!(run_token.is_cancelled(), "the run's own work still stops");
+        assert!(
+            !detached_token.is_cancelled(),
+            "a background session must outlive the run"
+        );
+        map.cancel(key());
+        assert!(detached_token.is_cancelled());
+    }
+
+    #[test]
+    fn cancel_map_teardown_stops_detached_and_foreground_registrations() {
+        let map = CancelMap::new();
+        let (foreground, foreground_cancel) = CancelToken::new();
+        let (background, background_cancel) = CancelToken::new();
+        map.insert(key(), foreground);
+        map.insert_detached(OTHER_KEY.to_owned(), background);
+
+        map.cancel_all();
+
+        assert!(foreground_cancel.is_cancelled());
+        assert!(background_cancel.is_cancelled());
+        assert!(!map.has_key(&key()));
+        assert!(!map.has_key(&OTHER_KEY.to_owned()));
     }
 }
