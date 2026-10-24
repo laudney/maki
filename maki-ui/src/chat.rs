@@ -83,6 +83,8 @@ pub struct Chat {
     /// Session-owned work keeps its routing and input after the main turn ends.
     pub detached: bool,
     pub(crate) generation_owned: bool,
+    pub(crate) spawn_tool_use_id: Option<String>,
+    pub(crate) spawn_parent_task_id: Option<String>,
     pub kind: TaskKind,
     initial_prompt_set: bool,
     pending_turn_usage: Option<String>,
@@ -118,6 +120,8 @@ impl Chat {
             draft: Submission::default(),
             detached: false,
             generation_owned: false,
+            spawn_tool_use_id: None,
+            spawn_parent_task_id: None,
             kind: TaskKind::Agent,
             initial_prompt_set: false,
             pending_turn_usage: None,

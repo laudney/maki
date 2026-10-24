@@ -1,13 +1,15 @@
 //! Real task plugin and background sessions with a callback-controlled provider.
 //! Model selection inherits the test provider; the session APIs stay real.
 
+use std::fs;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
 use maki_agent::template::Vars;
-use maki_agent::tools::test_support::stub_seed_owned_by;
+use maki_agent::tools::test_support::{stub_seed, stub_seed_owned_by};
 use maki_agent::tools::{RequestTools, ToolAudience, ToolContext, ToolExecResult, ToolRegistry};
 use maki_agent::{
     Agent, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, AgentSeed, CancelToken,
@@ -27,6 +29,10 @@ use serde_json::{Value, json};
 use test_case::test_case;
 
 const RESULT: &str = "background answer";
+const WRITE_TOOL: &str = "child_write";
+const WRITTEN: &str = "child wrote the file";
+const WRITE_FILE: &str = "child.txt";
+const SUB_WRITE_CALL: &str = "child-write-call";
 const LIST_TOOL: &str = "background_sessions";
 const NOTICE_TOOL: &str = "next_notice";
 const FIRST: &str = "first background task";
@@ -664,6 +670,7 @@ fn managed_call(
         model_policy: ctx.model_policy,
     };
     let registry = Arc::clone(reg);
+    let mode = ctx.mode;
     let (done, finished) = flume::unbounded();
     thread::spawn(move || {
         let mut history = History::new(Vec::new());
@@ -694,7 +701,7 @@ fn managed_call(
             .with_cancel(token)
             .run(AgentInput::from_defaults(
                 ROOT_PROMPT.into(),
-                AgentMode::Build,
+                mode,
                 Vec::new(),
                 SessionDefaults::default(),
                 InputSource::Tui,
@@ -1109,4 +1116,111 @@ fn a_failed_blocking_open_returns_its_error_without_a_receipt(extra: Value, expe
     assert_eq!(mailbox.background_tools(ROOT_RUN), 0);
     assert!(started.is_empty());
     assert!(mailbox.drain().is_empty());
+}
+
+/// A subagent that writes `path` once, then reports the tool result.
+struct WritingProvider {
+    path: PathBuf,
+}
+
+impl Provider for WritingProvider {
+    fn stream_message<'a>(
+        &'a self,
+        _: &'a Model,
+        messages: &'a [Message],
+        _: &'a str,
+        _: &'a Value,
+        _: &'a flume::Sender<ProviderEvent>,
+        _: RequestOptions,
+        _: Option<&'a SessionRef>,
+    ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+        let result = messages.iter().flat_map(|m| &m.content).find_map(|block| {
+            if let ContentBlock::ToolResult { content, .. } = block {
+                Some(content.clone())
+            } else {
+                None
+            }
+        });
+        let (block, stop_reason) = match result {
+            Some(text) => (ContentBlock::Text { text }, StopReason::EndTurn),
+            None => (
+                ContentBlock::tool_use(SUB_WRITE_CALL, WRITE_TOOL, json!({ "path": self.path })),
+                StopReason::ToolUse,
+            ),
+        };
+        Box::pin(async move {
+            Ok(StreamResponse {
+                message: Message {
+                    role: Role::Assistant,
+                    content: vec![block],
+                    ..Default::default()
+                },
+                stop_reason: Some(stop_reason),
+                ..Default::default()
+            })
+        })
+    }
+
+    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+}
+
+/// Headless, SDK and ACP runs publish a generation but no seed. A blocking
+/// task still runs there on the shared worker, and `background = true` falls
+/// back to it, so a general child writes as it would in the foreground.
+#[test_case(false, false; "blocking_build")]
+#[test_case(false, true; "background_fallback_build")]
+#[test_case(true, false; "blocking_plan")]
+#[test_case(true, true; "background_fallback_plan")]
+fn a_seedless_blocking_child_writes_through_the_shared_worker(planning: bool, background: bool) {
+    let reg = Arc::clone(ToolRegistry::global_arc());
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    load(&host);
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join(WRITE_FILE);
+    host.load_source("child_writer", &format!(r#"
+maki.api.register_tool({{
+    name = "{WRITE_TOOL}", description = "Write a child file",
+    schema = {{ type = "object", properties = {{ path = {{ type = "string" }} }}, required = {{ "path" }} }},
+    permission = "fs_write", permission_scopes = "path", mutable_path = "path",
+    audiences = {{ "general_sub" }},
+    handler = function(input)
+        assert(maki.fs.write(input.path, "{WRITTEN}"))
+        return "{WRITTEN}"
+    end,
+}})
+"#)).unwrap();
+    let session = MakiId::generate();
+    let mailbox = SessionMailbox::register(session);
+    let seed = stub_seed(session);
+    let mut ctx = seed.tool_context(CancelToken::none());
+    mailbox.publish_generation(ctx.event_tx.owner_cancel().unwrap());
+    assert!(AgentSeed::live(session).is_none());
+    ctx.provider = Arc::new(WritingProvider { path: path.clone() });
+    ctx.registry = Arc::clone(&reg);
+    ctx.background_for = None;
+    if planning {
+        ctx.mode = AgentMode::Plan(path.clone());
+    }
+    let root = managed_call(
+        &reg,
+        &mailbox,
+        ctx,
+        "task",
+        json!({
+            "description": TASK_NAME, "prompt": PROMPT, "subagent_type": "general", "background": background,
+        }),
+    );
+    assert_eq!(call_output(&root), (WRITTEN.into(), false));
+    let events: Vec<_> = root.events.drain().collect();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.subagent.as_ref().is_some_and(|child| {
+                child.parent_tool_use_id != ROOT_CALL
+                    && child.spawn_tool_use_id.as_deref() == Some(ROOT_CALL)
+            }))
+    );
+    assert_eq!(fs::read_to_string(path).unwrap(), WRITTEN);
 }

@@ -21,6 +21,7 @@ use maki_agent::agent::TranscriptError;
 use maki_agent::command::{CommandScope, CustomCommand};
 use maki_agent::permissions::{PermissionAnswer, PermissionManager};
 use maki_agent::session::NOTHING_TO_STORE;
+use maki_agent::tools::MAIN_TASK_ID;
 use maki_agent::{
     AgentMode, BufferSnapshot, CancelToken, DoneReason, HistorySnapshot, ImageMediaType,
     McpConfigErrors, McpServerInfo, McpServerStatus, McpSnapshot, McpSnapshotReader, Notice,
@@ -341,6 +342,7 @@ fn subagent_info_with_tx(
         kind: TaskKind::Agent,
         owner_cancel: None,
         spawn_tool_use_id: None,
+        spawn_parent_task_id: None,
         answer_tx,
         permission_tool_use_id: None,
         inbox: None,
@@ -389,6 +391,7 @@ fn detached_msg_of_kind(
     info.kind = kind;
     info.owner_cancel = Some(CancelToken::none());
     info.spawn_tool_use_id = Some(SPAWN_ID.into());
+    info.spawn_parent_task_id = Some(MAIN_TASK_ID.to_owned());
     Msg::Agent(Box::new(Envelope {
         event,
         subagent: Some(info),
@@ -2311,6 +2314,62 @@ fn a_detached_agents_usage_lands_on_its_spawn_row() {
         app.chats[0].tool_turn_usage(SPAWN_ID),
         Some(sub_usage_text().as_str())
     );
+}
+
+/// A nested child's spawn row is in the transcript of the task that spawned
+/// it, so its name, model and usage have to land there and not in the main
+/// one, whether that task is a delegated agent or a plugin's session.
+#[test_case(false ; "agent_task_parent")]
+#[test_case(true ; "plugin_task_parent")]
+fn a_nested_detached_agent_reports_on_its_parent_tasks_row(plugin_parent: bool) {
+    const NESTED_SPAWN: &str = "toolu_nested_spawn";
+    const NESTED_AGENT: &str = "subagent-nested";
+    const NESTED_NAME: &str = "nested research";
+    const NESTED_MODEL: &str = "nested-model";
+    let (mut app, parent) = if plugin_parent {
+        let mut app = app_with_plugin_task();
+        plugin_event(&mut app, tool_start(NESTED_SPAWN, "task"));
+        (app, MONITOR_ID)
+    } else {
+        let mut app = streaming_app();
+        app.update(agent_msg(tool_start(TASK_ID, "task")));
+        app.update(subagent_msg(
+            tool_start(NESTED_SPAWN, "task"),
+            TASK_ID,
+            Some(SUBAGENT_NAME),
+        ));
+        (app, TASK_ID)
+    };
+    let mut info = subagent_info(NESTED_AGENT, NESTED_NAME);
+    info.detached = true;
+    info.model = Some(NESTED_MODEL.into());
+    info.owner_cancel = Some(CancelToken::none());
+    info.spawn_tool_use_id = Some(NESTED_SPAWN.into());
+    info.spawn_parent_task_id = Some(parent.into());
+    app.deliver(
+        Envelope {
+            event: turn_complete(SUB_TOKENS, NESTED_MODEL, SUB_COST),
+            subagent: Some(info),
+            run_id: DETACHED_RUN_ID,
+        },
+        plugin_parent.then(|| (Arc::from(MONITOR_PLUGIN), MONITOR_ID)),
+    );
+
+    let row = (0..app.chats[1].message_count())
+        .filter_map(|index| app.chats[1].message_at(index))
+        .find(|message| matches!(&message.role, DisplayRole::Tool(tool) if tool.id == NESTED_SPAWN))
+        .unwrap();
+    assert_eq!(row.text, NESTED_NAME);
+    assert!(
+        row.annotation
+            .as_deref()
+            .is_some_and(|note| note.contains(NESTED_MODEL))
+    );
+    assert_eq!(
+        app.chats[1].tool_turn_usage(NESTED_SPAWN),
+        Some(sub_usage_text().as_str())
+    );
+    assert_eq!(app.chats[0].tool_turn_usage(NESTED_SPAWN), None);
 }
 
 #[test_case(false ; "plain_tool_takes_the_parent_turn")]
@@ -5708,6 +5767,96 @@ fn rewind_to_second_turn() -> RewindEntry {
         prompt_preview: "2: second".into(),
         prompt_text: "second prompt".into(),
     }
+}
+
+#[test_case(false, false; "rewind_attached")]
+#[test_case(false, true; "rewind_detached")]
+#[test_case(true, false; "fork_attached")]
+#[test_case(true, true; "fork_detached")]
+fn cutting_before_a_later_prompt_keeps_spawned_child_state(fork: bool, detached: bool) {
+    const SPAWN: &str = "tool-1";
+    const ORPHAN: &str = "subagent-orphan";
+    const ORPHAN_SPAWN: &str = "later-spawn";
+    let mut app = streaming_app();
+    seed_rewind_session(app.state.session_mut());
+    let mut messages = app.state.session.messages().to_vec();
+    messages[3].content.push(ContentBlock::tool_use(
+        ORPHAN_SPAWN,
+        "task",
+        serde_json::json!({}),
+    ));
+    app.state.session_mut().replace_messages(messages);
+    for (child, spawn) in [(AGENT_ID, SPAWN), (ORPHAN, ORPHAN_SPAWN)] {
+        let mut info = subagent_info(child, RESEARCH_NAME);
+        info.spawn_tool_use_id = Some(spawn.into());
+        info.spawn_parent_task_id = Some(MAIN_TASK_ID.to_owned());
+        info.detached = detached;
+        info.owner_cancel = Some(CancelToken::none());
+        app.update(Msg::Agent(Box::new(Envelope {
+            event: AgentEvent::SubagentHistory {
+                tool_use_id: child.into(),
+                messages: vec![Message {
+                    role: Role::Assistant,
+                    content: vec![ContentBlock::tool_use(
+                        SUB_TOOL_ID,
+                        "bash",
+                        serde_json::json!({}),
+                    )],
+                    ..Default::default()
+                }],
+                status: Some(SubagentVerdict::Done),
+            },
+            subagent: Some(info),
+            run_id: DETACHED_RUN_ID,
+        })));
+        app.state.session_mut().insert_tool_output(
+            task_tool_output_key(child, SUB_TOOL_ID),
+            Arc::new(ToolOutput::Plain(TOOL_OUTPUT_LINE.into())),
+        );
+    }
+    app.sync_subagents();
+    let tmp = TempDir::new().unwrap();
+    let claim = app.state.claim.clone();
+    app.state.session_mut().save_to(&claim, tmp.path()).unwrap();
+    let loaded = AppSession::load_from(app.state.session.id, tmp.path()).unwrap();
+    app.state.session = Arc::new(loaded);
+    app.reset_ui_chrome();
+    app.restore_display();
+    let session = if fork {
+        opened_fork(app.fork_to(rewind_to_second_turn()))
+    } else {
+        app.rewind_to(rewind_to_second_turn());
+        app.state.session.as_ref().clone()
+    };
+
+    assert!(session.subagent_messages().contains_key(AGENT_ID));
+    assert_eq!(
+        session.subagent_messages()[AGENT_ID][0]
+            .tool_uses()
+            .next()
+            .unwrap()
+            .0,
+        SUB_TOOL_ID
+    );
+    assert_eq!(
+        session.tool_outputs()[&task_tool_output_key(AGENT_ID, SUB_TOOL_ID)].as_text(),
+        TOOL_OUTPUT_LINE
+    );
+    assert!(!session.subagent_messages().contains_key(ORPHAN));
+    assert!(
+        !session
+            .tool_outputs()
+            .contains_key(&task_tool_output_key(ORPHAN, SUB_TOOL_ID))
+    );
+    assert_eq!(session.subagents().len(), 1);
+    assert_eq!(
+        serde_json::to_value(&session.subagents()[0]).unwrap()["spawn_tool_use_id"],
+        SPAWN
+    );
+    assert_eq!(
+        session.subagents()[0].spawn_parent_task_id.as_deref(),
+        Some(MAIN_TASK_ID)
+    );
 }
 
 #[test]

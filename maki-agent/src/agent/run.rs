@@ -307,6 +307,11 @@ impl<'h> Agent<'h> {
         self.carry_from = self.history.len();
         self.stop_continuations = 0;
         self.mode = mode;
+        if let Some(mailbox) = &self.mailbox
+            && let Some(owner) = self.event_tx.owner_cancel()
+        {
+            mailbox.set_mode(&owner, &self.mode);
+        }
         self.workflow = workflow;
         self.opts = RequestOptions { thinking, fast };
         // Each message of a burst is judged on its own, and one kept message is
@@ -1237,7 +1242,7 @@ mod tests {
     use crate::Notice;
     use std::borrow::Cow;
     use std::collections::{BTreeMap, VecDeque};
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
 
     use maki_config::ProjectConfig;
@@ -1791,6 +1796,34 @@ mod tests {
                     .last()
                     .unwrap()
                     .contains("Draft an analysis in /plans/analysis.md.")
+            );
+        });
+    }
+
+    #[test_case(false; "build_mode")]
+    #[test_case(true; "plan_mode")]
+    fn seedless_run_publishes_parent_mode_for_background_writes(planning: bool) {
+        smol::block_on(async {
+            let id = MakiId::generate();
+            let mailbox = SessionMailbox::register(id);
+            let (_owner, generation) = CancelToken::new();
+            mailbox.publish_generation(generation.clone());
+            let mut history = History::new(Vec::new());
+            let (mut agent, _events) = make_agent(
+                MockProvider::new(vec![text_response(StopReason::EndTurn)]),
+                &mut history,
+            );
+            agent.event_tx = agent.event_tx.with_owner_cancel(generation);
+            agent.mailbox = Some(mailbox);
+            let mut input = default_input();
+            if planning {
+                input.mode = AgentMode::Plan(PathBuf::from("/tmp/plan.md"));
+            }
+            agent.run(input).await.unwrap();
+
+            assert_eq!(
+                crate::AgentSeed::background_write_block(id, crate::AgentSeed::generation(id)),
+                planning.then(|| crate::live_session::BACKGROUND_PLAN_WRITE_DENIED.to_owned()),
             );
         });
     }

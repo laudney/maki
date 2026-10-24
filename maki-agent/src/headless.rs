@@ -17,6 +17,7 @@ use tracing::error;
 
 use crate::agent::{self, RunContext, RunContextBuilder};
 use crate::cancel::{CancelMap, CancelToken, CancelTrigger};
+use crate::live_session::HeadlessPlanning;
 use crate::permissions::{PermissionManager, PluginRuleStore};
 use crate::prompt::ResolvedPrompts;
 use crate::session::{Resumed, SessionTrack};
@@ -338,10 +339,17 @@ pub struct InteractiveHandle {
     pub permissions: Arc<PermissionManager>,
     /// Keeps generation identity available after the run exits, through cleanup.
     pub mailbox: SessionMailbox,
+    /// The exact generation this handle controls, even after replacement.
+    pub owner_cancel: CancelToken,
     pub task: smol::Task<()>,
 }
 
 impl InteractiveHandle {
+    pub fn set_planning(&self, planning: bool) {
+        self.mailbox
+            .set_planning(&self.owner_cancel, HeadlessPlanning::Client(planning));
+    }
+
     /// Assigns the prompt's identity and cancellation before it can be run.
     pub fn submit(&self, input: AgentInput) -> Result<u64, flume::SendError<()>> {
         let ticket = self.run_ids.fetch_add(1, Ordering::Relaxed) + 1;
@@ -441,7 +449,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
 
     let session_ref = params.resumed.id.clone();
     let mailbox = SessionMailbox::register(session_ref.id());
-    mailbox.publish_generation(owner_cancel);
+    mailbox.publish_generation(owner_cancel.clone());
     let handle_mailbox = mailbox.clone();
 
     let working_dir = params.initial_wd.to_string_lossy().into_owned();
@@ -558,6 +566,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
             session_id: session_ref,
             permissions,
             mailbox: handle_mailbox,
+            owner_cancel,
             task,
         },
         events,
@@ -606,11 +615,15 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use futures_lite::future::poll_once;
+    use tempfile::TempDir;
     use test_case::test_case;
 
     use super::*;
+    use crate::AgentSeed;
+    use crate::live_session::BACKGROUND_PLAN_WRITE_DENIED;
     use crate::mcp::McpCommand;
     use crate::prompt::{PromptId, Slot, SlotEntry};
+    use crate::tools::test_support::{BackgroundWriteProbe, WRITE_PROBE_CONTENT};
 
     const RUN_ID: u64 = 7;
     const STREAM_ENDED: &str = "the stream must end with the run, not with teardown";
@@ -814,11 +827,59 @@ mod tests {
             answer_tx: flume::unbounded().0,
             model_tx: flume::unbounded().0,
             mailbox: SessionMailbox::register(session_id.id()),
+            owner_cancel: CancelToken::none(),
             session_id,
             permissions: ctx.permissions,
             task: smol::spawn(std::future::pending()),
         };
         (handle, input_rx)
+    }
+
+    #[test]
+    fn one_shot_generation_allows_child_writes_without_a_mode_switch() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("child.txt");
+        let session = Resumed::fresh().id;
+        let mailbox = SessionMailbox::register(session.id());
+        let (_owner, owner_cancel) = CancelToken::new();
+        mailbox.publish_generation(owner_cancel.clone());
+        let child = BackgroundWriteProbe::new(session.id(), owner_cancel, path.clone());
+        let done = child.write();
+        assert!(!done.is_error, "{}", done.output.as_text());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), WRITE_PROBE_CONTENT);
+    }
+
+    #[test]
+    fn client_mode_overrides_captured_run_mode_for_its_generation() {
+        let (mut handle, _inputs) = interactive_handle();
+        let (_owner, owner_cancel) = CancelToken::new();
+        handle.owner_cancel = owner_cancel.clone();
+        handle.mailbox.publish_generation(owner_cancel.clone());
+        let id = handle.session_id.id();
+        handle.set_planning(true);
+        handle.mailbox.set_mode(&owner_cancel, &AgentMode::Build);
+        assert_eq!(
+            AgentSeed::background_write_block(id, Some(owner_cancel.clone())).as_deref(),
+            Some(BACKGROUND_PLAN_WRITE_DENIED)
+        );
+
+        handle.set_planning(false);
+        handle.mailbox.set_mode(
+            &owner_cancel,
+            &AgentMode::Plan(PathBuf::from("/tmp/plan.md")),
+        );
+        assert_eq!(
+            AgentSeed::background_write_block(id, Some(owner_cancel)),
+            None
+        );
+
+        let (_replacement, generation) = CancelToken::new();
+        handle.mailbox.publish_generation(generation.clone());
+        handle.set_planning(true);
+        assert_eq!(
+            AgentSeed::background_write_block(id, Some(generation)),
+            None
+        );
     }
 
     #[test_case(false; "before_it_starts")]

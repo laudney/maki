@@ -174,6 +174,8 @@ impl App {
             .filter_map(|chat| {
                 Some(StoredSubagent {
                     tool_use_id: chat.task_id()?.to_string(),
+                    spawn_tool_use_id: chat.spawn_tool_use_id.clone(),
+                    spawn_parent_task_id: chat.spawn_parent_task_id.clone(),
                     name: chat.name.clone(),
                     model: chat.model_id.clone(),
                     thinking: chat.opts.map(|o| o.thinking.into()),
@@ -291,6 +293,8 @@ impl App {
             );
             chat.set_restore_channel(self.restore_event_tx.clone());
             chat.plugin = sa.plugin;
+            chat.spawn_tool_use_id = sa.spawn_tool_use_id;
+            chat.spawn_parent_task_id = sa.spawn_parent_task_id;
             chat.cost = sa.cost;
             chat.model_id = sa.model;
             chat.detached = sa.detached;

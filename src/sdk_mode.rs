@@ -861,7 +861,11 @@ fn handle_control_request(
             let mode_str = cr.request.extra.get("mode").and_then(Value::as_str);
             match mode_str.and_then(PermissionMode::parse) {
                 Some(mode) => {
-                    shared.lock().unwrap().permission_mode = mode;
+                    {
+                        let mut shared = shared.lock().unwrap();
+                        handle.set_planning(mode == PermissionMode::Plan);
+                        shared.permission_mode = mode;
+                    }
                     writer.emit_control_response(&cr.request_id, ok, None)
                 }
                 None => writer.emit_control_response(
@@ -1315,9 +1319,13 @@ fn map_tool_names_in_content(content: &Value) -> Value {
 mod tests {
     use flume::Receiver;
     use maki_agent::cancel::CancelToken;
-    use maki_agent::{SubagentInfo, TaskKind, ToolStartEvent, TurnCompleteEvent};
+    use maki_agent::live_session::BACKGROUND_PLAN_WRITE_DENIED;
+    use maki_agent::tools::test_support::{BackgroundWriteProbe, WRITE_PROBE_CONTENT, stub_ctx};
+    use maki_agent::{SessionMailbox, SubagentInfo, TaskKind, ToolStartEvent, TurnCompleteEvent};
     use maki_config::ToolKey;
     use maki_providers::{ContentBlock, Message, Role};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use tempfile::TempDir;
     use test_case::test_case;
 
     use super::*;
@@ -1777,6 +1785,74 @@ mod tests {
         (pump, out_rx)
     }
 
+    #[test]
+    fn permission_mode_switch_updates_active_background_child_writes() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("child.txt");
+        let (answer_tx, _answers) = flume::unbounded();
+        let (pump, responses) = test_pump(PermissionMode::Default, answer_tx.clone());
+        let (input_tx, input_rx) = flume::unbounded();
+        let (_owner, owner_cancel) = CancelToken::new();
+        let mailbox = SessionMailbox::register(pump.writer.session_id.id());
+        mailbox.publish_generation(owner_cancel.clone());
+        let handle = InteractiveHandle {
+            tool_names: Vec::new(),
+            input_tx,
+            run_ids: Arc::new(AtomicU64::new(0)),
+            run_cancels: Arc::default(),
+            finished_run: Arc::default(),
+            subagent_cancels: Arc::default(),
+            answer_tx,
+            model_tx: flume::unbounded().0,
+            session_id: pump.writer.session_id.clone(),
+            permissions: stub_ctx(&AgentMode::Build).permissions,
+            mailbox,
+            owner_cancel: owner_cancel.clone(),
+            task: smol::spawn(std::future::pending()),
+        };
+        let child = BackgroundWriteProbe::new(handle.session_id.id(), owner_cancel, path.clone());
+        assert!(!child.write().is_error);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), WRITE_PROBE_CONTENT);
+        std::fs::remove_file(&path).unwrap();
+        let model = pump.shared.lock().unwrap().model.clone();
+        for (mode, denied) in [
+            (PermissionMode::Plan, true),
+            (PermissionMode::Default, false),
+        ] {
+            let request = InboundControlRequest {
+                request_id: OUTSTANDING_REQ.into(),
+                request: InboundControlRequestInner {
+                    subtype: "set_permission_mode".into(),
+                    extra: serde_json::json!({ "mode": mode.as_str() }),
+                },
+            };
+            handle_control_request(
+                &request,
+                &pump.writer,
+                &handle,
+                &pump.shared,
+                &model,
+                &ModelPolicy::default(),
+            )
+            .unwrap();
+            let response: Value = serde_json::from_str(&responses.try_recv().unwrap()).unwrap();
+            assert_eq!(response["response"]["subtype"], "success");
+            let done = child.write();
+            assert_eq!(done.is_error, denied);
+            assert_eq!(
+                done.output.as_text(),
+                if denied {
+                    BACKGROUND_PLAN_WRITE_DENIED
+                } else {
+                    WRITE_PROBE_CONTENT
+                }
+            );
+            assert_eq!(path.exists(), !denied);
+        }
+        assert_eq!(handle.run_ids.load(Ordering::Relaxed), 0);
+        assert!(input_rx.is_empty());
+    }
+
     fn permission_request() -> Envelope {
         Envelope {
             event: AgentEvent::PermissionRequest {
@@ -1812,6 +1888,7 @@ mod tests {
                 kind: TaskKind::Agent,
                 owner_cancel: None,
                 spawn_tool_use_id: None,
+                spawn_parent_task_id: None,
                 opts: None,
                 answer_tx,
                 permission_tool_use_id: None,

@@ -42,6 +42,8 @@ const OLDEST_LOG_FORMAT_VERSION: u32 = 2;
 /// it says which way to go and which format it found.
 const NEWER_LOG_FORMAT: &str = "written by a newer maki, log format";
 const TASK_TOOL_OUTPUT_PREFIX: &str = "task:";
+/// The session history, as distinct from a child task transcript.
+pub const MAIN_TASK_ID: &str = "main";
 pub const SESSIONS_DIR: &str = "sessions";
 const CWD_INDEX_FILE: &str = "cwd_latest.json";
 const CWD_INDEX_STEM: &str = "cwd_latest";
@@ -686,6 +688,10 @@ impl TaskKind {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StoredSubagent {
     pub tool_use_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawn_tool_use_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawn_parent_task_id: Option<String>,
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
@@ -2181,17 +2187,47 @@ where
     ///
     /// If you add another field keyed by tool_use_id, prune it here too.
     pub fn prune_orphans(&mut self, tool_ids: impl Fn(&M) -> Vec<String>) {
-        let mut kept: HashSet<String> = self.messages.iter().flat_map(&tool_ids).collect();
+        let main_calls: HashSet<String> = self.messages.iter().flat_map(&tool_ids).collect();
+        let mut kept = main_calls.clone();
+        for child in &self.subagents {
+            // Legacy child IDs were the main call IDs; scoped references take precedence.
+            if child.spawn_tool_use_id.is_some() || child.spawn_parent_task_id.is_some() {
+                kept.remove(&child.tool_use_id);
+            }
+        }
         kept.extend(
             self.subagents
                 .iter()
-                .filter(|sa| sa.plugin.is_some())
-                .map(|sa| sa.tool_use_id.clone()),
+                .filter(|child| child.plugin.is_some())
+                .map(|child| child.tool_use_id.clone()),
         );
+        let mut pending: Vec<String> = kept.iter().cloned().collect();
+        pending.push(MAIN_TASK_ID.to_owned());
+        while let Some(parent) = pending.pop() {
+            let calls = if parent == MAIN_TASK_ID {
+                main_calls.clone()
+            } else if let Some(messages) = self.subagent_messages.get(&parent) {
+                messages.iter().flat_map(&tool_ids).collect()
+            } else {
+                continue;
+            };
+            for child in &self.subagents {
+                if child.spawn_parent_task_id.as_deref() == Some(parent.as_str())
+                    && child
+                        .spawn_tool_use_id
+                        .as_ref()
+                        .is_some_and(|call| calls.contains(call))
+                    && kept.insert(child.tool_use_id.clone())
+                {
+                    pending.push(child.tool_use_id.clone());
+                }
+            }
+        }
         self.subagent_messages.retain(|id, _| kept.contains(id));
         self.subagents.retain(|sa| kept.contains(&sa.tool_use_id));
 
-        let mut live = kept;
+        let mut live = main_calls;
+        live.extend(kept);
         for (task_id, messages) in &self.subagent_messages {
             for tool_id in messages.iter().flat_map(&tool_ids) {
                 live.insert(task_tool_output_key(task_id, &tool_id));
@@ -2378,9 +2414,10 @@ mod tests {
     use super::canonical_key;
     use super::{
         ARCHIVE_DIR, ARCHIVE_KEEP, ARCHIVE_MAX_BYTES, CWD_INDEX_FILE, DEFAULT_TITLE, LOG_BLOATED,
-        MAX_APPENDS, MAX_TITLE_LEN, MSG_PREFIX, SESSION_VERSION, SESSIONS_DIR, StoredSubagent,
-        TAIL_BUF, TaskKind, generate_title, json_path, jsonl_path, load_cwd_index, lock_path,
-        locks_dir, next_epoch, task_tool_output_key, update_cwd_index, write_full_session,
+        MAIN_TASK_ID, MAX_APPENDS, MAX_TITLE_LEN, MSG_PREFIX, SESSION_VERSION, SESSIONS_DIR,
+        StoredSubagent, TAIL_BUF, TaskKind, generate_title, json_path, jsonl_path, load_cwd_index,
+        lock_path, locks_dir, next_epoch, task_tool_output_key, update_cwd_index,
+        write_full_session,
     };
     use super::{
         HistorySnapshot, LOG_FORMAT_VERSION, NEWER_LOG_FORMAT, OLDEST_LOG_FORMAT_VERSION,
@@ -2485,6 +2522,8 @@ mod tests {
         fn subagent(id: &str, plugin: Option<&str>) -> StoredSubagent {
             StoredSubagent {
                 tool_use_id: id.into(),
+                spawn_tool_use_id: None,
+                spawn_parent_task_id: None,
                 name: "sub".into(),
                 model: None,
                 thinking: None,
@@ -2536,6 +2575,202 @@ mod tests {
         let mut outputs: Vec<_> = session.tool_outputs().keys().cloned().collect();
         outputs.sort();
         assert_eq!(outputs, ["monitor-tool", "sub-tool", "task-live"]);
+    }
+
+    #[test]
+    fn pruning_keeps_children_reachable_through_persisted_spawn_ids() {
+        const SPAWN: &str = "spawn";
+        const CHILD: &str = "subagent-child";
+        const NESTED: &str = "subagent-nested";
+        const NESTED_SPAWN: &str = "nested-spawn";
+        const ORPHAN: &str = "subagent-orphan";
+        const OUTPUT: &str = "saved result";
+        let tmp = TempDir::new().unwrap();
+        let mut session: TestSession = Session::new("m", "/project");
+        session.push_message(Value::from(SPAWN));
+        session.push_message(Value::from("removed-spawn"));
+        // Child order must not decide whether a nested descendant survives.
+        session.set_subagents(
+            [
+                (NESTED, CHILD, NESTED_SPAWN),
+                (CHILD, MAIN_TASK_ID, SPAWN),
+                (ORPHAN, MAIN_TASK_ID, "removed-spawn"),
+            ]
+            .into_iter()
+            .map(|(child, parent, spawn)| {
+                serde_json::from_value(json!({
+                    "tool_use_id": child,
+                    "name": child,
+                    "spawn_tool_use_id": spawn,
+                    "spawn_parent_task_id": parent,
+                }))
+                .unwrap()
+            })
+            .collect(),
+        );
+        for child in [CHILD, NESTED, ORPHAN] {
+            session.set_subagent_messages(child.into(), vec![Value::from(NESTED_SPAWN)]);
+            session.insert_tool_output(
+                task_tool_output_key(child, NESTED_SPAWN),
+                Arc::new(Value::from(OUTPUT)),
+            );
+        }
+        let claim = claim_for(tmp.path(), &session);
+        session.save_to(&claim, tmp.path()).unwrap();
+        let mut loaded = TestSession::load_from(session.id, tmp.path()).unwrap();
+        loaded.truncate_messages(1);
+        loaded.prune_orphans(|m| vec![m.as_str().unwrap().to_owned()]);
+        loaded.save_to(&claim, tmp.path()).unwrap();
+        let loaded = TestSession::load_from(session.id, tmp.path()).unwrap();
+
+        for child in [CHILD, NESTED] {
+            assert!(loaded.subagent_messages().contains_key(child));
+            assert_eq!(
+                loaded.tool_outputs()[&task_tool_output_key(child, NESTED_SPAWN)].as_str(),
+                Some(OUTPUT)
+            );
+        }
+        assert_eq!(loaded.subagents().len(), 2);
+        assert!(!loaded.subagent_messages().contains_key(ORPHAN));
+        assert!(
+            !loaded
+                .tool_outputs()
+                .contains_key(&task_tool_output_key(ORPHAN, NESTED_SPAWN))
+        );
+    }
+
+    #[test]
+    fn pruning_scopes_reused_spawn_calls_to_the_parent_task() {
+        const ROOT_A: &str = "spawn-a";
+        const ROOT_B: &str = "spawn-b";
+        const A: &str = "subagent-a";
+        const B: &str = "subagent-b";
+        const A_CHILD: &str = "subagent-a-child";
+        const B_CHILD: &str = "subagent-b-child";
+        const CALL: &str = "call_1";
+        const OUTPUT: &str = "saved child output";
+        let tmp = TempDir::new().unwrap();
+        let mut session: TestSession = Session::new("m", "/project");
+        for call in [ROOT_A, CALL, ROOT_B] {
+            session.push_message(Value::from(call));
+        }
+        session.set_subagents(
+            [
+                (A_CHILD, A, CALL),
+                (B_CHILD, B, CALL),
+                (B, MAIN_TASK_ID, ROOT_B),
+                (A, MAIN_TASK_ID, ROOT_A),
+            ]
+            .into_iter()
+            .map(|(child, parent, call)| {
+                serde_json::from_value(json!({
+                    "tool_use_id": child,
+                    "name": child,
+                    "spawn_tool_use_id": call,
+                    "spawn_parent_task_id": parent,
+                }))
+                .unwrap()
+            })
+            .collect(),
+        );
+        for child in [A, B, A_CHILD, B_CHILD] {
+            session.set_subagent_messages(child.into(), vec![Value::from(CALL)]);
+            for key in [child.to_owned(), task_tool_output_key(child, CALL)] {
+                session.insert_tool_output(key, Arc::new(Value::from(OUTPUT)));
+            }
+        }
+        let claim = claim_for(tmp.path(), &session);
+        session.save_to(&claim, tmp.path()).unwrap();
+        let mut loaded = TestSession::load_from(session.id, tmp.path()).unwrap();
+        loaded.truncate_messages(2);
+        loaded.prune_orphans(|m| vec![m.as_str().unwrap().to_owned()]);
+        loaded.save_to(&claim, tmp.path()).unwrap();
+        let loaded = TestSession::load_from(session.id, tmp.path()).unwrap();
+
+        for child in [B, B_CHILD] {
+            assert!(
+                !loaded.subagent_messages().contains_key(child),
+                "orphan {child} survived"
+            );
+            assert!(
+                !loaded
+                    .subagents()
+                    .iter()
+                    .any(|stored| stored.tool_use_id == child)
+            );
+            assert!(!loaded.tool_outputs().contains_key(child));
+            assert!(
+                !loaded
+                    .tool_outputs()
+                    .contains_key(&task_tool_output_key(child, CALL))
+            );
+        }
+        for child in [A, A_CHILD] {
+            assert_eq!(
+                loaded.subagent_messages()[child].as_ref(),
+                &[Value::from(CALL)]
+            );
+            assert_eq!(loaded.tool_outputs()[child].as_str(), Some(OUTPUT));
+            assert_eq!(
+                loaded.tool_outputs()[&task_tool_output_key(child, CALL)].as_str(),
+                Some(OUTPUT)
+            );
+        }
+    }
+
+    #[test]
+    fn pruning_legacy_spawn_references_does_not_guess_the_parent_task() {
+        const DIRECT: &str = "legacy-direct";
+        const UNSCOPED: &str = "legacy-unscoped";
+        const SPAWN: &str = "legacy-spawn";
+        const PLUGIN: &str = "plugin-task";
+        const CALL: &str = "call_1";
+        let tmp = TempDir::new().unwrap();
+        let mut session: TestSession = Session::new("m", "/project");
+        for id in [DIRECT, SPAWN] {
+            session.push_message(Value::from(id));
+        }
+        session.set_subagents(
+            [
+                json!({ "tool_use_id": DIRECT, "name": DIRECT }),
+                json!({ "tool_use_id": UNSCOPED, "name": UNSCOPED, "spawn_tool_use_id": SPAWN }),
+                json!({ "tool_use_id": PLUGIN, "name": PLUGIN, "plugin": "monitor" }),
+            ]
+            .into_iter()
+            .map(|value| serde_json::from_value(value).unwrap())
+            .collect(),
+        );
+        for child in [DIRECT, UNSCOPED, PLUGIN] {
+            session.set_subagent_messages(child.into(), vec![Value::from(CALL)]);
+            session.insert_tool_output(task_tool_output_key(child, CALL), Arc::new(Value::Null));
+        }
+        let claim = claim_for(tmp.path(), &session);
+        session.save_to(&claim, tmp.path()).unwrap();
+        let mut loaded = TestSession::load_from(session.id, tmp.path()).unwrap();
+        assert!(
+            loaded
+                .subagents()
+                .iter()
+                .all(|child| child.spawn_parent_task_id.is_none())
+        );
+        assert!(loaded.subagent_messages().contains_key(UNSCOPED));
+
+        loaded.prune_orphans(|m| vec![m.as_str().unwrap().to_owned()]);
+
+        for child in [DIRECT, PLUGIN] {
+            assert!(loaded.subagent_messages().contains_key(child));
+            assert!(
+                loaded
+                    .tool_outputs()
+                    .contains_key(&task_tool_output_key(child, CALL))
+            );
+        }
+        assert!(!loaded.subagent_messages().contains_key(UNSCOPED));
+        assert!(
+            !loaded
+                .tool_outputs()
+                .contains_key(&task_tool_output_key(UNSCOPED, CALL))
+        );
     }
 
     #[test_case(false; "without_transcript")]

@@ -1734,7 +1734,10 @@ impl App {
             .map(|s| s.parent_tool_use_id.clone());
         // A detached child routes under an id of its own, so its usage finds no
         // row unless the call that spawned it is read from here.
-        let spawn_row = envelope.subagent.as_ref().map(SubagentInfo::spawn_row_id);
+        let spawn_row = envelope
+            .subagent
+            .as_ref()
+            .map(|info| (self.spawn_row_chat(info), info.spawn_row_id()));
 
         let is_plugin_task = plugin.is_some();
         let chat_idx = match envelope.subagent {
@@ -1809,9 +1812,9 @@ impl App {
             let ctx_size = tc.context_size.unwrap_or_else(|| tc.usage.context_tokens());
             self.set_context_size(chat_idx, ctx_size);
             self.chats[chat_idx].set_pending_turn_usage(tc.usage.format(tc.cost));
-            if let Some(row) = spawn_row {
+            if let Some((row_chat, row)) = spawn_row {
                 let formatted = tc.usage.format_sum_cost(self.chats[chat_idx].cost);
-                self.chats[MAIN_CHAT].set_tool_turn_usage(row, formatted);
+                self.chats[row_chat].set_tool_turn_usage(row, formatted);
             }
         }
 
@@ -1952,6 +1955,22 @@ impl App {
         }
     }
 
+    /// The chat whose transcript holds the row of the call that spawned
+    /// `child`: a nested child's row is in its parent task's chat, whether
+    /// that task is a delegated child or a plugin's session.
+    fn spawn_row_chat(&self, child: &SubagentInfo) -> usize {
+        child
+            .spawn_parent_task_id
+            .as_deref()
+            .and_then(|task| {
+                self.chat_index
+                    .get(task)
+                    .copied()
+                    .or_else(|| self.chat_of_task(task).ok())
+            })
+            .unwrap_or(MAIN_CHAT)
+    }
+
     /// Delegated children use `chat_index`; plugin tasks are found by id,
     /// independently of the main chat's turn routing.
     fn resolve_or_create_chat(
@@ -1994,10 +2013,10 @@ impl App {
             self.chat_index.insert(id.clone(), idx);
             // A moved tool call's row already shows what the call runs.
             if subagent.kind == TaskKind::Agent {
-                let row = subagent.spawn_row_id();
-                self.chats[MAIN_CHAT].update_tool_summary(row, &subagent.name);
+                let (row_chat, row) = (self.spawn_row_chat(subagent), subagent.spawn_row_id());
+                self.chats[row_chat].update_tool_summary(row, &subagent.name);
                 if let Some(ref model) = subagent.model {
-                    self.chats[MAIN_CHAT].update_tool_model(row, model);
+                    self.chats[row_chat].update_tool_model(row, model);
                 }
             }
         }
@@ -2013,6 +2032,8 @@ impl App {
         );
         chat.set_restore_channel(self.restore_event_tx.clone());
         chat.plugin = plugin.clone();
+        chat.spawn_tool_use_id = subagent.spawn_tool_use_id.clone();
+        chat.spawn_parent_task_id = subagent.spawn_parent_task_id.clone();
         chat.generation_owned = generation_owned;
         chat.model_id = subagent.model.clone();
         chat.opts = subagent.opts;

@@ -1267,6 +1267,9 @@ pub struct SubagentInfo {
     /// row for the spawn that has to carry the child's usage.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spawn_tool_use_id: Option<String>,
+    /// The task whose transcript owns `spawn_tool_use_id`; `main` names the root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawn_parent_task_id: Option<String>,
     /// What the subagent actually runs with, already reconciled against its
     /// model. `None` means unknown (a restore predating it), which reads as
     /// the parent's settings.
@@ -1512,6 +1515,7 @@ mod tests {
                 detached: false,
                 owner_cancel: Some(CancelToken::none()),
                 spawn_tool_use_id: None,
+                spawn_parent_task_id: None,
                 opts: None,
                 answer_tx: None,
                 permission_tool_use_id: Some(CHILD_PERMISSION_ID.into()),

@@ -277,7 +277,7 @@ async fn handle_request(
             Ok(()) => return,
             Err(e) => Err(e),
         },
-        "session/set_mode" => handle_set_mode(srv, raw),
+        "session/set_mode" => handle_set_mode(srv, raw, &params.storage),
         "session/set_config_option" => handle_set_config(srv, raw),
         _ => Err(AcpError::method_not_found()),
     };
@@ -737,13 +737,18 @@ fn handle_prompt(srv: &mut Server, raw: &Value, id: &RequestId) -> Result<(), Ac
     Ok(())
 }
 
-fn handle_set_mode(srv: &mut Server, raw: &Value) -> Result<AgentResponse, AcpError> {
+fn handle_set_mode(
+    srv: &mut Server,
+    raw: &Value,
+    storage: &StateDir,
+) -> Result<AgentResponse, AcpError> {
     let req: SetSessionModeRequest = parse_params(raw)?;
     let mode_str = req.mode_id.0.to_string();
-    let new_mode = methods::mode_id_to_agent_mode(&mode_str)
+    let new_mode = methods::mode_id_to_agent_mode(&mode_str, storage)
         .ok_or_else(|| AcpError::new(-32602, format!("unknown mode: {mode_str}")))?;
 
     let session = srv.session.as_mut().ok_or_else(no_session)?;
+    session.handle.set_planning(new_mode.plan_path().is_some());
     session.current_mode = new_mode;
 
     let sid = SessionId::from(session.handle.session_id.to_string());
@@ -1136,8 +1141,10 @@ mod tests {
     use std::sync::LazyLock;
     use std::sync::atomic::AtomicU64;
 
+    use maki_agent::live_session::BACKGROUND_PLAN_WRITE_DENIED;
     use maki_agent::permissions::{PermissionCheck, PermissionError, PermissionManager};
     use maki_agent::tools::PermissionScopes;
+    use maki_agent::tools::test_support::{BackgroundWriteProbe, WRITE_PROBE_CONTENT};
     use maki_agent::{
         CancelToken, DETACHED_RUN_ID, DoneReason, EventSender, SessionMailbox, SubagentInfo,
         TaskKind, ToolStartEvent, TurnCompleteEvent,
@@ -1383,6 +1390,7 @@ mod tests {
             model_tx: flume::unbounded().0,
             session_id: SessionRef::from(claim.id()),
             mailbox: SessionMailbox::register(claim.id()),
+            owner_cancel: CancelToken::none(),
             permissions: Arc::new(PermissionManager::new(
                 maki_config::PermissionsConfig::default(),
                 PathBuf::from("/project"),
@@ -1408,6 +1416,56 @@ mod tests {
             }),
         };
         (server, answer_rx, out_rx)
+    }
+
+    #[test]
+    fn set_mode_updates_active_background_child_writes() {
+        let dir = TempDir::new().unwrap();
+        let storage = StateDir::from_path(dir.path().to_path_buf());
+        let path = dir.path().join("child.txt");
+        let (mut srv, _answers, updates) = test_server();
+        let session = srv.session.as_mut().unwrap();
+        let (_owner, owner_cancel) = CancelToken::new();
+        session.handle.owner_cancel = owner_cancel.clone();
+        session
+            .handle
+            .mailbox
+            .publish_generation(owner_cancel.clone());
+        let sid = session.handle.session_id.id();
+        let child = BackgroundWriteProbe::new(sid, owner_cancel, path.clone());
+        assert!(!child.write().is_error);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), WRITE_PROBE_CONTENT);
+        std::fs::remove_file(&path).unwrap();
+
+        for (mode, denied) in [("plan", true), ("build", false)] {
+            let raw =
+                serde_json::json!({ "params": { "sessionId": sid.to_string(), "modeId": mode } });
+            assert!(matches!(
+                handle_set_mode(&mut srv, &raw, &storage).unwrap(),
+                AgentResponse::SetSessionModeResponse(_)
+            ));
+            assert!(updates.try_recv().is_ok());
+            let done = child.write();
+            assert_eq!(done.is_error, denied);
+            assert_eq!(
+                done.output.as_text(),
+                if denied {
+                    BACKGROUND_PLAN_WRITE_DENIED
+                } else {
+                    WRITE_PROBE_CONTENT
+                }
+            );
+            assert_eq!(path.exists(), !denied);
+        }
+        assert_eq!(
+            srv.session
+                .as_ref()
+                .unwrap()
+                .handle
+                .run_ids
+                .load(Ordering::Relaxed),
+            0
+        );
     }
 
     fn acp_params(storage: StateDir) -> AcpParams {
@@ -1616,6 +1674,7 @@ mod tests {
             kind: TaskKind::Agent,
             owner_cancel: None,
             spawn_tool_use_id: None,
+            spawn_parent_task_id: None,
             answer_tx,
             permission_tool_use_id: None,
             inbox: None,

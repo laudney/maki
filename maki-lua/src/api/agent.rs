@@ -15,8 +15,8 @@ use maki_agent::tools::interpreter_bridge;
 use maki_agent::tools::registry::ToolRegistry;
 use maki_agent::tools::schema::sanitize_tool_input_schema;
 use maki_agent::tools::{
-    CallOrigin, Deadline, DescriptionContext, LocalTool, LocalTools, RequestTools, ToolAudience,
-    ToolContext, ToolFilter, ToolLive, ToolOutputMode,
+    CallOrigin, Deadline, DescriptionContext, LocalTool, LocalTools, MAIN_TASK_ID, RequestTools,
+    ToolAudience, ToolContext, ToolFilter, ToolLive, ToolOutputMode,
 };
 use maki_agent::types::ALLOWED_BY;
 use maki_agent::{
@@ -1094,6 +1094,13 @@ async fn session(
             model: Some(model.spec()),
             detached,
             owner_cancel: Some(owner_cancel.clone()),
+            spawn_parent_task_id: spawn_tool_use_id.as_ref().map(|_| {
+                agent_ctx
+                    .task_id
+                    .as_deref()
+                    .unwrap_or(MAIN_TASK_ID)
+                    .to_owned()
+            }),
             spawn_tool_use_id,
             opts: Some(opts),
             answer_tx,
@@ -2694,12 +2701,39 @@ mod tests {
             Some(&state.sub_event_tx),
             Some(NESTED_CHILD),
         );
+        ctx.task_id = state.params.task_id.clone();
         ctx.subagent_cancels = Arc::clone(&state.params.subagent_cancels);
         ctx.user_response_rx = state.answer_rx.clone();
         ctx.cancel = prompt_cancel;
         drop(state);
         drop(parent);
         session_from_context(lua, ctx, false).await
+    }
+
+    #[test]
+    fn nested_spawn_reference_names_the_parent_task() {
+        let lua = Lua::new();
+        lua.set_app_data(SpawnedTasks::default());
+        smol::block_on(async {
+            let (parent, _events) = native_session_events(&lua, true, None).await;
+            let parent_handle = parent.borrow::<LuaSession>().unwrap();
+            let parent_info = parent_handle.cancel.presentation.info();
+            assert_eq!(
+                parent_info.spawn_parent_task_id.as_deref(),
+                Some(MAIN_TASK_ID)
+            );
+            assert_eq!(parent_info.spawn_tool_use_id.as_deref(), Some(NATIVE_CHILD));
+            drop(parent_handle);
+
+            let child = nested_session(&lua, &parent, CancelToken::none()).await;
+            let child_handle = child.borrow::<LuaSession>().unwrap();
+            let child_info = child_handle.cancel.presentation.info();
+            assert_eq!(
+                child_info.spawn_parent_task_id.as_deref(),
+                Some(parent_info.parent_tool_use_id.as_str())
+            );
+            assert_eq!(child_info.spawn_tool_use_id.as_deref(), Some(NESTED_CHILD));
+        });
     }
 
     #[test]
@@ -3112,6 +3146,7 @@ mod tests {
                 detached: false,
                 owner_cancel: None,
                 spawn_tool_use_id: None,
+                spawn_parent_task_id: None,
                 answer_tx: None,
                 permission_tool_use_id: None,
                 inbox: None,

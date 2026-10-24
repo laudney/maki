@@ -811,6 +811,7 @@ maki.api.create_autocmd("SessionEnd", { callback = function() maki.ui.input() en
                 kind: TaskKind::Agent,
                 owner_cancel: Some(owner.clone()),
                 spawn_tool_use_id: None,
+                spawn_parent_task_id: None,
                 answer_tx: None,
                 permission_tool_use_id: None,
                 inbox: None,
@@ -851,6 +852,7 @@ maki.api.create_autocmd("SessionEnd", { callback = function() maki.ui.input() en
                         kind: TaskKind::Agent,
                         owner_cancel: Some(owner.clone()),
                         spawn_tool_use_id: None,
+                        spawn_parent_task_id: None,
                         answer_tx: None,
                         permission_tool_use_id: None,
                         inbox: None,
@@ -919,7 +921,7 @@ maki.api.create_autocmd("SessionEnd", { callback = function() maki.ui.input() en
         let seed = AgentSeed::live(id).expect(SEED_NOT_LIVE);
         assert_eq!(seed.chat_opts(), app.request_options());
         assert_eq!(
-            AgentSeed::background_write_block(id).as_deref(),
+            AgentSeed::background_write_block(id, AgentSeed::generation(id)).as_deref(),
             Some(BACKGROUND_PLAN_WRITE_DENIED)
         );
     }

@@ -858,7 +858,7 @@ fn background_write_block(ctx: &ToolContext, name: &str, key: &FileKey) -> Optio
                 .as_ref()
                 .and_then(crate::RunningTool::background_session)
         })?;
-    let reason = AgentSeed::background_write_block(chat)?;
+    let reason = AgentSeed::background_write_block(chat, ctx.event_tx.owner_cancel())?;
     warn!(
         tool = %name,
         %chat,
@@ -2118,6 +2118,9 @@ mod tests {
             let seed = mailbox.publish_seed(stub_seed(chat));
             seed.set_chat_settings(Default::default(), &chat_mode);
             let mut ctx = build_ctx();
+            ctx.event_tx = ctx
+                .event_tx
+                .with_owner_cancel(AgentSeed::generation(chat).unwrap());
             ctx.registry = registered(Arc::new(HookMock(None)));
             ctx.background_for = Some(chat);
 
@@ -2130,6 +2133,58 @@ mod tests {
             )
             .await;
 
+            assert_eq!(done.output.as_text(), expected);
+        });
+    }
+
+    enum SeedlessParent {
+        Build,
+        Plan,
+        Cancelled,
+        Replaced,
+    }
+
+    #[test_case(SeedlessParent::Build; "build")]
+    #[test_case(SeedlessParent::Plan; "plan")]
+    #[test_case(SeedlessParent::Cancelled; "cancelled")]
+    #[test_case(SeedlessParent::Replaced; "replaced_without_cancelling_old_owner")]
+    fn seedless_background_child_checks_parent_mode_and_lifetime(parent: SeedlessParent) {
+        smol::block_on(async {
+            let chat = MakiId::generate();
+            let mailbox = SessionMailbox::register(chat);
+            let (owner, generation) = CancelToken::new();
+            mailbox.publish_generation(generation.clone());
+            let expected = match parent {
+                SeedlessParent::Build => ran(PLAN_PATH),
+                SeedlessParent::Plan => {
+                    mailbox.set_mode(&generation, &planning());
+                    BACKGROUND_PLAN_WRITE_DENIED.to_owned()
+                }
+                SeedlessParent::Cancelled => {
+                    owner.cancel();
+                    crate::MailboxError::NotLive(chat).to_string()
+                }
+                SeedlessParent::Replaced => {
+                    mailbox.publish_generation(CancelToken::none());
+                    mailbox.set_mode(&generation, &planning());
+                    crate::MailboxError::NotLive(chat).to_string()
+                }
+            };
+            let mut ctx = build_ctx();
+            ctx.registry = registered(Arc::new(HookMock(None)));
+            ctx.background_for = Some(chat);
+            ctx.event_tx = ctx.event_tx.with_owner_cancel(generation);
+
+            let done = run(
+                TEST_ID.into(),
+                HOOK_TOOL_NAME,
+                &call_input(PLAN_PATH),
+                &ctx,
+                CallOrigin::Model,
+            )
+            .await;
+
+            assert_eq!(done.is_error, !matches!(parent, SeedlessParent::Build));
             assert_eq!(done.output.as_text(), expected);
         });
     }
@@ -2148,6 +2203,9 @@ mod tests {
             let seed = mailbox.publish_seed(stub_seed(chat));
             seed.set_chat_settings(Default::default(), &chat_mode);
             let mut ctx = build_ctx();
+            ctx.event_tx = ctx
+                .event_tx
+                .with_owner_cancel(AgentSeed::generation(chat).unwrap());
             ctx.registry = registered(Arc::new(HookMock(None)));
             ctx.child_presentation = Some(ChildPresentation::new(
                 Some(chat),
@@ -2161,6 +2219,7 @@ mod tests {
                     detached: false,
                     owner_cancel: None,
                     spawn_tool_use_id: None,
+                    spawn_parent_task_id: None,
                     opts: None,
                     answer_tx: None,
                     permission_tool_use_id: None,

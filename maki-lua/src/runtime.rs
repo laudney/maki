@@ -652,6 +652,7 @@ impl RestoreReply {
                 kind: TaskKind::Agent,
                 owner_cancel: None,
                 spawn_tool_use_id: None,
+                spawn_parent_task_id: None,
                 answer_tx: None,
                 permission_tool_use_id: None,
                 inbox: None,

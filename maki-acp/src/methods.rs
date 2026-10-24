@@ -5,6 +5,8 @@ use agent_client_protocol_schema::v1::{
     SessionConfigSelectOption, SessionMode, SessionModeId, SessionModeState,
 };
 
+use maki_storage::StateDir;
+
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 const MODE_BUILD: &str = "build";
@@ -57,12 +59,11 @@ pub fn model_config_option(current: &str, specs: &[String]) -> SessionConfigOpti
         .category(SessionConfigOptionCategory::Model)
 }
 
-pub fn mode_id_to_agent_mode(mode_id: &str) -> Option<maki_agent::AgentMode> {
+pub fn mode_id_to_agent_mode(mode_id: &str, storage: &StateDir) -> Option<maki_agent::AgentMode> {
     match mode_id {
         MODE_BUILD => Some(maki_agent::AgentMode::Build),
         MODE_PLAN => {
-            let storage = maki_storage::StateDir::resolve().ok()?;
-            let plan_path = maki_storage::plans::new_plan_path(&storage).ok()?;
+            let plan_path = maki_storage::plans::new_plan_path(storage).ok()?;
             Some(maki_agent::AgentMode::Plan(plan_path))
         }
         _ => None,

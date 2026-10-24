@@ -13,7 +13,7 @@ use super::CallInstructions;
 use super::tool_dispatch;
 use crate::cancel::{CancelMap, CancelSlot, CancelToken, CancelTrigger};
 use crate::permissions::TaggedAnswer;
-use crate::tools::ToolContext;
+use crate::tools::{MAIN_TASK_ID, ToolContext};
 use crate::{
     AgentEvent, ChildPresentation, DETACHED_RUN_ID, Envelope, EventSender, Notice, ResultDelivery,
     SessionMailbox, SubagentInfo, SubagentVerdict, TaskKind, ToolDoneEvent, ToolOutput,
@@ -232,6 +232,7 @@ impl ForegroundTools {
             detached: true,
             owner_cancel: Some(self.owner.clone()),
             spawn_tool_use_id: Some(call.id.clone()),
+            spawn_parent_task_id: Some(MAIN_TASK_ID.to_owned()),
             opts: None,
             answer_tx: call.answer_tx.clone(),
             permission_tool_use_id: None,
@@ -1451,6 +1452,7 @@ mod tests {
                 detached: false,
                 owner_cancel: fixture.ctx.event_tx.owner_cancel(),
                 spawn_tool_use_id: Some(FIRST.into()),
+                spawn_parent_task_id: Some(MAIN_TASK_ID.to_owned()),
                 opts: None,
                 answer_tx: Some(answer_tx),
                 permission_tool_use_id: None,
@@ -1929,6 +1931,7 @@ mod tests {
                             detached: false,
                             owner_cancel: None,
                             spawn_tool_use_id: None,
+                            spawn_parent_task_id: None,
                             opts: None,
                             answer_tx: Some(answer_tx),
                             permission_tool_use_id: None,

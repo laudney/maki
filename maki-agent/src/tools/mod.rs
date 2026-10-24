@@ -16,6 +16,7 @@ pub mod schema;
 pub use deadline::Deadline;
 pub use file_access::{FileAccess, FileKey};
 pub use hook::{Authority, HookCall, HookStage, ToolHook, Verdict};
+pub use maki_storage::sessions::MAIN_TASK_ID;
 pub use registry::{
     BoxFuture, ExecFuture, HeaderFuture, HeaderResult, ParseError, PermissionScopes,
     RegisteredTool, RegistryError, Tool, ToolAudience, ToolExecResult, ToolInvocation, ToolReach,
@@ -50,8 +51,6 @@ pub(crate) const TOOL_NAME_FIELD: &str = "name";
 const COMPACT_DURATION: SpanPrinter = SpanPrinter::new()
     .designator(Designator::Compact)
     .spacing(Spacing::None);
-/// What `maki.task` calls the session's own chat.
-pub const MAIN_TASK_ID: &str = "main";
 
 /// Who made a tool call. A resumed session rebuilds its state from the `ToolUse`
 /// blocks in history, and those hold the model's own calls only, so a nested
@@ -643,13 +642,91 @@ pub mod test_support {
     use maki_providers::Timeouts;
     use maki_storage::id::MakiId;
 
-    use crate::cancel::CancelMap;
+    use crate::cancel::{CancelMap, CancelTrigger};
     use crate::live_session::AgentSeed;
-    use crate::{Envelope, EventSender, ModelSlot, ToolOutput};
+    use crate::{Envelope, EventSender, ModelSlot, ToolDoneEvent, ToolOutput};
 
     use super::*;
 
     pub const GUARDED_TOOL_NAME: &str = "guarded_mock";
+
+    const WRITE_PROBE_TOOL: &str = "background_write_probe";
+    pub const WRITE_PROBE_CONTENT: &str = "background child wrote the file";
+
+    pub struct BackgroundWriteProbe {
+        ctx: ToolContext,
+        _child: CancelTrigger,
+    }
+
+    impl BackgroundWriteProbe {
+        pub fn new(session: MakiId, owner: CancelToken, path: PathBuf) -> Self {
+            let (child, cancel) = owner.child();
+            let mut ctx = stub_ctx(&AgentMode::Build);
+            ctx.event_tx = ctx.event_tx.with_owner_cancel(owner);
+            ctx.session_id = Some(session.into());
+            ctx.background_for = Some(session);
+            ctx.task_id = Some(Arc::from(format!("subagent-{}", MakiId::generate())));
+            ctx.audience = ToolAudience::GENERAL_SUB;
+            ctx.cancel = cancel;
+            ctx.registry
+                .register(
+                    Arc::new(WriteProbeTool(path)),
+                    registry::ToolSource::Lua {
+                        plugin: Arc::from(WRITE_PROBE_TOOL),
+                    },
+                )
+                .unwrap();
+            Self { ctx, _child: child }
+        }
+
+        pub fn write(&self) -> ToolDoneEvent {
+            assert!(!self.ctx.cancel.is_cancelled());
+            smol::block_on(crate::agent::tool_dispatch::run(
+                WRITE_PROBE_TOOL.into(),
+                WRITE_PROBE_TOOL,
+                &serde_json::json!({}),
+                &self.ctx,
+                CallOrigin::Model,
+            ))
+        }
+    }
+
+    struct WriteProbeTool(PathBuf);
+
+    impl registry::Tool for WriteProbeTool {
+        fn name(&self) -> &str {
+            WRITE_PROBE_TOOL
+        }
+        fn description(&self, _ctx: &DescriptionContext) -> Cow<'_, str> {
+            WRITE_PROBE_TOOL.into()
+        }
+        fn schema(&self) -> Value {
+            serde_json::json!({ "type": "object", "properties": {} })
+        }
+        fn parse(
+            &self,
+            _input: &Value,
+        ) -> Result<Box<dyn registry::ToolInvocation>, registry::ParseError> {
+            Ok(Box::new(Self(self.0.clone())))
+        }
+    }
+
+    impl registry::ToolInvocation for WriteProbeTool {
+        fn start_header(&self) -> registry::HeaderFuture {
+            registry::HeaderFuture::Ready(registry::HeaderResult::plain(WRITE_PROBE_TOOL.into()))
+        }
+        fn mutable_path(&self) -> Option<&Path> {
+            Some(&self.0)
+        }
+        fn execute<'a>(self: Box<Self>, _ctx: &'a ToolContext) -> registry::ExecFuture<'a> {
+            Box::pin(async move {
+                fs::write(self.0, WRITE_PROBE_CONTENT)
+                    .map(|()| ToolOutput::Plain(WRITE_PROBE_CONTENT.into()))
+                    .map_err(|error| error.to_string())
+                    .into()
+            })
+        }
+    }
 
     /// Registry and routing tests care about the name and audience only, never
     /// about what the tool returns.

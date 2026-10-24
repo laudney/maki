@@ -44,6 +44,13 @@ struct LiveSession {
 struct SeedRegistration {
     seed: Weak<AgentSeed>,
     generation: Option<CancelToken>,
+    headless_planning: Option<HeadlessPlanning>,
+}
+
+pub(crate) enum HeadlessPlanning {
+    Run(bool),
+    // A client mode switch takes precedence over a run's already captured input.
+    Client(bool),
 }
 
 /// One queued report for a live session: the observation the model will read
@@ -330,6 +337,7 @@ impl SessionMailbox {
         *published = SeedRegistration {
             seed: Arc::downgrade(&seed),
             generation: Some(seed.owner_cancel.clone()),
+            headless_planning: None,
         };
         seed
     }
@@ -339,7 +347,27 @@ impl SessionMailbox {
         *lock(&self.live.seed) = SeedRegistration {
             seed: Weak::new(),
             generation: Some(generation),
+            headless_planning: Some(HeadlessPlanning::Run(false)),
         };
+    }
+
+    pub(crate) fn set_mode(&self, owner: &CancelToken, mode: &AgentMode) {
+        self.set_planning(owner, HeadlessPlanning::Run(mode.plan_path().is_some()));
+    }
+
+    pub(crate) fn set_planning(&self, owner: &CancelToken, planning: HeadlessPlanning) {
+        let mut published = lock(&self.live.seed);
+        if !owner.is_cancelled()
+            && published
+                .generation
+                .as_ref()
+                .is_some_and(|current| current.same_token(owner))
+            && let Some(current) = &mut published.headless_planning
+            && !(matches!(current, HeadlessPlanning::Client(_))
+                && matches!(&planning, HeadlessPlanning::Run(_)))
+        {
+            *current = planning;
+        }
     }
 
     pub fn seed(&self) -> Option<Arc<AgentSeed>> {
@@ -428,12 +456,29 @@ impl AgentSeed {
     /// my files alone". So every write asks here, and a switch to plan mode
     /// also covers the next write of a prompt that is already running. A chat
     /// that is gone can't say it isn't planning, so that is a no too.
-    pub fn background_write_block(chat: MakiId) -> Option<String> {
-        let Some(seed) = Self::live(chat) else {
-            return Some(MailboxError::NotLive(chat).to_string());
+    pub fn background_write_block(chat: MakiId, owner: Option<CancelToken>) -> Option<String> {
+        let planning = || {
+            let owner = owner.as_ref()?;
+            let live = lock(&LIVE_SESSIONS).get(&chat)?.upgrade()?;
+            let published = lock(&live.seed);
+            if owner.is_cancelled() || !published.generation.as_ref()?.same_token(owner) {
+                return None;
+            }
+            published
+                .seed
+                .upgrade()
+                .map(|seed| lock(&seed.chat_settings).1)
+                .or(published.headless_planning.as_ref().map(|mode| match mode {
+                    HeadlessPlanning::Run(planning) | HeadlessPlanning::Client(planning) => {
+                        *planning
+                    }
+                }))
         };
-        let (_, planning) = *lock(&seed.chat_settings);
-        planning.then(|| BACKGROUND_PLAN_WRITE_DENIED.to_owned())
+        match planning() {
+            Some(true) => Some(BACKGROUND_PLAN_WRITE_DENIED.to_owned()),
+            Some(false) => None,
+            None => Some(MailboxError::NotLive(chat).to_string()),
+        }
     }
 
     /// No chat shows this work, so its events go to a channel nobody reads.
@@ -848,7 +893,7 @@ mod tests {
         assert_eq!(ctx.mode, AgentMode::Build);
         assert_eq!(ctx.background_for, Some(id));
         assert_eq!(
-            AgentSeed::background_write_block(id).as_deref(),
+            AgentSeed::background_write_block(id, AgentSeed::generation(id)).as_deref(),
             Some(BACKGROUND_PLAN_WRITE_DENIED)
         );
     }
@@ -859,11 +904,14 @@ mod tests {
         let id = MakiId::generate();
         let mailbox = SessionMailbox::register(id);
         let seed = mailbox.publish_seed(stub_seed(id));
-        assert_eq!(AgentSeed::background_write_block(id), None);
+        assert_eq!(
+            AgentSeed::background_write_block(id, AgentSeed::generation(id)),
+            None
+        );
 
         drop(seed);
         assert_eq!(
-            AgentSeed::background_write_block(id),
+            AgentSeed::background_write_block(id, AgentSeed::generation(id)),
             Some(MailboxError::NotLive(id).to_string())
         );
     }
