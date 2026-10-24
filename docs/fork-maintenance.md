@@ -110,6 +110,11 @@ Keep the title and description equal to the final diff. The maintainer
 reviews the description, and behavior it advertises but the diff lacks is a
 review finding.
 
+Before opening a PR, and before each push that answers its review, run the
+`maki-ci-review` skill in `.claude/skills/`. It runs the upstream review bot's
+audit locally and never posts, so its findings are fixed before the bot
+raises them.
+
 Keep the branch rebased. Upstream `main` moves daily and a review can require
 a rebase before it continues.
 
