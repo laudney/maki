@@ -37,7 +37,7 @@ On macOS, some bindings use Option or Fn keys instead (run `/help` for exact key
 | `PageUp` / `PageDown` | Scroll page up / down |
 | `Ctrl+E` | Jump to end of line |
 | `Ctrl+G` | Scroll to top |
-| `Ctrl+B` | Scroll to bottom |
+| `Ctrl+Alt+G` | Scroll to bottom |
 | `Ctrl+Q` | Pop queue |
 | `Esc Esc` | Rewind |
 | `Alt+O` | Edit input in external editor |

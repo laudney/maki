@@ -972,10 +972,6 @@ impl App {
             self.active_chat().scroll_to_top();
             return Some(vec![]);
         }
-        if key::SCROLL_BOTTOM.matches(key) {
-            self.active_chat().enable_auto_scroll();
-            return Some(vec![]);
-        }
         None
     }
 
@@ -1304,6 +1300,10 @@ impl App {
         if key::SCROLL_PAGE_DOWN.matches(key) {
             let page = self.chats[self.active_chat].page();
             self.active_chat().scroll(-page);
+            return vec![];
+        }
+        if key::SCROLL_BOTTOM.matches(key) {
+            self.active_chat().enable_auto_scroll();
             return vec![];
         }
 
