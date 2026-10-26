@@ -321,13 +321,13 @@ local function handler(input, ctx)
   view:append({ { "Waiting for output...", "dim" } })
 
   local waiting = true
-  local output_parts = {}
+  local output_capture = output_limits.collect(opts, ctx)
   local function show(line)
     if waiting then
       waiting = false
       view:clear()
     end
-    output_parts[#output_parts + 1] = line
+    output_capture:append(line)
     view:append(line)
   end
 
@@ -337,14 +337,7 @@ local function handler(input, ctx)
   -- again as the interpreter's error, and the view is painted only once.
   local cut_reply
   local function cut(reason)
-    cut_reply = cut_reply
-      or partial.cut(
-        view,
-        truncate(table.concat(output_parts, "\n"), max_lines, max_bytes),
-        reason,
-        timeout,
-        started_at
-      )
+    cut_reply = cut_reply or partial.cut(view, output_capture:result(), reason, timeout, started_at)
     return cut_reply
   end
 

@@ -2373,6 +2373,8 @@ Requires the `run` [plugin permission](#plugin-permissions).
 - `{opts?}` (`table?`) Optional settings:
   - `cwd` (`string?`) working directory (tilde is expanded).
   - `env` (`table?`) extra environment variables, `{ VAR = "value" }`.
+  - `output` (`userdata?`) collector from `require("maki.output_limits").collect`.
+    Captures output before Lua callbacks, which receive short preview lines.
   - `on_stdout` (`function?`) called with `(job_id, line)` for each stdout line.
   - `on_stderr` (`function?`) called with `(job_id, line)` for each stderr line.
   - `on_exit` (`function?`) called with `(job_id, code)` when the process finishes.
@@ -7794,23 +7796,18 @@ ListPicker.range_spans = range_spans
 ### `require("maki.output_limits")`
 
 ```lua
--- Shared per-tool output limit options, so the tools that support them
--- cannot drift apart.
-M.DEFAULT_MAX_LINE_BYTES = DEFAULT_MAX_LINE_BYTES
-function M.extend(spec)
-
---- Returns max_lines, max_bytes: tool override when set, agent-wide otherwise.
---- Both nil in full mode.
-function M.resolve(opts, ctx)
-
---- opts.max_line_bytes, or 0 (no limit) in full mode.
-function M.line_bytes(opts, ctx)
-
---- Cuts {text} to the limits keeping its head and its tail, since on a long
---- build or test run the errors and the summary sit at the end. Each end gets
---- half of every limit. A nil limit is unlimited. The marker between the two
---- notes how many lines and bytes it dropped.
-function M.cut_middle(text, max_lines, max_bytes)
+-- Rust-backed output helpers.
+limits.DEFAULT_MAX_LINE_BYTES
+limits.specs -- max_output_lines and max_output_bytes option specs
+limits.extend(spec) -- add output option specs
+limits.resolve(opts, ctx) -- max_lines, max_bytes; nil in full mode
+limits.line_bytes(opts, ctx) -- max_line_bytes; zero in full mode
+limits.cut_middle(text, max_lines, max_bytes) -- keep both ends within the limits
+limits.collect(opts, ctx) -- native collector keeping the head
+limits.collect_middle(opts, ctx) -- native collector keeping both ends
+collector:append(line) -- add a line without retaining it in Lua
+collector:result() -- bounded text and an omitted-byte notice
+-- jobstart accepts { output = collector } to capture before Lua previews.
 ```
 
 ### `require("maki.partial")`
@@ -8054,8 +8051,7 @@ function ToolView.restore_markdown(output, is_error, opts)
 ### `require("maki.truncate")`
 
 ```lua
---- require("maki.truncate")(text, max_lines, max_bytes)
---- Cuts {text} to the limits and notes how many bytes it dropped. A nil limit
---- is unlimited.
+-- Rust-backed function. Nil limits are unlimited.
+truncate(text, max_lines, max_bytes) -- string with an omitted-byte notice
 ```
 
