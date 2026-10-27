@@ -103,7 +103,8 @@ end
 
 -- opts: max_lines (default 80) shown while collapsed, keep "head"|"tail"
 -- (default "tail"), max_expand_lines (default 2000) kept for expansion,
--- max_line_bytes (optional) per-line byte cap applied at render time.
+-- max_line_bytes (optional) per-line byte cap. Lines are stored already cut,
+-- so a run of huge lines costs no more than short ones while kept for expansion.
 function ToolView.new(buf, opts)
   local self = setmetatable({}, ToolView)
   self.buf = buf
@@ -140,6 +141,7 @@ function ToolView:clear()
 end
 
 function ToolView:append(line)
+  line = truncate_line(line, self.max_line_bytes)
   local all_idx
   if #self.all_lines < self.max_expand_lines then
     self.all_lines[#self.all_lines + 1] = line
@@ -278,6 +280,7 @@ function ToolView:flush()
 end
 
 function ToolView:update_line(all_idx, line)
+  line = truncate_line(line, self.max_line_bytes)
   self.all_lines[all_idx] = line
   for ri = 1, self.ring_count do
     if self.ring_map[ri] == all_idx then

@@ -8890,7 +8890,8 @@ function ToolView.line_nr_fmt(max_line_nr)
 
 -- opts: max_lines (default 80) shown while collapsed, keep "head"|"tail"
 -- (default "tail"), max_expand_lines (default 2000) kept for expansion,
--- max_line_bytes (optional) per-line byte cap applied at render time.
+-- max_line_bytes (optional) per-line byte cap. Lines are stored already cut,
+-- so a run of huge lines costs no more than short ones while kept for expansion.
 function ToolView.new(buf, opts)
 function ToolView:set_header(lines)
 function ToolView:clear()
