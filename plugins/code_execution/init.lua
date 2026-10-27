@@ -129,11 +129,11 @@ local description = [[Execute a Python subset (Monty) in a sandbox where every t
 
 Use for chained/dependent tool calls and filtering results before they enter context.
 
-- Tools are already in scope: `result = await read(path='file.txt', offset=1, limit=0)`. No `import tools` or `tools.read`. All tools are async and return strings, not objects. Parse output yourself.
+- Tools are globals: `result = await read(path='file.txt', offset=1, limit=0)`. No `tools` module. They return strings; parse output yourself.
 - Tool results are complete. Only what you print/return is capped.
 - Concurrency: `a, b = await gather(read(path='a.py', offset=1, limit=0), grep(pattern='x'))`. Pass calls directly, never wrapped in `async def`.
-- Preloaded modules: re, asyncio, sys, os, json. Import others, such as pathlib, yourself. No network access. `open()` works on text files, and `os`/`pathlib` can stat, list, walk, glob and mkdir.
-- Their APIs are limited: no `sys.exit` or `asyncio.create_task`. Use `await bash(command='...')` for shell commands, full Python or installed packages. No direct process access.
+- Preloaded: re, asyncio, sys, os, json; import others such as pathlib. No network. `open()` works on text files, and `os`/`pathlib` can stat, list, walk, glob and mkdir. No `sys.exit` or `asyncio.create_task`.
+- Use `bash` for shell commands or full Python.
 - Fresh sandbox each run: no state persists between executions.
 - 30s script timeout (`timeout` param); time awaiting tool calls doesn't count.
 - Skip it when a single tool call needs no transformation.
