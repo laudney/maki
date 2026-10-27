@@ -1,5 +1,16 @@
 Maki is an AI coding agent (like Claude Code and opencode), that is built bottom up to optimize costs and number of tokens used, while not sacrificing performance too much.
 
+## Upstream development
+
+Before planning fork work or proposing changes upstream, read the
+[upstream maintainer guide](docs/upstream-maintainer-guide.md). It records
+upstream's public requirements, architecture preferences, review expectations,
+and contribution playbook. Current upstream repository instructions take
+priority over the guide.
+
+For fork updates, also read [the maintenance guide](docs/fork-maintenance.md).
+It maps each extension to its owner and regression checks.
+
 ## Code guidelines
 
 - No trivial comments
