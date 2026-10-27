@@ -5,12 +5,13 @@ use std::io::{BufRead, BufReader};
 use std::mem;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
+use event_listener::{Event, Listener};
 use maki_config::ShellPreference;
 use maki_lua_macro::{lua_fn, lua_table};
 use maki_providers::{shell_command, strip_provider_keys};
@@ -32,6 +33,15 @@ const MAX_COMPLETED_SESSION_JOBS: usize = 256;
 const DEFAULT_WAIT_MS: u64 = 30_000;
 
 const READER_BUF_SIZE: usize = 8 * 1024;
+/// Unread output a job may queue while Lua is busy. Past this its readers
+/// wait, so the pipe fills and the child blocks on write until callbacks
+/// catch up. Far above what a job normally has unread, so only a runaway
+/// command ever meets it.
+const JOB_QUEUE_BYTES: usize = 16 * 1024 * 1024;
+/// How far a full queue drains before its readers go on. Waking them for
+/// every freed line cost a cross-thread wake per line, about a third of a
+/// saturated run's time.
+const JOB_QUEUE_RESUME: usize = JOB_QUEUE_BYTES / 2;
 
 const NO_TASK_SCOPE_ERR: &str =
     "jobstart: no active task; use scope = \"plugin\" or { session = ... }";
@@ -176,7 +186,8 @@ struct JobMeta {
     on_stderr: Option<RegistryKey>,
     on_exit: Option<RegistryKey>,
     ceiling: Option<Ceiling>,
-    event_rx: Option<flume::Receiver<JobEvent>>,
+    event_rx: Option<JobEvents>,
+    _queue: QueueOwner,
     stdout_tail: VecDeque<String>,
     stderr_tail: VecDeque<String>,
     tail_cap: usize,
@@ -274,7 +285,7 @@ pub(crate) struct JobStore {
 struct CheckedOutReceiver {
     lua: Lua,
     job_id: u32,
-    receiver: Option<flume::Receiver<JobEvent>>,
+    receiver: Option<JobEvents>,
 }
 
 impl JobStore {
@@ -335,12 +346,14 @@ impl JobStore {
         let id = self.next_id;
         self.next_id += 1;
 
-        let (event_tx, event_rx) = flume::unbounded();
+        // The owner exists before any thread does, so a failed spawn below
+        // still closes the queue on a reader that is already waiting on it.
+        let (sender, events, queue) = job_queue();
 
         macro_rules! spawn_reader {
             ($stream:expr, $name:expr, $variant:ident) => {
                 if let Some(stream) = $stream {
-                    let tx = event_tx.clone();
+                    let sender = sender.clone();
                     Some(
                         thread::Builder::new()
                             .name($name.into())
@@ -349,7 +362,7 @@ impl JobStore {
                                     .lines()
                                     .map_while(Result::ok)
                                 {
-                                    if tx.send(JobEvent::$variant(line)).is_err() {
+                                    if !sender.send(JobEvent::$variant(line)) {
                                         break;
                                     }
                                 }
@@ -381,7 +394,7 @@ impl JobStore {
                 }
                 let code = child.wait().map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
                 wait_reaped.store(true, Ordering::Relaxed);
-                let _ = event_tx.send(JobEvent::Exit(code));
+                sender.send(JobEvent::Exit(code));
             })
             .map_err(|e| e.to_string())?;
 
@@ -397,7 +410,8 @@ impl JobStore {
                 on_stderr,
                 on_exit,
                 ceiling,
-                event_rx: Some(event_rx),
+                event_rx: Some(events),
+                _queue: queue,
                 stdout_tail: VecDeque::new(),
                 stderr_tail: VecDeque::new(),
                 tail_cap: DEFAULT_TAIL,
@@ -445,13 +459,13 @@ impl JobStore {
         job_id: u32,
         task_id: Option<u64>,
         plugin: &str,
-    ) -> Option<flume::Receiver<JobEvent>> {
+    ) -> Option<JobEvents> {
         let job = self.jobs.get_mut(&job_id)?;
         job.can_access(task_id, plugin)
             .then(|| job.event_rx.take())?
     }
 
-    pub fn restore_receiver(&mut self, job_id: u32, receiver: flume::Receiver<JobEvent>) {
+    pub fn restore_receiver(&mut self, job_id: u32, receiver: JobEvents) {
         if let Some(job) = self.jobs.get_mut(&job_id)
             && job.event_rx.is_none()
         {
@@ -486,7 +500,7 @@ impl JobStore {
         if let Some(code) = job.replay_exit.take() {
             return Some(JobEvent::Exit(code));
         }
-        job.event_rx.as_ref()?.try_recv().ok()
+        job.event_rx.as_ref()?.try_recv()
     }
 
     /// Round-robins over the jobs holding events: taking the first match every
@@ -721,7 +735,7 @@ impl Drop for JobStore {
 }
 
 impl CheckedOutReceiver {
-    fn new(lua: &Lua, job_id: u32, receiver: flume::Receiver<JobEvent>) -> Self {
+    fn new(lua: &Lua, job_id: u32, receiver: JobEvents) -> Self {
         Self {
             lua: lua.clone(),
             job_id,
@@ -729,7 +743,7 @@ impl CheckedOutReceiver {
         }
     }
 
-    fn get(&self) -> &flume::Receiver<JobEvent> {
+    fn get(&self) -> &JobEvents {
         self.receiver.as_ref().expect("receiver is checked out")
     }
 }
@@ -808,6 +822,123 @@ fn drop_callbacks(lua: &Lua, job: &mut JobMeta) {
     }
 }
 
+/// Counts the bytes a job has queued. Readers wait here once the count hits
+/// [`JOB_QUEUE_BYTES`] and go on when consumers drain it to
+/// [`JOB_QUEUE_RESUME`]. Dropping the job closes it for good, which frees
+/// them even while `jobwait` holds the receiver inside a callback that is
+/// not draining.
+#[derive(Default)]
+struct JobQueue {
+    bytes: AtomicUsize,
+    drained: Event,
+    closed: AtomicBool,
+}
+
+impl JobQueue {
+    fn is_full(&self) -> bool {
+        self.bytes.load(Ordering::Acquire) >= JOB_QUEUE_BYTES
+    }
+
+    fn popped(&self, event: &JobEvent) {
+        let cost = queued_bytes(event);
+        let before = self
+            .bytes
+            .update(Ordering::AcqRel, Ordering::Acquire, |bytes| {
+                bytes.saturating_sub(cost)
+            });
+        let left = before.saturating_sub(cost);
+        if left <= JOB_QUEUE_RESUME {
+            self.drained.notify(usize::MAX);
+        }
+    }
+}
+
+/// What an event holds in the queue. The fixed part keeps a flood of empty
+/// lines from queueing without bound, as `read_line_page` charges per line.
+fn queued_bytes(event: &JobEvent) -> usize {
+    size_of::<JobEvent>()
+        + match event {
+            JobEvent::Stdout(line) | JobEvent::Stderr(line) => line.len(),
+            JobEvent::Exit(_) => 0,
+        }
+}
+
+/// A job's receiving end. Taking an event through it settles that event's
+/// bytes with the [`JobQueue`], so no consumer can forget to and leave the
+/// readers waiting on a queue that is long drained.
+pub(crate) struct JobEvents {
+    rx: flume::Receiver<JobEvent>,
+    queue: Arc<JobQueue>,
+}
+
+impl JobEvents {
+    fn try_recv(&self) -> Option<JobEvent> {
+        let event = self.rx.try_recv().ok()?;
+        self.queue.popped(&event);
+        Some(event)
+    }
+
+    async fn recv_async(&self) -> Option<JobEvent> {
+        let event = self.rx.recv_async().await.ok()?;
+        self.queue.popped(&event);
+        Some(event)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.rx.is_empty()
+    }
+}
+
+struct QueueOwner(Arc<JobQueue>);
+
+impl Drop for QueueOwner {
+    fn drop(&mut self) {
+        self.0.closed.store(true, Ordering::Release);
+        self.0.drained.notify(usize::MAX);
+    }
+}
+
+/// The sending, receiving and owning ends of one job's queue.
+fn job_queue() -> (JobEventSender, JobEvents, QueueOwner) {
+    let (tx, rx) = flume::unbounded();
+    let queue = Arc::new(JobQueue::default());
+    let sender = JobEventSender {
+        tx,
+        queue: Arc::clone(&queue),
+    };
+    let events = JobEvents {
+        rx,
+        queue: Arc::clone(&queue),
+    };
+    (sender, events, QueueOwner(queue))
+}
+
+#[derive(Clone)]
+struct JobEventSender {
+    tx: flume::Sender<JobEvent>,
+    queue: Arc<JobQueue>,
+}
+
+impl JobEventSender {
+    /// Returns false once the job is gone, so the reader can stop.
+    fn send(&self, event: JobEvent) -> bool {
+        while self.queue.is_full() {
+            // Listen before looking, so a drain in between still wakes us.
+            let drained = self.queue.drained.listen();
+            if self.queue.closed.load(Ordering::Acquire) {
+                return false;
+            }
+            if self.queue.bytes.load(Ordering::Acquire) > JOB_QUEUE_RESUME {
+                drained.wait();
+            }
+        }
+        self.queue
+            .bytes
+            .fetch_add(queued_bytes(&event), Ordering::AcqRel);
+        self.tx.send(event).is_ok()
+    }
+}
+
 /// Signalling a reaped pid would hit whoever the kernel handed it to next, so
 /// skip the jobs the wait thread already reaped. Until then the child is a
 /// zombie, and a zombie group leader keeps its pid and pgid off the free list,
@@ -843,6 +974,11 @@ fn kill_job(job: &JobMeta) {
 /// pipe, or `$(...)`.
 /// You get back a job id that you can pass to `jobstop` or `jobwait` to
 /// control the process.
+///
+/// Output nobody has read yet waits in a queue of up to 16 MiB per job.
+/// Past that the child blocks on write until `on_stdout` / `on_stderr` or
+/// `jobwait` drain it, so a job started where nothing delivers its events,
+/// like a tool handler before it returns, pauses there.
 ///
 /// `stdout` and `stderr` route a stream to a file instead of into maki. A
 /// path is opened for append and handed to the child, so nothing is buffered
@@ -1269,12 +1405,11 @@ async fn jobwait(
     let mut stderr_lines = Vec::new();
 
     let exit_code = loop {
-        let event =
-            futures_lite::future::or(async { receiver.get().recv_async().await.ok() }, async {
-                (&mut deadline).await;
-                None
-            })
-            .await;
+        let event = futures_lite::future::or(async { receiver.get().recv_async().await }, async {
+            (&mut deadline).await;
+            None
+        })
+        .await;
 
         let Some(event) = event else {
             return Ok(err_pair(JOB_WAIT_TIMEOUT_ERR));
@@ -1466,7 +1601,7 @@ mod tests {
     use crate::api::util::command::{NO_UI_ERR, WinView};
 
     const TEST_PLUGIN: &str = "test-plugin";
-    const JOB_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
+    const JOB_EXIT_TIMEOUT: Duration = Duration::from_secs(30);
     const JOB_POLL_INTERVAL: Duration = Duration::from_millis(10);
     #[cfg(unix)]
     const EXIT_WITHOUT_REAP: &str =
@@ -1536,6 +1671,7 @@ mod tests {
             on_exit,
             ceiling: None,
             event_rx: None,
+            _queue: QueueOwner(Arc::default()),
             stdout_tail: VecDeque::new(),
             stderr_tail: VecDeque::new(),
             tail_cap: DEFAULT_TAIL,
@@ -1613,7 +1749,7 @@ mod tests {
         assert!(!store.is_empty(&owner));
         let receiver = store.take_receiver(id, Some(1), TEST_PLUGIN).unwrap();
         while !matches!(
-            receiver.recv_timeout(Duration::from_secs(5)).unwrap(),
+            receiver.rx.recv_timeout(Duration::from_secs(5)).unwrap(),
             JobEvent::Exit(_)
         ) {}
 
@@ -1725,7 +1861,7 @@ mod tests {
         let mut got_exit = false;
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while std::time::Instant::now() < deadline {
-            match rx.recv_timeout(Duration::from_millis(200)) {
+            match rx.rx.recv_timeout(Duration::from_millis(200)) {
                 Ok(JobEvent::Exit(_)) => {
                     got_exit = true;
                     break;
@@ -1770,12 +1906,13 @@ mod tests {
         const QUEUED_PER_JOB: usize = 2;
         let mut store = make_store();
         for id in [1, 2] {
-            let (tx, rx) = flume::unbounded();
+            let (sender, events, queue) = job_queue();
             for _ in 0..QUEUED_PER_JOB {
-                tx.send(JobEvent::Stdout("spam".into())).unwrap();
+                sender.send(JobEvent::Stdout("spam".into()));
             }
             let mut job = stub_job(task_owner(1), None, None);
-            job.event_rx = Some(rx);
+            job.event_rx = Some(events);
+            job._queue = queue;
             store.jobs.insert(id, job);
         }
 
@@ -2399,5 +2536,147 @@ mod tests {
             "exited session job must stay listed"
         );
         store.kill_session(&lua, session);
+    }
+
+    #[cfg(unix)]
+    mod backpressure {
+        use super::*;
+
+        /// Prints 4 KiB lines forever: a few thousand of them fill the queue,
+        /// fast enough on a slow CI runner.
+        const FLOOD_CMD: &str = "yes \"$(printf '%04096d' 0)\"";
+        /// Long lines, so filling the queue takes fewer of them.
+        const PADDED_LINE_BYTES: usize = 4096;
+        const NEVER_FILLED: &str = "the job's queue never filled";
+        const NEVER_RELEASED: &str = "a reader blocked on a full queue was never released";
+
+        fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+            let deadline = Instant::now() + JOB_EXIT_TIMEOUT;
+            while !done() {
+                assert!(Instant::now() < deadline, "{what}");
+                thread::sleep(JOB_POLL_INTERVAL);
+            }
+        }
+
+        /// Starts {cmd} and waits for its queue to fill, so its readers are
+        /// parked on a send.
+        fn start_blocked(store: &mut JobStore, owner: JobOwner, cmd: &str) -> u32 {
+            let id = store.start(JobSpec::new(owner, cmd)).unwrap();
+            let queue = Arc::clone(
+                &store.jobs[&id]
+                    .event_rx
+                    .as_ref()
+                    .expect("receiver in store")
+                    .queue,
+            );
+            wait_until(NEVER_FILLED, || queue.is_full());
+            id
+        }
+
+        #[test]
+        fn blocked_reader_delivers_every_line_in_order() {
+            let lines = 2 * JOB_QUEUE_BYTES / PADDED_LINE_BYTES;
+            let mut store = make_store();
+            let cmd = format!("seq -f %0{PADDED_LINE_BYTES}g 1 {lines}");
+            let id = start_blocked(&mut store, task_owner(1), &cmd);
+            assert!(
+                !store.jobs[&id].reaped.load(Ordering::Relaxed),
+                "a parked reader must hold off the reap"
+            );
+
+            let events = collect_until_exit(id, || store.next_event(&task_owner(1)));
+
+            let stdout: Vec<String> = events
+                .iter()
+                .filter_map(|(_, event)| match event {
+                    JobEvent::Stdout(line) => Some(line.clone()),
+                    _ => None,
+                })
+                .collect();
+            let expected: Vec<String> = (1..=lines)
+                .map(|n| format!("{n:0PADDED_LINE_BYTES$}"))
+                .collect();
+            assert_eq!(stdout, expected);
+            assert!(matches!(events.last(), Some((_, JobEvent::Exit(0)))));
+        }
+
+        enum Teardown {
+            KillTask,
+            KillPlugin,
+            KillSession,
+            DropStore,
+            RemoveWhileCheckedOut,
+        }
+
+        /// The checked-out case is `jobwait` holding the receiver inside a
+        /// callback: nothing drains it, so only closing the job's queue can
+        /// release the readers and the wait thread.
+        #[test_case::test_case(Teardown::KillTask ; "kill_task")]
+        #[test_case::test_case(Teardown::KillPlugin ; "kill_plugin")]
+        #[test_case::test_case(Teardown::KillSession ; "kill_session")]
+        #[test_case::test_case(Teardown::DropStore ; "drop_store")]
+        #[test_case::test_case(Teardown::RemoveWhileCheckedOut ; "remove_while_checked_out")]
+        fn teardown_releases_blocked_readers(teardown: Teardown) {
+            let lua = Lua::new();
+            let session = MakiId::generate();
+            let owner = match teardown {
+                Teardown::KillPlugin => plugin_owner(),
+                Teardown::KillSession => session_owner(session),
+                _ => task_owner(1),
+            };
+            let mut store = make_store();
+            let id = start_blocked(&mut store, owner.clone(), FLOOD_CMD);
+            let reaped = Arc::clone(&store.jobs[&id].reaped);
+            let held = matches!(teardown, Teardown::RemoveWhileCheckedOut)
+                .then(|| store.take_receiver(id, Some(1), TEST_PLUGIN).unwrap());
+
+            match teardown {
+                Teardown::KillSession => store.kill_session(&lua, session),
+                Teardown::DropStore => drop(store),
+                _ => {
+                    store.kill_owner(&lua, &owner);
+                }
+            }
+
+            wait_until(NEVER_RELEASED, || reaped.load(Ordering::Relaxed));
+            if let Some(rx) = held {
+                wait_until(NEVER_RELEASED, || rx.rx.is_disconnected());
+            }
+        }
+
+        #[test]
+        fn jobstop_on_a_blocked_job_drains_to_exit() {
+            let mut store = make_store();
+            let id = start_blocked(&mut store, task_owner(1), FLOOD_CMD);
+
+            store.kill(id, Some(1), TEST_PLUGIN);
+            let events = collect_until_exit(id, || store.next_event(&task_owner(1)));
+
+            let delivered: usize = events.iter().map(|(_, event)| queued_bytes(event)).sum();
+            assert!(delivered > JOB_QUEUE_BYTES, "queued lines were lost");
+            assert!(matches!(events.last(), Some((_, JobEvent::Exit(_)))));
+        }
+
+        #[test]
+        fn forget_keeps_a_blocked_job_until_it_exits() {
+            let lua = Lua::new();
+            let mut store = make_store();
+            let id = start_blocked(&mut store, session_owner(MakiId::generate()), FLOOD_CMD);
+
+            store.forget(&lua, id, None, TEST_PLUGIN);
+            assert!(
+                store.snapshot(id, None, TEST_PLUGIN).is_some(),
+                "a job that has not exited must survive forget"
+            );
+
+            store.kill(id, None, TEST_PLUGIN);
+            let events = collect_until_exit(id, || next_plugin_event(&mut store));
+            let Some((_, JobEvent::Exit(code))) = events.last() else {
+                panic!("{NEVER_EXITED}");
+            };
+            store.complete(&lua, id, *code);
+            store.forget(&lua, id, None, TEST_PLUGIN);
+            assert!(store.snapshot(id, None, TEST_PLUGIN).is_none());
+        }
     }
 }

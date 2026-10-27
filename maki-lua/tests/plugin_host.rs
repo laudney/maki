@@ -8876,7 +8876,7 @@ mod session_owned_ui {
 }
 
 const PARK_MS: u64 = 600_000;
-const DELIVERY_POLLS: usize = 500;
+const DELIVERY_POLLS: usize = 3000;
 const DELIVERY_POLL_MS: u64 = 10;
 const SECOND_JOB_EXIT: i32 = 3;
 
@@ -8930,4 +8930,37 @@ maki.api.register_tool({{
     exec_tool(&reg, "start_jobs", json!({})).unwrap();
     let out = exec_tool(&reg, "second_exit", json!({})).unwrap();
     assert_eq!(out, format!("exit={SECOND_JOB_EXIT}"));
+}
+
+/// Twice the 16 MiB a job may queue, so `jobwait` only sees the end if the
+/// lines it takes free the job's readers again.
+#[cfg(unix)]
+const PAST_BOUND_LINES: usize = 2 * 16 * 1024 * 1024 / PADDED_LINE_BYTES;
+#[cfg(unix)]
+const PADDED_LINE_BYTES: usize = 4096;
+#[cfg(unix)]
+const PAST_BOUND_WAIT_MS: u64 = 20_000;
+
+#[cfg(unix)]
+#[test]
+fn jobwait_drains_a_job_past_its_queue_bound() {
+    let src = format!(
+        r#"maki.api.register_tool({{
+    name = "wait_past_bound",
+    description = "t",
+    schema = {MINIMAL_SCHEMA},
+    handler = function()
+        local id = maki.fn.jobstart("seq -f %0{PADDED_LINE_BYTES}g 1 {PAST_BOUND_LINES}")
+        local result, err = maki.fn.jobwait(id, {PAST_BOUND_WAIT_MS})
+        if not result then return "error: " .. err end
+        return tostring(#result.stdout)
+    end,
+}})"#
+    );
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source("past_bound_plugin", &src).unwrap();
+    let out = exec_tool(&reg, "wait_past_bound", json!({})).unwrap();
+    let expected = PAST_BOUND_LINES * (PADDED_LINE_BYTES + 1) - 1;
+    assert_eq!(out, expected.to_string());
 }

@@ -2508,6 +2508,11 @@ pipe, or `$(...)`.
 You get back a job id that you can pass to `jobstop` or `jobwait` to
 control the process.
 
+Output nobody has read yet waits in a queue of up to 16 MiB per job.
+Past that the child blocks on write until `on_stdout` / `on_stderr` or
+`jobwait` drain it, so a job started where nothing delivers its events,
+like a tool handler before it returns, pauses there.
+
 `stdout` and `stderr` route a stream to a file instead of into maki. A
 path is opened for append and handed to the child, so nothing is buffered
 here: no callback, no tail, no events for that stream, and it counts as
