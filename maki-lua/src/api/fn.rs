@@ -466,12 +466,27 @@ impl JobStore {
         self.next_matching(|job| job.owner == *owner)
     }
 
-    /// [`Self::next_event`] for the jobs the host pumps: plugin-owned ones and
-    /// session-owned ones, which outlive the task that started them.
-    pub fn next_plugin_event(&mut self) -> Option<(u32, JobEvent)> {
-        self.next_matching(|job| {
-            matches!(job.owner, JobOwner::Plugin(_) | JobOwner::Session { .. })
-        })
+    /// Jobs the host pumps that hold events: plugin-owned ones and
+    /// session-owned ones, which outlive the task that started them. The
+    /// host delivers each on a task of its own.
+    pub fn plugin_jobs_with_events(&self) -> Vec<u32> {
+        self.jobs
+            .iter()
+            .filter(|(_, job)| {
+                matches!(job.owner, JobOwner::Plugin(_) | JobOwner::Session { .. })
+                    && job.has_pending()
+            })
+            .map(|(&id, _)| id)
+            .collect()
+    }
+
+    /// Pop one queued event of {job_id}, a replayed exit first.
+    pub fn next_event_of(&mut self, job_id: u32) -> Option<JobEvent> {
+        let job = self.jobs.get_mut(&job_id)?;
+        if let Some(code) = job.replay_exit.take() {
+            return Some(JobEvent::Exit(code));
+        }
+        job.event_rx.as_ref()?.try_recv().ok()
     }
 
     /// Round-robins over the jobs holding events: taking the first match every
@@ -490,11 +505,7 @@ impl JobStore {
         }
         let id = past_cursor.or(lowest)?;
         self.scan_cursor = id;
-        let job = self.jobs.get_mut(&id)?;
-        if let Some(code) = job.replay_exit.take() {
-            return Some((id, JobEvent::Exit(code)));
-        }
-        Some((id, job.event_rx.as_ref()?.try_recv().ok()?))
+        Some((id, self.next_event_of(id)?))
     }
 
     pub fn record_event(&mut self, job_id: u32, event: &JobEvent) {
@@ -1489,6 +1500,11 @@ mod tests {
         JobStore::new()
     }
 
+    fn next_plugin_event(store: &mut JobStore) -> Option<(u32, JobEvent)> {
+        let id = *store.plugin_jobs_with_events().iter().min()?;
+        store.next_event_of(id).map(|event| (id, event))
+    }
+
     fn task_owner(id: u64) -> JobOwner {
         JobOwner::Task(id)
     }
@@ -1733,7 +1749,7 @@ mod tests {
         let task_events = collect_until_exit(id, || store.next_event(&task_owner(1)));
         assert!(task_events.iter().all(|(job_id, _)| *job_id != plugin_id));
 
-        let plugin_events = collect_until_exit(plugin_id, || store.next_plugin_event());
+        let plugin_events = collect_until_exit(plugin_id, || next_plugin_event(&mut store));
         assert!(plugin_events.iter().all(|(job_id, _)| *job_id != id));
     }
 
@@ -1960,7 +1976,7 @@ mod tests {
         store.detach_plugin_callbacks(&lua, TEST_PLUGIN);
         assert!(store.jobs.contains_key(&id), "detach must keep the job");
 
-        for (_, event) in collect_until_exit(id, || store.next_plugin_event()) {
+        for (_, event) in collect_until_exit(id, || next_plugin_event(&mut store)) {
             store.record_event(id, &event);
         }
         store.complete(&lua, id, 3);
@@ -2152,11 +2168,11 @@ mod tests {
 
         assert!(store.attach(&lua, 1, None, TEST_PLUGIN, exit_updates(&lua)));
 
-        let (id, event) = store.next_plugin_event().expect("replayed exit");
+        let (id, event) = next_plugin_event(&mut store).expect("replayed exit");
         assert_eq!(id, 1);
         assert!(matches!(event, JobEvent::Exit(CODE)));
         assert!(
-            store.next_plugin_event().is_none(),
+            next_plugin_event(&mut store).is_none(),
             "the replay must be served once"
         );
 
@@ -2184,7 +2200,7 @@ mod tests {
         assert!(!store.attach(&lua, 1, None, "other-plugin", exit_updates(&lua)));
         assert!(!store.attach(&lua, 999, None, TEST_PLUGIN, exit_updates(&lua)));
         assert!(
-            store.next_plugin_event().is_none(),
+            next_plugin_event(&mut store).is_none(),
             "a refused attach must not queue a replay"
         );
     }
@@ -2362,7 +2378,7 @@ mod tests {
         let id = store
             .start(JobSpec::new(session_owner(session), "sleep 0.1"))
             .unwrap();
-        for (_, event) in collect_until_exit(id, || store.next_plugin_event()) {
+        for (_, event) in collect_until_exit(id, || next_plugin_event(&mut store)) {
             store.record_event(id, &event);
         }
         assert!(

@@ -2385,6 +2385,20 @@ async fn deliver_pending(
     }
 }
 
+/// Deliver what {job_id} has queued, then leave {delivering} so the next
+/// event it queues gets a task again. The delivery scope republishes the
+/// task handle across callback yields: an unscoped resume would run with no
+/// task, out of the watchdog's reach.
+async fn deliver_job(lua: Lua, job_id: u32, delivering: Rc<RefCell<HashSet<u32>>>) {
+    let scope = TaskScope::delivery(&lua);
+    scope
+        .scope_future(deliver_pending(&lua, usize::MAX, || {
+            with_jobs(&lua, |store| store.next_event_of(job_id)).map(|event| (job_id, event))
+        }))
+        .await;
+    delivering.borrow_mut().remove(&job_id);
+}
+
 impl Drop for TaskScope {
     fn drop(&mut self) {
         let task_id = {
@@ -5473,23 +5487,21 @@ pub fn spawn(
             .detach();
             {
                 let lua = rt.lua.clone();
+                // Weak, or the executor would own a task that owns it back.
+                let host = Rc::downgrade(&ex);
                 ex.spawn(async move {
+                    // One task per job, so a callback parked on a prompt or a
+                    // request holds back only its own job's events.
+                    let delivering = Rc::new(RefCell::new(HashSet::new()));
                     loop {
-                        // Pop before building the scope so an idle pump costs
-                        // nothing. The delivery scope republishes the task
-                        // handle across callback yields: an unscoped resume
-                        // would run with no task, out of the watchdog's reach.
-                        if let Some(first) = with_jobs(&lua, |store| store.next_plugin_event()) {
-                            let mut first = Some(first);
-                            let scope = TaskScope::delivery(&lua);
-                            scope
-                                .scope_future(deliver_pending(&lua, usize::MAX, || {
-                                    first
-                                        .take()
-                                        .or_else(|| with_jobs(&lua, |s| s.next_plugin_event()))
-                                }))
-                                .await;
-                            drop(scope);
+                        if let Some(host) = host.upgrade() {
+                            for job_id in with_jobs(&lua, |s| s.plugin_jobs_with_events()) {
+                                if delivering.borrow_mut().insert(job_id) {
+                                    let delivering = Rc::clone(&delivering);
+                                    host.spawn(deliver_job(lua.clone(), job_id, delivering))
+                                        .detach();
+                                }
+                            }
                         }
                         smol::Timer::after(DISPATCH_POLL_INTERVAL).await;
                     }

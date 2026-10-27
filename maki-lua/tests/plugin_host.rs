@@ -8874,3 +8874,60 @@ mod session_owned_ui {
         assert_eq!(hint_owners(&host), [None, Some(kept)]);
     }
 }
+
+const PARK_MS: u64 = 600_000;
+const DELIVERY_POLLS: usize = 500;
+const DELIVERY_POLL_MS: u64 = 10;
+const SECOND_JOB_EXIT: i32 = 3;
+
+/// The first job's callback parks far longer than the test runs, and the
+/// second job starts only once it has, so that job reaches its `on_exit`
+/// only if the two are delivered apart.
+#[test]
+fn a_parked_callback_holds_back_only_its_own_job() {
+    let src = format!(
+        r#"local parked, exit_code
+local function wait_until(done)
+    for _ = 1, {DELIVERY_POLLS} do
+        if done() then return end
+        maki.async.sleep({DELIVERY_POLL_MS})
+    end
+end
+maki.api.register_tool({{
+    name = "start_jobs",
+    description = "t",
+    schema = {MINIMAL_SCHEMA},
+    handler = function()
+        maki.fn.jobstart("echo park", {{
+            scope = "plugin",
+            on_stdout = function()
+                parked = true
+                maki.async.sleep({PARK_MS})
+            end,
+        }})
+        wait_until(function() return parked end)
+        assert(parked, "the first callback never parked")
+        maki.fn.jobstart("exit {SECOND_JOB_EXIT}", {{
+            scope = "plugin",
+            on_exit = function(_, code) exit_code = code end,
+        }})
+        return "started"
+    end,
+}})
+maki.api.register_tool({{
+    name = "second_exit",
+    description = "t",
+    schema = {MINIMAL_SCHEMA},
+    handler = function()
+        wait_until(function() return exit_code end)
+        return "exit=" .. tostring(exit_code)
+    end,
+}})"#
+    );
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source("parked_plugin", &src).unwrap();
+    exec_tool(&reg, "start_jobs", json!({})).unwrap();
+    let out = exec_tool(&reg, "second_exit", json!({})).unwrap();
+    assert_eq!(out, format!("exit={SECOND_JOB_EXIT}"));
+}
