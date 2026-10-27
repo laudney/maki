@@ -1908,6 +1908,62 @@ fn jobstart_invalid_cwd_errors_with_expanded_path() {
     assert!(out.contains(&expected), "got: {out}");
 }
 
+/// `0` means no cap of the caller's own, as in `maki.fs` reads, so the line
+/// comes through whole.
+#[test]
+fn jobstart_treats_zero_max_line_bytes_as_the_default() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let src = format!(
+        r#"maki.api.register_tool({{
+            name = "job_zero_line_bytes",
+            description = "jobstart with max_line_bytes = 0",
+            schema = {MINIMAL_SCHEMA},
+            audiences = {{ "main" }},
+            handler = function(input, ctx)
+                local id = maki.fn.jobstart("echo abcdef", {{ max_line_bytes = 0 }})
+                return maki.fn.jobwait(id).stdout
+            end
+        }})"#,
+    );
+    host.load_source("job_zero_line_bytes", &src).unwrap();
+    let out = exec_tool(&reg, "job_zero_line_bytes", serde_json::json!({})).unwrap();
+    assert_eq!(out, "abcdef");
+}
+
+/// The stream name sits third, where Neovim's job callbacks pass it, and the
+/// uncut length after it: `abcdef` is cut to 3 bytes plus the marker.
+#[test]
+fn job_line_callbacks_get_the_stream_and_the_uncut_length() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let src = format!(
+        r#"maki.api.register_tool({{
+            name = "job_line_args",
+            description = "records line callback arguments",
+            schema = {MINIMAL_SCHEMA},
+            audiences = {{ "main" }},
+            handler = function(input, ctx)
+                local seen = {{}}
+                local function record(_, line, stream, bytes)
+                    seen[#seen + 1] = line .. " " .. stream .. " " .. bytes
+                end
+                local id = maki.fn.jobstart("echo abcdef; echo xy >&2", {{
+                    max_line_bytes = 3,
+                    on_stdout = record,
+                    on_stderr = record,
+                }})
+                maki.fn.jobwait(id)
+                table.sort(seen)
+                return table.concat(seen, ",")
+            end
+        }})"#,
+    );
+    host.load_source("job_line_args", &src).unwrap();
+    let out = exec_tool(&reg, "job_line_args", serde_json::json!({})).unwrap();
+    assert_eq!(out, "abc... stdout 6,xy stderr 2");
+}
+
 #[test]
 fn async_job_exits_without_finish_is_error() {
     let reg = fresh_registry();

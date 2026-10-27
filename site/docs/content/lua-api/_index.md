@@ -2530,8 +2530,13 @@ Requires the `run` [plugin permission](#plugin-permissions).
 - `{opts?}` (`table?`) Optional settings:
   - `cwd` (`string?`) working directory (tilde is expanded).
   - `env` (`table?`) extra environment variables, `{ VAR = "value" }`.
-  - `on_stdout` (`function?`) called with `(job_id, line)` for each stdout line.
-  - `on_stderr` (`function?`) called with `(job_id, line)` for each stderr line.
+  - `on_stdout` (`function?`) called with `(job_id, line, "stdout", bytes)`
+    for each stdout line, the stream name third as in Neovim (which
+    passes a list of lines where maki passes one). `bytes` is the line's
+    length before `max_line_bytes` cut it, so it equals `#line` unless
+    the line was cut.
+  - `on_stderr` (`function?`) called with `(job_id, line, "stderr", bytes)`
+    for each stderr line.
   - `on_exit` (`function?`) called with `(job_id, code)` when the process finishes.
   - `stdout` (`string|false?`) append stdout to this path, or `false` to
     discard it.
@@ -2542,6 +2547,10 @@ Requires the `run` [plugin permission](#plugin-permissions).
     session ends, and survives plugin reload.
   - `tail` (`integer?`) trailing lines per stream kept for `jobinfo`
     (default 20, 0 disables, max 1024).
+  - `max_line_bytes` (`integer?`) longest line delivered, in bytes. A longer
+    line is cut at a UTF-8 boundary and ends in `...`, and its rest is
+    skipped without being read into memory (default and `0`: 64 MiB, the
+    `maki.fs` read limit).
   - `name` (`string?`) handle for `jobfind`, unique among the live jobs this
     plugin can see. Starting a second job under a live name is an error.
 
@@ -2620,7 +2629,8 @@ table with `stdout`, `stderr`, `exit_code`, and `truncated`. A job that
 already exited answers from its captured tail, so `truncated` says
 whether that tail ever lost a line (`tail` too small or 0, or the stream
 redirected away). Waiting on a live job collects every line and is never
-truncated.
+truncated. Neither counts lines cut by `max_line_bytes`: those still
+arrive, ending in `...`.
 
 While waiting, the job's `on_stdout`, `on_stderr`, and `on_exit`
 callbacks fire as events arrive (like Neovim), so you can stream

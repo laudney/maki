@@ -1,7 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::BufReader;
 use std::mem;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -19,7 +19,7 @@ use maki_storage::id::MakiId;
 use mlua::{Function, Lua, RegistryKey, Result as LuaResult, Table, Value};
 use shell_words::join as shell_join;
 
-use crate::api::fs::expand_tilde;
+use crate::api::fs::{Line, MAX_READ_BYTES, expand_tilde, next_line};
 use crate::api::keymap::{InputMode, KeymapWriter};
 use crate::api::util::command::{UiAction, ui_roundtrip, ui_send};
 use crate::api::util::convert::TableExt;
@@ -42,6 +42,8 @@ const JOB_QUEUE_BYTES: usize = 16 * 1024 * 1024;
 /// every freed line cost a cross-thread wake per line, about a third of a
 /// saturated run's time.
 const JOB_QUEUE_RESUME: usize = JOB_QUEUE_BYTES / 2;
+const STDOUT_STREAM: &str = "stdout";
+const STDERR_STREAM: &str = "stderr";
 
 const NO_TASK_SCOPE_ERR: &str =
     "jobstart: no active task; use scope = \"plugin\" or { session = ... }";
@@ -64,8 +66,8 @@ pub fn set_shell_preference(shell: ShellPreference) {
 
 #[derive(Clone)]
 pub(crate) enum JobEvent {
-    Stdout(String),
-    Stderr(String),
+    Stdout(Line),
+    Stderr(Line),
     Exit(i32),
 }
 
@@ -154,6 +156,9 @@ pub(crate) struct JobSpec {
     /// The [`Ceiling`] the job was started under, which its callbacks run
     /// under too.
     pub ceiling: Option<Ceiling>,
+    /// Longest line a reader hands on. The rest of a longer line is skipped
+    /// without being read into memory.
+    pub max_line_bytes: u64,
 }
 
 impl JobSpec {
@@ -170,6 +175,7 @@ impl JobSpec {
             on_stderr: None,
             on_exit: None,
             ceiling: None,
+            max_line_bytes: MAX_READ_BYTES,
         }
     }
 }
@@ -310,6 +316,7 @@ impl JobStore {
             on_stderr,
             on_exit,
             ceiling,
+            max_line_bytes,
         } = spec;
         let mut command = cmd.build();
         strip_provider_keys(&mut command)
@@ -358,9 +365,9 @@ impl JobStore {
                         thread::Builder::new()
                             .name($name.into())
                             .spawn(move || {
-                                for line in BufReader::with_capacity(READER_BUF_SIZE, stream)
-                                    .lines()
-                                    .map_while(Result::ok)
+                                let mut reader = BufReader::with_capacity(READER_BUF_SIZE, stream);
+                                while let Ok(Some(line)) =
+                                    next_line(&mut reader, Some(max_line_bytes))
                                 {
                                     if !sender.send(JobEvent::$variant(line)) {
                                         break;
@@ -527,8 +534,8 @@ impl JobStore {
             return;
         };
         match event {
-            JobEvent::Stdout(line) => job.record_line(true, line),
-            JobEvent::Stderr(line) => job.record_line(false, line),
+            JobEvent::Stdout(line) => job.record_line(true, &line.text),
+            JobEvent::Stderr(line) => job.record_line(false, &line.text),
             // Termination is [`Self::complete`]'s business: it owns
             // `exit_code` and runs once per job.
             JobEvent::Exit(_) => {}
@@ -858,7 +865,7 @@ impl JobQueue {
 fn queued_bytes(event: &JobEvent) -> usize {
     size_of::<JobEvent>()
         + match event {
-            JobEvent::Stdout(line) | JobEvent::Stderr(line) => line.len(),
+            JobEvent::Stdout(line) | JobEvent::Stderr(line) => line.text.len(),
             JobEvent::Exit(_) => 0,
         }
 }
@@ -993,8 +1000,13 @@ fn kill_job(job: &JobMeta) {
 /// @param opts table? Optional settings:
 ///   `cwd` (string?) working directory (tilde is expanded).
 ///   `env` (table?) extra environment variables, `{ VAR = "value" }`.
-///   `on_stdout` (function?) called with `(job_id, line)` for each stdout line.
-///   `on_stderr` (function?) called with `(job_id, line)` for each stderr line.
+///   `on_stdout` (function?) called with `(job_id, line, "stdout", bytes)`
+///     for each stdout line, the stream name third as in Neovim (which
+///     passes a list of lines where maki passes one). `bytes` is the line's
+///     length before `max_line_bytes` cut it, so it equals `#line` unless
+///     the line was cut.
+///   `on_stderr` (function?) called with `(job_id, line, "stderr", bytes)`
+///     for each stderr line.
 ///   `on_exit` (function?) called with `(job_id, code)` when the process finishes.
 ///   `stdout` (string|false?) append stdout to this path, or `false` to
 ///     discard it.
@@ -1005,6 +1017,10 @@ fn kill_job(job: &JobMeta) {
 ///     session ends, and survives plugin reload.
 ///   `tail` (integer?) trailing lines per stream kept for `jobinfo`
 ///     (default 20, 0 disables, max 1024).
+///   `max_line_bytes` (integer?) longest line delivered, in bytes. A longer
+///     line is cut at a UTF-8 boundary and ends in `...`, and its rest is
+///     skipped without being read into memory (default and `0`: 64 MiB, the
+///     `maki.fs` read limit).
 ///   `name` (string?) handle for `jobfind`, unique among the live jobs this
 ///     plugin can see. Starting a second job under a live name is an error.
 /// @return (integer?, string?) Job id, or nil plus an error message when the
@@ -1047,6 +1063,10 @@ fn jobstart(
         spec.ceiling = Ceiling::current_for(lua, &plugin);
         spec.stdout = parse_redirect(lua, opts, "stdout", spec.on_stdout.is_some(), &grants)?;
         spec.stderr = parse_redirect(lua, opts, "stderr", spec.on_stderr.is_some(), &grants)?;
+        // 0 means no cap of the caller's own, as in `maki.fs` reads.
+        if let Some(max) = opts.opt::<u64>("max_line_bytes")?.filter(|max| *max > 0) {
+            spec.max_line_bytes = max;
+        }
         tail = opts.opt("tail").ok().flatten();
         if let Some(n) = tail
             && n > MAX_TAIL_LINES
@@ -1353,7 +1373,8 @@ fn jobforget(lua: &Lua, #[ctx] plugin: Arc<str>, job_id: u32) -> LuaResult<()> {
 /// already exited answers from its captured tail, so `truncated` says
 /// whether that tail ever lost a line (`tail` too small or 0, or the stream
 /// redirected away). Waiting on a live job collects every line and is never
-/// truncated.
+/// truncated. Neither counts lines cut by `max_line_bytes`: those still
+/// arrive, ending in `...`.
 ///
 /// While waiting, the job's `on_stdout`, `on_stderr`, and `on_exit`
 /// callbacks fire as events arrive (like Neovim), so you can stream
@@ -1421,8 +1442,8 @@ async fn jobwait(
             tracing::warn!(job_id, error = %strip_traceback(&e), "jobwait callback failed");
         }
         match event {
-            JobEvent::Stdout(line) => stdout_lines.push(line),
-            JobEvent::Stderr(line) => stderr_lines.push(line),
+            JobEvent::Stdout(line) => stdout_lines.push(line.text),
+            JobEvent::Stderr(line) => stderr_lines.push(line.text),
             JobEvent::Exit(code) => break code,
         }
     };
@@ -1467,15 +1488,20 @@ pub(crate) async fn deliver_job_event(lua: &Lua, job_id: u32, event: &JobEvent) 
         with_jobs(lua, |store| store.complete(lua, job_id, *code));
     }
     if let Some(callback) = callback {
-        let arg = match event {
+        let thread = lua.create_thread(callback)?;
+        let call = match event {
             JobEvent::Stdout(line) | JobEvent::Stderr(line) => {
-                Value::String(lua.create_string(line)?)
+                // The stream name sits third, where Neovim passes it.
+                let stream = if matches!(event, JobEvent::Stdout(_)) {
+                    STDOUT_STREAM
+                } else {
+                    STDERR_STREAM
+                };
+                let text = lua.create_string(&line.text)?;
+                thread.into_async::<()>((job_id, text, stream, line.bytes))?
             }
-            JobEvent::Exit(code) => Value::Integer(*code as i64),
+            JobEvent::Exit(code) => thread.into_async::<()>((job_id, *code))?,
         };
-        let call = lua
-            .create_thread(callback)?
-            .into_async::<()>((job_id, arg))?;
         Narrowed::under(lua, ceiling, call).await?;
     }
     Ok(())
@@ -1598,6 +1624,8 @@ lua_table! {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use crate::api::fs::LINE_CUT_MARKER;
     use crate::api::util::command::{NO_UI_ERR, WinView};
 
     const TEST_PLUGIN: &str = "test-plugin";
@@ -1736,6 +1764,30 @@ mod tests {
             ..JobSpec::new(task_owner(1), "echo hello")
         });
         assert!(result.is_err());
+    }
+
+    /// Without a cap of its own a job still stops at the `maki.fs` read
+    /// limit, so one endless line cannot fill the shared heap.
+    #[cfg(unix)]
+    #[test]
+    fn reader_cuts_at_the_read_limit_by_default() {
+        let over = MAX_READ_BYTES + 1;
+        let mut store = make_store();
+        let cmd = format!("head -c {over} /dev/zero | tr '\\0' x");
+        let id = store
+            .start(JobSpec::new(task_owner(1), cmd.as_str()))
+            .unwrap();
+
+        let events = collect_until_exit(id, || store.next_event(&task_owner(1)));
+
+        let [(_, JobEvent::Stdout(line)), (_, JobEvent::Exit(0))] = events.as_slice() else {
+            panic!("expected one line and the exit");
+        };
+        assert_eq!(
+            line.text.len() as u64,
+            MAX_READ_BYTES + LINE_CUT_MARKER.len() as u64
+        );
+        assert_eq!(line.bytes, over);
     }
 
     #[test]
@@ -2204,8 +2256,8 @@ mod tests {
     fn armed_slots(store: &JobStore) -> (bool, bool, bool) {
         let held = |event| store.callback_key(1, &event).is_some();
         (
-            held(JobEvent::Stdout(String::new())),
-            held(JobEvent::Stderr(String::new())),
+            held(JobEvent::Stdout("".into())),
+            held(JobEvent::Stderr("".into())),
             held(JobEvent::Exit(0)),
         )
     }
@@ -2589,7 +2641,7 @@ mod tests {
             let stdout: Vec<String> = events
                 .iter()
                 .filter_map(|(_, event)| match event {
-                    JobEvent::Stdout(line) => Some(line.clone()),
+                    JobEvent::Stdout(line) => Some(line.text.clone()),
                     _ => None,
                 })
                 .collect();
