@@ -53,8 +53,14 @@ const FINISHED_LATE: &str = "finished-late";
 const MOVED_AS_ASKED: &str = "Started in the background as asked";
 const EARLIER_IN_LOG: &str = "earlier lines are in the full output log";
 const EARLIER_DROPPED: &str = "earlier lines dropped]";
+const TRUNCATED: &str = "[truncated ";
+/// Past the default reply budget, under the line cap bash gives its job.
+const LONG_LINE_BYTES: usize = 64 * 1024;
 const EARLY_LINES: usize = 10;
 const LATE_LINES: usize = 300;
+/// Once the reply is cut, the newest lines it keeps are the second half of
+/// its line budget, and they seed the tail on the move.
+const KEPT_TAIL_LINES: usize = TAIL_LINES / 2;
 /// Lines of 49 bytes that cross `LOG_CAP_BYTES` once.
 const PADDED_LINES: usize = 60;
 
@@ -320,7 +326,7 @@ fn memory_stays_bounded_while_the_log_keeps_everything() {
     let receipt = run.move_to_background();
     assert!(
         receipt.contains(&format!(
-            "Last {TAIL_LINES} lines:\nearly-7\nearly-8\nearly-9\nearly-10\n{READY_LINE}\n"
+            "Last {KEPT_TAIL_LINES} lines:\nearly-10\n{READY_LINE}\n"
         )),
         "{receipt}"
     );
@@ -341,6 +347,40 @@ fn memory_stays_bounded_while_the_log_keeps_everything() {
     let log = run.log();
     assert_eq!(log.lines().count(), total_lines);
     assert!(log.starts_with("early-1\n") && log.ends_with("late-300\n"));
+}
+
+/// The model can read what the cut dropped instead of running the command
+/// again, long lines included.
+#[test]
+fn a_cut_foreground_reply_names_a_log_with_every_line() {
+    let long_line = "0".repeat(LONG_LINE_BYTES);
+    let run = Run::start(
+        json!({ "max_output_lines": TAIL_LINES }),
+        None,
+        &format!("for i in $(seq 1 {LATE_LINES}); do echo late-$i; done; echo {long_line}"),
+        "true",
+    );
+    run.release();
+
+    let reply = run.reply().expect("the command succeeds");
+
+    assert!(reply.contains(TRUNCATED), "{reply}");
+    assert!(reply.ends_with(&progress_line(&run)), "{reply}");
+    let every_line: String = (1..=LATE_LINES)
+        .map(|i| format!("late-{i}\n"))
+        .chain([format!("{long_line}\n")])
+        .collect();
+    assert_eq!(run.log(), every_line);
+}
+
+/// Output that fits the reply leaves no log behind.
+#[test]
+fn a_foreground_reply_that_fits_has_no_log() {
+    let run = Run::start(json!({}), None, "echo only", "true");
+    run.release();
+
+    assert_eq!(run.reply().as_deref(), Ok("only"));
+    assert!(!run.log_path().exists());
 }
 
 /// The reply's note on the lines its tail dropped points at both files,

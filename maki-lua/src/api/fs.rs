@@ -1474,6 +1474,18 @@ mod tests {
     const TEST_READ_LIMIT: u64 = 4;
     const TEST_PLUGIN: &str = "test";
 
+    const OUTPUT_LIMITS_SRC: &str = include_str!("../../../plugins/lib/maki/output_limits.lua");
+
+    #[test]
+    fn full_output_ceiling_matches_the_read_limit() {
+        let lua = Lua::new();
+        let limits: Table = lua.load(OUTPUT_LIMITS_SRC).eval().unwrap();
+        assert_eq!(
+            limits.get::<u64>("FULL_OUTPUT_MAX_BYTES").unwrap(),
+            MAX_READ_BYTES
+        );
+    }
+
     #[test]
     fn read_file_ok() {
         let tmp = TempDir::new().unwrap();

@@ -19,6 +19,10 @@ local RTK_UNSUPPORTED_FLAGS = {
   " -fprintf ",
 }
 local SEPARATOR = "──────"
+-- Lines up to this size reach bash whole, so the log keeps long JSON or
+-- minified code intact. A line that never ends still stays out of the
+-- shared heap.
+local LOG_LINE_BYTES = 1024 * 1024
 local TASK_LOGS_DIR = "tasks"
 local LOG_EXT = ".log"
 local NO_SESSION_ERR = "no chat session to keep the output log under"
@@ -309,7 +313,7 @@ Commands run in the session's working directory (see Environment) by default.
 - Do NOT use to communicate text to the user.
 - Chain dependent commands with `&&`. Use batch for independent ones.
 - Provide a short `description` (3-5 words).
-- Output sent to the model is cut beyond 2000 lines or 50KB.
+- Output sent to the model is cut beyond 2000 lines or 50KB; the reply then names a log with the full output.
 - Interactive commands (sudo, ssh prompts) fail immediately.]]
 
 maki.api.register_prompt_hint({
@@ -330,7 +334,7 @@ local opts = maki.api.register_options(output_limits.extend({
   background_log_bytes = {
     default = LOG_MAX_BYTES,
     min = 1024,
-    desc = "Size at which the output log of a command moved to the background rotates to `.log.1`. Values above 1 GiB count as 1 GiB.",
+    desc = "Size at which the output log of a command rotates to `.log.1`. A command gets a log once its output outgrows the reply or it moves to the background. Values above 1 GiB count as 1 GiB.",
   },
 }))
 
@@ -436,92 +440,116 @@ maki.api.register_tool({
 
     local buf, view = create_bash_view(command, ctx)
 
-    -- `tail` and `log` replace `lines` once the call moves to the background:
-    -- a command that outlives its turn can print without bound.
-    local lines = {}
-    local tail, log
+    -- The reply comes from `collected` until the call moves to the
+    -- background, and from the bounded `tail` after. The log opens once the
+    -- output outgrows the reply or the call moves, and gets every line.
+    local collected = output_limits.collector(max_lines, max_bytes)
+    local tail, log, log_err
+    local log_gate = maki.async.semaphore(1)
     local has_output = false
     local finishing, finished = false, false
     local foreground_note
 
-    -- Swaps `lines` for the bounded tail and returns what `lines` held. Never
-    -- yields, so no line lands between the swap and the caller's next step.
+    -- The log opens right before the collector drops its first line, so it
+    -- starts with everything printed so far. A failed open is remembered.
+    -- Otherwise a call that cannot log would retry on every line, and a
+    -- later move could start a log with a hole in it. The gate stops a move
+    -- and an overflow from opening the log twice.
+    local function open_log()
+      local permit = log_gate:acquire()
+      if not log and not log_err then
+        local session = ctx:session_id()
+        local path
+        if session then
+          path, log_err = log_path(ctx, session)
+        else
+          log_err = NO_SESSION_ERR
+        end
+        if path then
+          local opened, open_err = bash_log.open(path, math.min(opts.background_log_bytes, LOG_MAX_BYTES_CEILING))
+          if opened then
+            log = opened
+            local lines = collected:newest()
+            if #lines > 0 then
+              log:push(table.concat(lines, "\n") .. "\n")
+            end
+          else
+            log_err = "cannot open the output log: " .. open_err
+          end
+        end
+      end
+      permit:release()
+      return log ~= nil, log_err
+    end
+
+    -- Swaps `collected` for the bounded tail, seeded with the newest lines it
+    -- kept. Never yields, so no line lands between the swap and the caller's
+    -- next step.
     local function use_tail()
-      local backlog = lines
-      lines = nil
-      tail = bash_log.new_tail(max_lines or FALLBACK_TAIL_LINES, max_bytes or FALLBACK_TAIL_BYTES)
-      for _, line in ipairs(backlog) do
+      if not collected then
+        return
+      end
+      local newest, before = collected:newest()
+      collected = nil
+      tail = bash_log.new_tail(max_lines or FALLBACK_TAIL_LINES, max_bytes or FALLBACK_TAIL_BYTES, before)
+      for _, line in ipairs(newest) do
         bash_log.tail_push(tail, line)
       end
-      return backlog
     end
 
     -- Opens the output log and moves to the bounded tail. Safe to call again:
     -- the runtime may refuse a move after this ran, and the next press asks
     -- again. Returns true, or nil and the reason the command cannot move.
     local function enter_background()
-      if log then
+      if not collected then
         return true
       end
       if finishing or finished then
         return nil, FINISHED_ERR
       end
-      local session = ctx:session_id()
-      if not session then
-        return nil, NO_SESSION_ERR
-      end
-      local path, path_err = log_path(ctx, session)
-      if not path then
-        return nil, path_err
-      end
-      local opened, open_err = bash_log.open(path, math.min(opts.background_log_bytes, LOG_MAX_BYTES_CEILING))
+      local opened, open_err = open_log()
       if not opened then
-        return nil, "cannot open the output log: " .. open_err
+        return nil, open_err
       end
       if finishing or finished then
         return nil, FINISHED_ERR
       end
-      -- Nothing yields between the open's return and the swap, so no line is
-      -- lost or written out of order.
-      log = opened
-      local backlog = use_tail()
-      if #backlog > 0 then
-        log:push(table.concat(backlog, "\n") .. "\n")
-      end
+      use_tail()
       log:drain()
       return true
     end
 
-    local function capture(line)
+    local function capture(line, bytes)
       if not has_output then
         has_output = true
         view:clear()
       end
       -- A bash inside a moved batch never runs its own hook, so its first
       -- output after the move does the same switch.
-      if not tail and ctx:backgrounded() then
+      if collected and ctx:backgrounded() then
         local entered, enter_err = enter_background()
         if not entered then
           maki.log.warn("bash: moved without an output log: " .. enter_err)
           use_tail()
         end
       end
-      if tail then
-        bash_log.tail_push(tail, line)
-        if log then
-          log:push(line .. "\n")
-        end
+      if collected and not log and not log_err and not collected:fits(bytes) then
+        open_log()
+      end
+      if collected then
+        collected:append(line, bytes)
       else
-        lines[#lines + 1] = line
+        bash_log.tail_push(tail, line)
+      end
+      if log then
+        log:push(line .. "\n")
       end
       view:append(line)
     end
 
-    -- Presentation limits apply after the view streams every line. Both the
-    -- exit and cancel path go through here.
     local function final_output()
-      if not tail then
-        return output_limits.cut_middle(table.concat(lines, "\n"), max_lines, max_bytes)
+      if collected then
+        return collected:result()
       end
       local text = output_limits.cut_middle(bash_log.tail_text(tail), max_lines, max_bytes)
       local dropped = bash_log.tail_dropped(tail)
@@ -557,8 +585,11 @@ maki.api.register_tool({
       end
       finished = true
       local output = final_output()
+      -- Full mode promises the whole output, so a cut there is an error, the
+      -- way a `maki.fs` read past its limit is one.
+      local over_full_limit = collected ~= nil and not max_bytes and collected:truncated()
 
-      local is_error = exit_code ~= 0
+      local is_error = exit_code ~= 0 or over_full_limit
       local llm_output
       if exit_code == 0 then
         llm_output = output == "" and "Exit code: 0" or output
@@ -569,14 +600,20 @@ maki.api.register_tool({
           llm_output = output .. "\nExit code: " .. exit_code
         end
       end
+      if over_full_limit then
+        llm_output = llm_output .. "\n" .. output_limits.FULL_LIMIT_NOTE
+      end
 
       if output == "" then
         view:clear()
         view:append({ { "No output", "dim" } })
       end
 
-      if is_error then
+      if exit_code ~= 0 then
         view:append({ { "Exit code: " .. exit_code, "dim" } })
+      end
+      if over_full_limit then
+        view:append({ { output_limits.FULL_LIMIT_NOTE, "dim" } })
       end
       local reply = reply_text(llm_output)
       view:finish()
@@ -589,11 +626,12 @@ maki.api.register_tool({
     local job, err = maki.fn.jobstart(command, {
       cwd = workdir,
       env = { GIT_TERMINAL_PROMPT = "0" },
-      on_stdout = function(_, line)
-        capture(line)
+      max_line_bytes = max_bytes and math.max(max_bytes, LOG_LINE_BYTES),
+      on_stdout = function(_, line, _, bytes)
+        capture(line, bytes)
       end,
-      on_stderr = function(_, line)
-        capture(line)
+      on_stderr = function(_, line, _, bytes)
+        capture(line, bytes)
       end,
       on_exit = function(_, code)
         finish(code)

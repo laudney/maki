@@ -8670,6 +8670,12 @@ ListPicker.range_spans = range_spans
 -- Shared per-tool output limit options, so the tools that support them
 -- cannot drift apart.
 M.DEFAULT_MAX_LINE_BYTES = DEFAULT_MAX_LINE_BYTES
+M.FULL_OUTPUT_MAX_BYTES = FULL_OUTPUT_MAX_BYTES
+M.FULL_OUTPUT_MAX_LINES = FULL_OUTPUT_MAX_LINES
+
+--- Appended where full-mode output passed the ceilings, which callers that
+--- promised the whole output report as an error.
+M.FULL_LIMIT_NOTE = "[output passed the full-mode limit; redirect it to a file to keep all of it]"
 function M.extend(spec)
 
 --- Returns max_lines, max_bytes: tool override when set, agent-wide otherwise.
@@ -8678,6 +8684,31 @@ function M.resolve(opts, ctx)
 
 --- opts.max_line_bytes, or 0 (no limit) in full mode.
 function M.line_bytes(opts, ctx)
+
+--- Cuts streamed lines the way `cut_middle` cuts a whole text, holding no
+--- more than the limits while they arrive. nil limits fall back to the
+--- full-mode ceilings, so even full mode stops growing at 64 MiB. Lines go in
+--- with `collector:append(line, bytes)` and the text comes out of
+--- `collector:result()`.
+function M.collector(max_lines, max_bytes)
+
+--- Whether one more line of {bytes} still leaves every line kept, so a
+--- caller can save the output elsewhere before the collector drops any.
+function Collector:fits(bytes)
+
+--- Adds {line}. {bytes} is its length before a reader cut it, the fourth
+--- argument of a `jobstart` line callback, so the marker counts what the cut
+--- dropped too. Defaults to `#line`.
+function Collector:append(line, bytes)
+
+--- Whether the collector has dropped anything, so a caller that promised
+--- the whole output can say it could not keep it.
+function Collector:truncated()
+
+--- The newest lines kept with no gap between them, and how many lines came
+--- before them: every line until the collector cuts, its tail window after.
+function Collector:newest()
+function Collector:result()
 
 --- Cuts {text} to the limits keeping its head and its tail, since on a long
 --- build or test run the errors and the summary sit at the end. Each end gets

@@ -35,6 +35,7 @@ const TOOLS: &[&str] = &[
     "batch",
     "webfetch",
 ];
+const NO_OUTPUT: &str = "(no output)";
 const MODEL_BYTES: usize = 1024;
 const MODEL_LINES: usize = 8;
 const COMPACT_GLOB_LIMIT: usize = 100;
@@ -151,6 +152,13 @@ fn python_parses_complete_bash_json_with_bounded_final_output() {
     assert!(returned.len() < MODEL_BYTES * 2);
 }
 
+#[test_case::test_case("pass" ; "nothing")]
+#[test_case::test_case("print()" ; "an_empty_line")]
+fn python_without_output_says_so(code: &str) {
+    let (_registry, _host, ctx) = setup();
+    assert_eq!(python(&ctx, code).unwrap(), NO_OUTPUT);
+}
+
 #[test]
 fn final_python_output_keeps_model_limits() {
     let (_registry, _host, ctx) = setup();
@@ -165,8 +173,14 @@ fn final_python_output_keeps_model_limits() {
         ),
     )
     .unwrap();
-    assert!(output.contains("[truncated"));
-    assert!(!output.contains(&format!("\n{}\n", MODEL_LINES * 3 - 1)));
+    let last = MODEL_LINES * 3 - 1;
+    assert!(output.starts_with("0\n1\n"), "head kept: {output}");
+    assert!(output.contains("[truncated "), "middle cut: {output}");
+    assert!(output.contains(&format!("\n{last}")), "tail kept: {output}");
+    assert!(
+        !output.contains(&format!("\n{}\n", MODEL_LINES * 2)),
+        "middle dropped: {output}"
+    );
 }
 
 #[test_case::test_case(1, 0, MODEL_LINES * 3 ; "through_eof")]
@@ -272,7 +286,10 @@ fn python_bash_returns_full_output_and_keeps_complete_error_output() {
     let uncaught = python(&ctx, &format!("await bash(command={failing:?})")).unwrap_err();
     assert!(uncaught.contains("[truncated"));
     assert!(uncaught.len() < MODEL_BYTES);
-    assert!(!uncaught.contains(lines.last().unwrap()));
+    assert!(
+        uncaught.contains("Exit code: 7"),
+        "error tail kept: {uncaught}"
+    );
 }
 
 #[test]

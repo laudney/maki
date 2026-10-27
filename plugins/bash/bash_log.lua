@@ -1,6 +1,6 @@
--- The on-disk output of a bash call that moved to the background. Writes are
--- batched and serialized so output callbacks rarely wait on the disk, and the
--- file rotates so a dev server cannot fill it.
+-- The on-disk output of a bash call that outgrew its reply or moved to the
+-- background. Writes are batched and serialized so output callbacks rarely
+-- wait on the disk, and the file rotates so a dev server cannot fill it.
 
 local ROTATED_SUFFIX = ".1"
 local UTF8_CONTINUATION = "^[\128-\191]"
@@ -128,8 +128,10 @@ function Log:drain()
 end
 
 --- Keeps the last lines of the output in memory, whatever its total size.
-function M.new_tail(max_lines, max_bytes)
-  return { lines = {}, first = 1, last = 0, bytes = 0, max_lines = max_lines, max_bytes = max_bytes }
+--- {dropped} counts lines already gone before the first one pushed.
+function M.new_tail(max_lines, max_bytes, dropped)
+  local first = dropped + 1
+  return { lines = {}, first = first, last = first - 1, bytes = 0, max_lines = max_lines, max_bytes = max_bytes }
 end
 
 local function utf8_prefix(line, max_bytes)
