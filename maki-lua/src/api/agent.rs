@@ -1717,9 +1717,12 @@ impl SessionCancellation {
         if self.stopped_by_user() {
             return Some(STOPPED_BY_USER_ERR);
         }
-        // Its chat session or its plugin may have ended while the plugin kept
-        // the handle.
-        (self.background && !self.registry.contains(&self.ui_id)).then_some(CANCELLED_MSG)
+        // Stopping the call that opened the session fires this token right
+        // away, but the prompt it cut short takes a while to unwind. Its chat
+        // session or its plugin may also have ended while the plugin kept the
+        // handle.
+        (self.trigger.is_cancelled() || (self.background && !self.registry.contains(&self.ui_id)))
+            .then_some(CANCELLED_MSG)
     }
 
     fn stopped_by_user(&self) -> bool {
@@ -2920,6 +2923,27 @@ mod tests {
         );
     }
 
+    fn cancellation(
+        ui_id: &str,
+        trigger: CancelTrigger,
+        registry: BackgroundTasks,
+        background: bool,
+    ) -> SessionCancellation {
+        let parent_cancels = Arc::new(CancelMap::new());
+        let (slot_trigger, _cancel) = CancelToken::new();
+        SessionCancellation {
+            slot: parent_cancels.insert(ui_id.to_owned(), slot_trigger),
+            parent_cancels,
+            ui_id: ui_id.to_owned(),
+            trigger,
+            registry,
+            background,
+            mailbox: SessionMailbox::register(MakiId::generate()),
+            adoption: None,
+            stop: StopMark::default(),
+        }
+    }
+
     /// A running prompt holds the session lock until it unwinds, so `send`
     /// can only ask the cancellation whether Esc stopped the task.
     #[test]
@@ -2928,20 +2952,8 @@ mod tests {
         let _live = crate::background::tests::live(session);
         let registry = BackgroundTasks::default();
         let (mut entry, _token) = crate::background::tests::entry(session, None);
-        let parent_cancels = Arc::new(CancelMap::new());
-        let (slot_trigger, _cancel) = CancelToken::new();
         let (trigger, _session_cancel) = CancelToken::new();
-        let cancellation = SessionCancellation {
-            slot: parent_cancels.insert(entry.info.id.clone(), slot_trigger),
-            parent_cancels,
-            ui_id: entry.info.id.clone(),
-            trigger,
-            registry: registry.clone(),
-            background: true,
-            mailbox: SessionMailbox::register(MakiId::generate()),
-            adoption: None,
-            stop: StopMark::default(),
-        };
+        let cancellation = cancellation(&entry.info.id, trigger, registry.clone(), true);
         entry.stop = cancellation.stop.clone();
         registry.register(entry).unwrap();
         assert_eq!(cancellation.refusal(), None);
@@ -2949,6 +2961,20 @@ mod tests {
         registry.stop(&cancellation.ui_id, Stop::User);
 
         assert_eq!(cancellation.refusal(), Some(STOPPED_BY_USER_ERR));
+    }
+
+    /// The parent message of a stopped call would otherwise queue for the
+    /// prompt that is still unwinding and never reads it.
+    #[test]
+    fn a_stopped_call_refuses_while_its_prompt_unwinds() {
+        let (call_trigger, call) = CancelToken::new();
+        let (trigger, _session_cancel) = call.child();
+        let cancellation = cancellation(PARENT_ID, trigger, BackgroundTasks::default(), false);
+        assert_eq!(cancellation.refusal(), None);
+
+        call_trigger.cancel();
+
+        assert_eq!(cancellation.refusal(), Some(CANCELLED_MSG));
     }
 
     /// The first turn reaches the parent while the call is in the

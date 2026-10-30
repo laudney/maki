@@ -141,6 +141,11 @@ impl CancelTrigger {
         Arc::ptr_eq(&self.0, &token.0)
     }
 
+    /// True once this trigger or a parent of its token fired.
+    pub fn is_cancelled(&self) -> bool {
+        self.0.cancelled.load(Ordering::Acquire)
+    }
+
     pub fn handle(&self) -> CancelHandle {
         CancelHandle(Arc::downgrade(&self.0))
     }

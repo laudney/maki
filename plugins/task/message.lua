@@ -62,9 +62,11 @@ maki.api.register_tool({
       table.insert(task.pending, input.message)
       return QUEUED:format(task.name)
     end
-    local ok, err = task.sess:send(input.message)
-    if not ok then
-      return { llm_output = err, is_error = true }
+    -- A stopped task stays tracked here until its handler unwinds, and
+    -- `send` already refuses it then. Answering the same as after the
+    -- untrack means the reply does not depend on that timing.
+    if not task.sess:send(input.message) then
+      return { llm_output = NOT_RUNNING .. input.id, is_error = true }
     end
     return QUEUED:format(task.name)
   end,
