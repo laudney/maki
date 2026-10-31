@@ -167,7 +167,7 @@ fn project_id(root: &Path) -> String {
     format!("{name}-{hash:016x}")
 }
 
-fn fnv1a_64(bytes: &[u8]) -> u64 {
+pub(crate) fn fnv1a_64(bytes: &[u8]) -> u64 {
     bytes.iter().fold(FNV_OFFSET_BASIS, |hash, &byte| {
         (hash ^ u64::from(byte)).wrapping_mul(FNV_PRIME)
     })

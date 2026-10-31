@@ -34,19 +34,24 @@ impl Default for InputHistory {
 
 impl InputHistory {
     pub fn load(dir: &StateDir, cwd: &Path, max_entries: usize) -> Self {
-        let file = history_path(dir, cwd);
+        Self::load_file(history_path(dir, cwd), max_entries)
+    }
+
+    /// A history kept in a file of its own, such as a remote agent's, whose
+    /// workspace this machine does not resolve to a project.
+    pub fn load_file(file: PathBuf, max_entries: usize) -> Self {
         let mut history = Self {
             entries: VecDeque::with_capacity(max_entries),
             max_entries,
-            file: Some(file),
+            file: None,
         };
-        let Some(data) = history.file.as_ref().and_then(|p| fs::read(p).ok()) else {
-            return history;
-        };
-        let items: Vec<String> = serde_json::from_slice(&data).unwrap_or_default();
-        for entry in items {
-            history.push_inner(entry);
+        if let Ok(data) = fs::read(&file) {
+            let items: Vec<String> = serde_json::from_slice(&data).unwrap_or_default();
+            for entry in items {
+                history.push_inner(entry);
+            }
         }
+        history.file = Some(file);
         history
     }
 

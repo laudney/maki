@@ -3,16 +3,22 @@
 //! `atomic_write_permissions` sets file mode before persist (for auth keys at 0600).
 
 pub mod auth;
+pub mod child_guard;
+pub mod file_index;
 pub mod frame;
 pub mod id;
 pub mod input_history;
 pub mod intern;
 pub mod lock;
 pub mod log;
+pub mod logging;
 pub mod model;
 pub mod paths;
 pub mod plans;
+pub mod remote_drafts;
+pub mod search;
 pub mod sessions;
+pub mod text;
 pub mod theme;
 pub mod trusted_folders;
 pub mod version;
@@ -60,8 +66,6 @@ impl StateDir {
 
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
-    #[error("home directory not found")]
-    HomeNotSet,
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]

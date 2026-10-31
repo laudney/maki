@@ -3188,8 +3188,6 @@ dependencies = [
  "event-listener",
  "flume",
  "futures",
- "grep-regex",
- "grep-searcher",
  "ignore",
  "jiff",
  "jsonrepair",
@@ -3197,7 +3195,6 @@ dependencies = [
  "maki-otel",
  "maki-providers",
  "maki-storage",
- "nucleo-matcher",
  "oauth2",
  "open",
  "rcgen",
@@ -3220,7 +3217,6 @@ dependencies = [
  "toml",
  "toml_edit",
  "tracing",
- "unicode-segmentation",
  "url",
 ]
 
@@ -3408,6 +3404,7 @@ dependencies = [
 name = "maki-otel"
 version = "0.7.0"
 dependencies = [
+ "color-eyre",
  "http",
  "maki-config",
  "opentelemetry",
@@ -3476,16 +3473,25 @@ dependencies = [
 name = "maki-storage"
 version = "0.7.0"
 dependencies = [
+ "arc-swap",
  "bs58",
  "etcetera",
  "getrandom 0.4.3",
+ "grep-regex",
+ "grep-searcher",
+ "ignore",
+ "nucleo-matcher",
  "reqwest",
+ "rustix 1.1.6",
  "serde",
  "serde_json",
  "tempfile",
  "test-case",
  "thiserror 2.0.21",
+ "tokio",
  "tracing",
+ "tracing-subscriber",
+ "unicode-segmentation",
  "uuid",
 ]
 

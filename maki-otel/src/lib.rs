@@ -8,12 +8,15 @@
 
 mod console;
 pub mod emit;
+mod exit;
 mod export;
 pub mod logs;
 pub mod metrics;
 mod overrides;
 pub mod resource;
 pub mod settings;
+
+pub use exit::{TELEMETRY_SHUTDOWN_TIMEOUT, exit};
 
 use std::convert::Infallible;
 use std::env;
