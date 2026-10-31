@@ -7,6 +7,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use futures::future::{Either, select};
+use futures_lite::future::or;
 use maki_agent::agent::{LoadedInstructions, tool_dispatch};
 use maki_agent::cancel::{CancelMap, CancelSlot, CancelToken, CancelTrigger};
 use maki_agent::permissions::{PermissionAnswer, TaggedAnswer};
@@ -1683,14 +1684,20 @@ fn cut_short_err(result: &Result<DoneReason, AgentError>, stopped_by_user: bool)
 }
 
 /// The notices that wake the session's next turn, or `None` once none of its
-/// moved calls is still out and nothing they reported is left unread. `Err`
+/// moved calls is still out and nothing they reported is left unread. A sent
+/// message wakes it with no notices while a moved call is still out. `Err`
 /// when the session or the caller is cancelled first.
 async fn next_wake(
     mailbox: &SessionMailbox,
+    inbox: &SubagentInbox,
     session: &CancelToken,
     caller: Option<&CancelToken>,
 ) -> Result<Option<Vec<Message>>, String> {
-    let wake = session.race(mailbox.next_wake_before_answer());
+    let sent = async {
+        inbox.wait_nonempty().await;
+        Some(Vec::new())
+    };
+    let wake = session.race(or(mailbox.next_wake_before_answer(), sent));
     match caller {
         Some(caller) => caller.race(wake).await?,
         None => wake.await,
@@ -1986,7 +1993,14 @@ async fn prompt(
             break Some(err);
         }
         let caller_cancel = watch.as_ref().map(|(caller_cancel, _)| caller_cancel);
-        match next_wake(&s.cancellation.mailbox, &s.child_cancel, caller_cancel).await {
+        match next_wake(
+            &s.cancellation.mailbox,
+            &inbox,
+            &s.child_cancel,
+            caller_cancel,
+        )
+        .await
+        {
             Ok(Some(notices)) => {
                 if let Some((_, settle)) = &mut watch {
                     settle.outcome = Some(cancelled_run());
@@ -2189,6 +2203,7 @@ mod tests {
     const WOKEN_REPLY: &str = "The build passed.";
     const MOVED_CALL_ID: &str = "toolu_moved";
     const NOTICE_TEXT: &str = "Background bash toolu_moved (cargo build) finished:\n\nok";
+    const SENT_MESSAGE: &str = "Wrap up now.";
 
     #[test_case(ThinkingConfig::Effort(Effort::Low), json!({"adaptive": {"enable_thinking": true}}), ThinkingConfig::Adaptive, ThinkingConfig::Effort(Effort::Low) ; "toggle_keeps_ancestor_effort_ceiling")]
     #[test_case(ThinkingConfig::Adaptive, json!({"adaptive": {"enable_thinking": true}}), ThinkingConfig::Adaptive, ThinkingConfig::Effort(Effort::Max) ; "explicit_adaptive_stays_unbounded")]
@@ -3540,6 +3555,38 @@ mod tests {
         });
     }
 
+    /// A call moved to the background may never end, so a message sent while
+    /// the prompt waits on it has to wake the prompt by itself.
+    #[test]
+    fn a_message_sent_while_waiting_for_moved_calls_wakes_the_prompt() {
+        let lua = Lua::new();
+        let (ctx, requests) = scripted_ctx();
+        smol::block_on(async {
+            let sess = native_session(&lua, &ctx).await;
+            let mailbox = session_mailbox(&sess);
+            mailbox.track(MOVED_CALL_ID);
+            let ((text, error), woken) = futures::future::join(prompt_text(&lua, &sess), async {
+                requests.recv_async().await.unwrap();
+                let session = sess.borrow::<LuaSession>().unwrap();
+                let (sent, _) = send(&lua, &session, SENT_MESSAGE.into()).unwrap();
+                assert_eq!(sent, Some(true));
+                let woken = requests.recv_async().await.unwrap();
+                mailbox.settle(MOVED_CALL_ID, None);
+                woken
+            })
+            .await;
+            close(lua.clone(), sess.borrow().unwrap()).await.unwrap();
+
+            assert!(error.is_none(), "{error:?}");
+            assert_eq!(text.as_deref(), Some(WOKEN_REPLY));
+            assert!(
+                texts(&woken.messages)
+                    .iter()
+                    .any(|text| text.contains(SENT_MESSAGE))
+            );
+        });
+    }
+
     /// Its token fired with no prompt left to notice, so nothing would ever
     /// read what the call it moved reports.
     #[test_case(false ; "between_prompts")]
@@ -3595,7 +3642,8 @@ mod tests {
         let session = CancelToken::none();
         let (caller_trigger, caller) = CancelToken::new();
         smol::block_on(async {
-            let mut wake = pin!(next_wake(&mailbox, &session, Some(&caller)));
+            let inbox = SubagentInbox::default();
+            let mut wake = pin!(next_wake(&mailbox, &inbox, &session, Some(&caller)));
             assert!(poll_once(&mut wake).await.is_none());
             caller_trigger.cancel();
             assert!(wake.await.is_err());
