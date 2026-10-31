@@ -1,3 +1,4 @@
+use maki_config::project::Runtime;
 use std::env;
 use std::sync::Arc;
 
@@ -26,7 +27,7 @@ pub fn run(
     maki_providers::model_registry::load_from_storage(&storage);
 
     let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
-    let trust = project::resolve(&storage, &cwd, trust_mode);
+    let trust = project::resolve(&storage, &cwd, trust_mode, Runtime::Agent);
     load_env_files(&trust.project_config);
 
     let mut plugin_host = PluginHost::start(

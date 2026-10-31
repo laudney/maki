@@ -42,6 +42,7 @@ pub enum GatedFile {
     Permissions,
     InitLua,
     Mcp,
+    UiLua,
 }
 
 impl GatedFile {
@@ -59,6 +60,7 @@ impl GatedFile {
             GatedFile::Permissions => "permissions.toml",
             GatedFile::InitLua => "init.lua",
             GatedFile::Mcp => "mcp.toml",
+            GatedFile::UiLua => "ui.lua",
         }
     }
 
@@ -71,8 +73,29 @@ impl GatedFile {
             GatedFile::Permissions => "decides which tools run without asking",
             GatedFile::InitLua => "runs Lua inside Maki's own process at startup",
             GatedFile::Mcp => "starts MCP servers as child processes",
+            GatedFile::UiLua => "runs Lua inside Maki's UI at startup",
         }
     }
+
+    /// Whether {runtime} executes this file, which is what lets it hold
+    /// that runtime back.
+    pub const fn runs_in(self, runtime: Runtime) -> bool {
+        match (self, runtime) {
+            (_, Runtime::Combined) => true,
+            (GatedFile::UiLua, runtime) => matches!(runtime, Runtime::Ui),
+            (_, runtime) => matches!(runtime, Runtime::Agent),
+        }
+    }
+}
+
+/// What a run executes of a project's gated files, so a file it never runs
+/// neither holds it back nor is asked about there: `maki acp` runs the
+/// agent's, the client `ui.lua`, the TUI both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Runtime {
+    Agent,
+    Ui,
+    Combined,
 }
 
 impl std::fmt::Display for GatedFile {
@@ -173,7 +196,7 @@ impl TrustQuestion {
     /// consulted. `maki trust add` grants against this.
     pub fn for_folder(folder: &CanonicalFolder) -> Self {
         Self {
-            present: gated_files(folder.path()),
+            present: gated_files(folder.path(), Runtime::Combined),
             folder: folder.clone(),
             added: Vec::new(),
         }
@@ -311,22 +334,29 @@ pub enum TrustMode {
     Session,
 }
 
-pub fn resolve(storage: &StateDir, cwd: &Path, mode: TrustMode) -> ProjectDecision {
+/// The trust answer for {cwd} as seen by {runtime}, which only the gated
+/// files it executes can hold back.
+pub fn resolve(
+    storage: &StateDir,
+    cwd: &Path,
+    mode: TrustMode,
+    runtime: Runtime,
+) -> ProjectDecision {
     match mode {
         TrustMode::Session => session_grant(ProjectConfig::discover(cwd)),
-        TrustMode::Consult => resolve_recorded(storage, ProjectConfig::discover(cwd)),
+        TrustMode::Consult => resolve_recorded(storage, ProjectConfig::discover(cwd), runtime),
     }
 }
 
 /// For commands that never open the state directory for anything else: a state
 /// directory they cannot resolve costs them the shared project config, not the
 /// whole command.
-pub fn resolve_noninteractive(cwd: &Path, mode: TrustMode) -> ProjectDecision {
+pub fn resolve_noninteractive(cwd: &Path, mode: TrustMode, runtime: Runtime) -> ProjectDecision {
     if mode == TrustMode::Session {
         return session_grant(ProjectConfig::discover(cwd));
     }
     match StateDir::resolve() {
-        Ok(storage) => resolve(&storage, cwd, mode),
+        Ok(storage) => resolve(&storage, cwd, mode, runtime),
         Err(error) => ProjectDecision::inert(
             ProjectConfig::discover(cwd),
             format!("cannot resolve folder trust state: {error}; {SKIPPED}"),
@@ -352,7 +382,11 @@ fn session_grant(project_config: ProjectConfig) -> ProjectDecision {
     ProjectDecision::new(project_config, state, None)
 }
 
-fn resolve_recorded(storage: &StateDir, project_config: ProjectConfig) -> ProjectDecision {
+fn resolve_recorded(
+    storage: &StateDir,
+    project_config: ProjectConfig,
+    runtime: Runtime,
+) -> ProjectDecision {
     // Every config that leaves here carries the store its answer came from,
     // trusted or not, so a later write can find the same answer again.
     let project_config = project_config.with_trust_store(storage);
@@ -367,7 +401,7 @@ fn resolve_recorded(storage: &StateDir, project_config: ProjectConfig) -> Projec
         Err(error) => return ProjectDecision::inert(project_config, format!("{error}; {SKIPPED}")),
     };
     let trusted_folders = TrustedFolders::new(storage);
-    let present = gated_files(project_config.config_root());
+    let present = gated_files(project_config.config_root(), runtime);
     let decision = match trusted_folders.decide(&folder, &store_names(&present), &project_root) {
         Ok(decision) => decision,
         Err(error) => return ProjectDecision::inert(project_config, format!("{error}; {SKIPPED}")),
@@ -564,15 +598,15 @@ pub fn confirm_trust(
     Ok(trusted)
 }
 
-/// Which gated files a project ships right now. This is the set a trust answer
-/// is recorded against, so `maki trust add` and `resolve` agree on what an
-/// answer covers.
-pub fn gated_files(config_root: &Path) -> Vec<GatedFile> {
+/// Which gated files {runtime} executes that a project ships right now. This
+/// is the set a trust answer is recorded against, so `maki trust add` and
+/// `resolve` agree on what an answer covers.
+pub fn gated_files(config_root: &Path, runtime: Runtime) -> Vec<GatedFile> {
     let project_dir = config_root.join(PROJECT_DIR);
     GatedFile::ALL
         .iter()
         .copied()
-        .filter(|file| project_dir.join(file.file_name()).exists())
+        .filter(|file| file.runs_in(runtime) && project_dir.join(file.file_name()).exists())
         .collect()
 }
 
@@ -641,6 +675,7 @@ mod tests {
     const PERMISSIONS_SOURCE: &str = "[bash]\n";
     const INIT_FILE: &str = ".maki/init.lua";
     const MCP_FILE: &str = ".maki/mcp.toml";
+    const UI_LUA_FILE: &str = ".maki/ui.lua";
     const CONFIG_FILE: &str = ".maki/config.toml";
     const PERMISSIONS_FILE: &str = ".maki/permissions.toml";
     const INIT_NAME: &str = "init.lua";
@@ -694,6 +729,7 @@ mod tests {
     #[test_case(GatedFile::Permissions, "permissions.toml" ; "permissions")]
     #[test_case(GatedFile::InitLua, "init.lua" ; "init_lua")]
     #[test_case(GatedFile::Mcp, "mcp.toml" ; "mcp")]
+    #[test_case(GatedFile::UiLua, "ui.lua" ; "ui_lua")]
     fn gated_file_names_are_the_wire_format(file: GatedFile, expected: &str) {
         assert_eq!(file.file_name(), expected);
     }
@@ -748,7 +784,10 @@ mod tests {
             Prior::Nothing => {}
             Prior::Trusted => {
                 store
-                    .add(folder, &store_names(&gated_files(folder.path())))
+                    .add(
+                        folder,
+                        &store_names(&gated_files(folder.path(), Runtime::Combined)),
+                    )
                     .unwrap();
             }
             Prior::Rejected => {
@@ -799,7 +838,7 @@ mod tests {
         project: ProjectConfig,
         answer: Option<TrustAnswer>,
     ) -> Answered {
-        let decision = resolve_recorded(storage, project);
+        let decision = resolve_recorded(storage, project, Runtime::Combined);
         let pending = match &decision.state {
             TrustState::Unanswered(question) => answer.map(|answer| (question.clone(), answer)),
             _ => None,
@@ -1009,7 +1048,12 @@ mod tests {
         record_prior(prior, &storage, state.path(), &folder);
         let before = TrustedFolders::new(&storage).status(&folder).unwrap();
 
-        let decision = resolve(&storage, project.path(), TrustMode::Session);
+        let decision = resolve(
+            &storage,
+            project.path(),
+            TrustMode::Session,
+            Runtime::Combined,
+        );
 
         assert!(decision.project_config.is_trusted());
         assert_eq!(decision.warning, None);
@@ -1094,7 +1138,7 @@ mod tests {
         );
         let again = answer_question(&storage, project_at(project.path()), CANNOT_ASK);
         assert!(matches!(
-            resolve_recorded(&storage, project_at(project.path())).state,
+            resolve_recorded(&storage, project_at(project.path()), Runtime::Combined).state,
             TrustState::Unanswered(_)
         ));
         assert!(!again.config.is_trusted());
@@ -1110,7 +1154,7 @@ mod tests {
         let (_state, project, storage) = setup();
         deny(&storage, &question_at(project.path())).unwrap();
 
-        let decision = resolve_recorded(&storage, project_at(project.path()));
+        let decision = resolve_recorded(&storage, project_at(project.path()), Runtime::Combined);
 
         assert!(matches!(decision.state, TrustState::Declined(_)));
         assert_eq!(decision.state.unanswered(), None);
@@ -1127,7 +1171,7 @@ mod tests {
     fn notices_carry_the_restriction_a_bare_warning_omits() {
         let (_state, project, storage) = setup();
 
-        let decision = resolve_recorded(&storage, project_at(project.path()));
+        let decision = resolve_recorded(&storage, project_at(project.path()), Runtime::Combined);
 
         assert_eq!(decision.warning, None);
         assert_eq!(
@@ -1153,9 +1197,41 @@ mod tests {
         fs::write(project.path().join(MCP_FILE), MCP_SOURCE).unwrap();
         grant(&storage, &question).unwrap();
 
-        match resolve_recorded(&storage, project_at(project.path())).state {
+        match resolve_recorded(&storage, project_at(project.path()), Runtime::Combined).state {
             TrustState::Unanswered(later) => assert_eq!(later.added, vec![GatedFile::Mcp]),
             other => panic!("a kind added after the question must re-ask, got {other:?}"),
+        }
+    }
+
+    /// A runtime is held back only by the files it runs: a `ui.lua` added to
+    /// a folder trusted for its `init.lua` leaves the agent trusted, and the
+    /// TUI, which runs both, asks about it once.
+    #[test]
+    fn a_new_ui_lua_holds_back_only_the_runtimes_that_run_it() {
+        let (_state, project, storage) = setup();
+        grant(&storage, &question_at(project.path())).unwrap();
+        fs::write(project.path().join(UI_LUA_FILE), INIT_SOURCE).unwrap();
+
+        let agent = resolve_recorded(&storage, project_at(project.path()), Runtime::Agent);
+        assert_eq!(agent.state, TrustState::Trusted);
+        assert!(
+            agent
+                .project_config
+                .gated_path(GatedFile::InitLua)
+                .is_some()
+        );
+        let combined = resolve_recorded(&storage, project_at(project.path()), Runtime::Combined);
+        match &combined.state {
+            TrustState::Unanswered(question) => {
+                assert_eq!(question.added, vec![GatedFile::UiLua]);
+            }
+            other => panic!("the TUI must ask about the new ui.lua, got {other:?}"),
+        }
+
+        apply_answer(&storage, combined, TrustAnswer::Trust);
+        for runtime in [Runtime::Agent, Runtime::Ui, Runtime::Combined] {
+            let decision = resolve_recorded(&storage, project_at(project.path()), runtime);
+            assert_eq!(decision.state, TrustState::Trusted, "{runtime:?}");
         }
     }
 

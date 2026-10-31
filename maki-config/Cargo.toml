@@ -9,6 +9,8 @@ edition.workspace = true
 test-util = []
 
 [dependencies]
+reqwest = { workspace = true, features = ["socks", "gzip", "deflate", "stream"] }
+tokio = { workspace = true }
 maki-config-macro = { workspace = true }
 maki-storage = { workspace = true }
 serde = { workspace = true }

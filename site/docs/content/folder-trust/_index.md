@@ -16,6 +16,7 @@ anything. Maki loads none of it until you trust the folder.
 | `.maki/permissions.toml` | decides which tools run without asking |
 | `.maki/init.lua` | runs Lua inside Maki's own process at startup |
 | `.maki/mcp.toml` | starts MCP servers as child processes |
+| `.maki/ui.lua` | runs Lua inside Maki's UI at startup |
 
 The first interactive start in an untrusted project draws a card before the
 main UI opens, listing the gated files it found. It takes three answers:

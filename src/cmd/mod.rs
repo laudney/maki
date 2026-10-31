@@ -1,3 +1,4 @@
+use maki_config::project::Runtime;
 mod acp;
 mod migrate;
 mod session;
@@ -159,7 +160,7 @@ fn cli_stack(
     // The `trust.paths` policy deliberately stops at the session entry points
     // (`cmd::tui`, `maki-acp`): a one-shot utility would record a grant the
     // user never saw, for a session it never runs.
-    let trust = project::resolve_noninteractive(&cwd, trust_mode);
+    let trust = project::resolve_noninteractive(&cwd, trust_mode, Runtime::Agent);
     load_env_files(&trust.project_config);
 
     let mut host = PluginHost::start(

@@ -488,7 +488,9 @@ pub fn resolve_api_key_env(slug: &str, def: Option<&ProviderDef>) -> String {
     if let Some(builtin) = builtin_provider(slug) {
         return builtin.default_api_key_env.to_string();
     }
-    format!("{}_API_KEY", slug.to_uppercase().replace('-', "_"))
+    crate::child_env::builtin_key_env(slug)
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("{}_API_KEY", slug.to_uppercase().replace('-', "_")))
 }
 
 /// The `<SLUG>_BASE_URL` env var name (e.g. `anthropic` -> `ANTHROPIC_BASE_URL`,

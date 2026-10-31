@@ -18,8 +18,9 @@ pub mod test_support;
 pub mod tokens;
 pub(crate) mod types;
 
-pub use child_env::{shell_command, strip_provider_keys};
+pub use child_env::strip_provider_keys;
 pub use error::{AgentError, Overflow};
+pub use maki_config::shell_command;
 pub use maki_storage::sessions::add_cost;
 pub use model::{
     FastPricing, Model, ModelEntry, ModelError, ModelFamily, ModelInfo, ModelPricing, ModelTier,

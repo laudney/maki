@@ -1,3 +1,4 @@
+use maki_config::project::Runtime;
 use std::collections::HashMap;
 use std::io::Write;
 use std::iter;
@@ -659,7 +660,7 @@ fn trusted_project_config(
     mode: TrustMode,
     policy: &TrustConfig,
 ) -> ProjectConfig {
-    let mut decision = project::resolve(storage, cwd, mode);
+    let mut decision = project::resolve(storage, cwd, mode, Runtime::Agent);
     let matched = decision
         .state
         .unanswered()
@@ -1335,7 +1336,8 @@ mod tests {
         );
 
         assert_eq!(config.is_trusted(), expected_trusted);
-        let recorded = project::resolve(&storage, project.path(), TrustMode::Consult);
+        let recorded =
+            project::resolve(&storage, project.path(), TrustMode::Consult, Runtime::Agent);
         assert_eq!(recorded.project_config.is_trusted(), expected_trusted);
     }
 

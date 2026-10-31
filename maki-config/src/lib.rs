@@ -21,10 +21,15 @@ const ENV_FILE: &str = ".env";
 pub const UNTRUSTED_PROJECT_WRITE: &str =
     "folder is not trusted, so nothing was saved to .maki/permissions.toml";
 
+pub mod http;
 pub mod project;
 pub use project::{GatedFile, ProjectConfig, policy_grant};
 
+pub mod child_env;
 pub mod providers;
+
+mod shell;
+pub use shell::shell_command;
 
 pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 50 * 1024;
 pub const DEFAULT_MAX_OUTPUT_LINES: usize = 2000;
@@ -70,6 +75,11 @@ pub const DEFAULT_MAX_RETRIES: u32 = 5;
 pub const DEFAULT_MAX_LOG_BYTES_MB: u64 = 200;
 pub const DEFAULT_MAX_LOG_FILES: u32 = 10;
 pub const DEFAULT_INPUT_HISTORY_SIZE: usize = 100;
+/// The `maki.setup` sections `ui.lua` may set: the ones the UI reads. Every
+/// other section only the agent reads.
+pub const UI_LUA_SECTIONS: [&str; 4] = ["ui", "plugins", "net", "storage"];
+/// The `storage` keys `ui.lua` may set.
+pub const UI_LUA_STORAGE_KEYS: [&str; 1] = ["input_history_size"];
 
 pub const MIN_OUTPUT_BYTES: usize = 1024;
 pub const MIN_OUTPUT_LINES: usize = 10;
@@ -561,6 +571,21 @@ pub struct RawConfig {
 }
 
 impl RawConfig {
+    /// What of this `ui.lua` would set the UI reads: the sections of
+    /// [`UI_LUA_SECTIONS`], with `storage` cut to [`UI_LUA_STORAGE_KEYS`].
+    pub fn into_ui_sections(self) -> Self {
+        Self {
+            ui: self.ui,
+            plugins: self.plugins,
+            net: self.net,
+            storage: StorageFileConfig {
+                input_history_size: self.storage.input_history_size,
+                ..StorageFileConfig::default()
+            },
+            ..Self::default()
+        }
+    }
+
     pub fn merge(&mut self, overlay: RawConfig) {
         merge_option!(
             self,
@@ -578,13 +603,7 @@ impl RawConfig {
         self.trust.merge(overlay.trust);
         self.instructions.merge(overlay.instructions);
         self.telemetry.merge(overlay.telemetry);
-        for (name, plugin) in overlay.plugins {
-            let entry = self.plugins.entry(name).or_default();
-            if plugin.enabled.is_some() {
-                entry.enabled = plugin.enabled;
-            }
-            entry.opts.extend(plugin.opts);
-        }
+        merge_plugins(&mut self.plugins, overlay.plugins);
     }
 
     /// `packages` are the external package names discovery found. They are
@@ -644,6 +663,20 @@ impl RawConfig {
             });
         }
         Ok(())
+    }
+}
+
+/// Lays {overlay}'s plugin tables over {base}'s, key by key.
+fn merge_plugins(
+    base: &mut HashMap<String, PluginFileConfig>,
+    overlay: HashMap<String, PluginFileConfig>,
+) {
+    for (name, plugin) in overlay {
+        let entry = base.entry(name).or_default();
+        if plugin.enabled.is_some() {
+            entry.enabled = plugin.enabled;
+        }
+        entry.opts.extend(plugin.opts);
     }
 }
 
@@ -2320,6 +2353,10 @@ impl PluginsConfig {
             packages: enabled_packages,
             opts,
         }
+    }
+
+    pub fn is_enabled(&self, name: &str) -> bool {
+        self.names.iter().chain(&self.packages).any(|n| n == name)
     }
 }
 
@@ -4023,7 +4060,7 @@ mod tests {
         const SCOPE: &str = "cargo *";
 
         let dir = TempDir::new().unwrap();
-        let project = ProjectConfig::discover(dir.path()).with_trust(trusted);
+        let project = untrusted_project(dir.path()).with_trust(trusted);
 
         let result = append_permission_rule_with_global(
             &ToolKey::native("bash"),

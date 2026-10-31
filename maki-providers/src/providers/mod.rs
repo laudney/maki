@@ -6,8 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use futures::TryStreamExt;
-use reqwest::redirect::Policy;
-use reqwest::{Client, ClientBuilder, Proxy, Request, RequestBuilder, Response};
+use reqwest::{Client, ClientBuilder, Request, RequestBuilder, Response};
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::io::{AsyncBufRead, Lines};
@@ -19,7 +18,7 @@ use maki_storage::StateDir;
 use maki_storage::auth::{OAuthTokens, delete_tokens, load_tokens, lock_tokens, save_tokens};
 
 use crate::AgentError;
-use crate::http::{Lookup, error_chain, proxy_env};
+use crate::http::error_chain;
 use crate::retry::RetryPolicy;
 
 pub(crate) mod anthropic;
@@ -51,14 +50,7 @@ fn bearer_value(api_key: &str) -> String {
     format!("{BEARER_PREFIX}{api_key}")
 }
 
-pub fn user_agent() -> &'static str {
-    concat!(
-        "maki/v",
-        env!("CARGO_PKG_VERSION"),
-        "-g",
-        env!("GIT_SHORT_HASH")
-    )
-}
+pub use maki_config::http::{client_builder, user_agent};
 
 #[derive(Debug, Clone, Copy)]
 pub struct Timeouts {
@@ -423,21 +415,6 @@ impl Timeouts {
             .connect_timeout(self.connect)
             .read_timeout(self.low_speed)
     }
-}
-
-/// Where every client in the crate starts, so a side request (OAuth, the
-/// catalogs, container credentials) shares the providers' redirect, proxy,
-/// DNS and trust rules. Redirects stay off: a 3xx reaches
-/// [`AgentError::from_response`] and a key header is never replayed
-/// cross-origin. HTTP/1.1 stays pinned in case a dependency turns on reqwest's
-/// http2 feature.
-pub fn client_builder() -> ClientBuilder {
-    Client::builder()
-        .redirect(Policy::none())
-        .http1_only()
-        .user_agent(user_agent())
-        .proxy(Proxy::custom(|url| proxy_env().proxy_for(url.as_str())))
-        .dns_resolver(Arc::new(Lookup))
 }
 
 /// Trust comes from the platform verifier, which on Linux reads

@@ -1,3 +1,4 @@
+use maki_config::project::Runtime;
 use std::env;
 use std::io::{self, Write};
 use std::path::Path;
@@ -659,7 +660,7 @@ pub fn index(path: &str, no_plugins: bool, no_jit: bool, trust_mode: TrustMode) 
 pub fn mcp_auth(server: &str, storage: &StateDir, trust_mode: TrustMode) -> Result<()> {
     Handle::current().block_on(async {
         let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
-        let trust = project::resolve(storage, &cwd, trust_mode);
+        let trust = project::resolve(storage, &cwd, trust_mode, Runtime::Agent);
         super::report_warnings(trust.notices());
         let (config, _) = mcp_config::load_config(&cwd, trust.project_config);
         let raw = config

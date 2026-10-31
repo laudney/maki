@@ -1,3 +1,4 @@
+use maki_config::project::Runtime;
 use std::env;
 use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
@@ -16,7 +17,7 @@ pub fn add(storage: &StateDir, path: Option<&Path>, yes: bool) -> Result<()> {
     let folder = CanonicalFolder::resolve(ProjectConfig::discover(&path).config_root())?;
     // The same resolve a start in that folder would do, so the command and the
     // question agree on what is already covered and what changed.
-    let decision = project::resolve(storage, &path, TrustMode::Consult);
+    let decision = project::resolve(storage, &path, TrustMode::Consult, Runtime::Combined);
     if let Some(warning) = decision.warning {
         bail!("{warning}");
     }

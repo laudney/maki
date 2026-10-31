@@ -1,3 +1,4 @@
+use maki_config::project::Runtime;
 use std::env;
 use std::io::{self, IsTerminal, Read};
 use std::path::Path;
@@ -309,7 +310,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
     } else {
         TrustMode::Consult
     };
-    let mut trust = project::resolve(&storage, &cwd, mode);
+    let mut trust = project::resolve(&storage, &cwd, mode, Runtime::Combined);
     load_env_files(&trust.project_config);
     let mut teardown = Teardown::default();
     let launch = Launch {
@@ -559,7 +560,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
                 let was_trusted = trust.project_config.is_trusted();
                 // Re-read the store: a `/trust` grant, or a `maki trust add`
                 // run in another terminal, only takes effect from here.
-                trust = project::resolve(&storage, &cwd, mode);
+                trust = project::resolve(&storage, &cwd, mode, Runtime::Combined);
                 let (new_stack, new_warnings, pack_report) = rebuild(
                     &launch,
                     stack,
