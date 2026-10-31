@@ -59,7 +59,7 @@ const USER_INTERRUPT_TAG: &str = "user-interrupt";
 const USER_INTERRUPT_NOTE: &str =
     "The user sent a new message while you were working. Address it and continue.";
 const PARENT_INTERRUPT_TAG: &str = "parent-interrupt";
-const PARENT_INTERRUPT_NOTE: &str = "Your parent agent or plugin sent a new message while you were working, not the user directly. Address it and continue.";
+const PARENT_INTERRUPT_NOTE: &str = "Your parent agent or a plugin sent this while you were working, not the user. Address it and continue.";
 /// A layer that always answers "continue" would never let the run end, and
 /// the user would pay for every turn of it. So `agent.stop` gets this many in
 /// a row, and the count starts over whenever the user speaks.

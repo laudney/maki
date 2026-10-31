@@ -1,10 +1,9 @@
 -- task_message reaches a subagent the task tool moved to the background. The
 -- task tool tracks its moved calls here, since only it holds their sessions.
 
-local DESCRIPTION = [[Message a running background subagent by id. It reads the message after its current step.
-
-Use it when the subagent should act on something new, like a fact, a changed scope, or "wrap up now", instead of waiting for a stale result or starting over.]]
-local ID_DESCRIPTION = "Id of the background subagent, as named in its receipt"
+local DESCRIPTION =
+  'Message a running background subagent by id, e.g. a new fact, a changed scope or "wrap up now". It reads it after its current step.'
+local ID_DESCRIPTION = "Task id from its receipt"
 local MESSAGE_DESCRIPTION = "What the subagent should know or do"
 local NOT_RUNNING = "no running background subagent with id "
 local QUEUED = "Message queued for %s."

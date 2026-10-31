@@ -24,8 +24,8 @@ const NOTICE_HEAD: &str = "Background";
 const NOTICE_BODY_SEP: &str = ":\n\n";
 /// A fork can drop the call a receipt came from, and then nobody knows the tool.
 const LOST_TOOL: &str = "task";
-const LOST_NOTICE_BODY: &str = "It ended without reporting back: maki exited or reloaded, or \
-     this session was forked from the one it ran in. Its result is lost.";
+const LOST_NOTICE_BODY: &str =
+    "Maki exited or reloaded, or this session was forked, before it reported back.";
 /// Nobody listens on an unattended context's events, so its run id is never read.
 const UNATTENDED_RUN_ID: u64 = 0;
 

@@ -76,8 +76,7 @@ const HOOKED_TOOL: &str = "hooked";
 const RELEASE_CHILD_TOOL: &str = "release_child";
 const IS_PARKED_TOOL: &str = "is_parked";
 const IS_PARKED_TEXT: &str = "true";
-const MOVED_HEADER: &str =
-    "Still running in the background (their results arrive when they finish):";
+const MOVED_HEADER: &str = "Still running in the background:";
 const MOVED_BY_USER: &str = "Moved to the background by the user";
 const MOVED_AS_ASKED: &str = "Started in the background as asked";
 const FOREGROUND_NOTE_HEAD: &str = "Could not start in the background (";

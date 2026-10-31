@@ -7,7 +7,7 @@ group = "Reference"
 
 # Tools
 
-Maki ships with 23 built-in tools in this reference (21 on by default, 2 opt-in via plugin options). Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
+Maki ships with 23 built-in tools in this reference (22 on by default, 1 opt-in via plugin options). Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
 
 ## File Operations
 
@@ -18,7 +18,7 @@ Commands run in the session's working directory (see Environment) by default.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
-| `background` | boolean | no |  | Run in the background and return at once; the result arrives as a message when it ends. |
+| `background` | boolean | no |  | Run in the background. The result arrives as a message when it ends. |
 | `command` | string | yes |  | The bash command to execute |
 | `description` | string | no |  | What the command does in 3-5 words, not the command itself |
 | `timeout` | integer | no | 120 | Timeout in seconds |
@@ -171,7 +171,7 @@ Launch an autonomous subagent to perform tasks independently. Best combined with
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `background` | boolean | no | Run in the background and continue other work. The result arrives as a message when it ends. End your turn to wait for it. |
+| `background` | boolean | no | Run in the background. The result arrives as a message when it ends. End your turn to wait for it. |
 | `description` | string | yes | Short (3-5 words) description of the task |
 | `model_tier` | string | no | Model tier (optional, omit to use current model, capped at current tier):<br>- "strong" (e.g. Opus): Deep reasoning, complex architecture, subtle bugs, most critical sections. ~5x cost of medium.<br>- "medium" (e.g. Sonnet): Balanced. Refactors, features, multi-file changes.<br>- "weak" (e.g. Haiku): Fast/cheap. Search, summarize, boilerplate, simple edits. |
 | `output_schema` | object | no | JSON Schema (object) the subagent's final result must match. When set, the result is returned as a validated JSON string. |
@@ -181,19 +181,19 @@ Launch an autonomous subagent to perform tasks independently. Best combined with
 
 ### `task_stop` {#task_stop}
 
-Stop a background task (a moved command or subagent) by id.
+Stop a background task by id.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `id` | string | yes | Id of the background task, as named in its receipt |
+| `id` | string | yes | Task id from its receipt |
 
-### `task_message` <span class="badge badge-optin">opt-in</span> {#task_message}
+### `task_message` {#task_message}
 
-Message a running background subagent by id. It reads the message after its current step.
+Message a running background subagent by id, e.g. a new fact, a changed scope or "wrap up now". It reads it after its current step.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `id` | string | yes | Id of the background subagent, as named in its receipt |
+| `id` | string | yes | Task id from its receipt |
 | `message` | string | yes | What the subagent should know or do |
 
 ### `todo_write` {#todo_write}

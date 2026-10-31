@@ -216,14 +216,13 @@ const CAP_REACHED_MSG: &str = "background tasks already running";
 const HOOK_SILENT_MSG: &str = "on_background hook did not answer within";
 const MOVE_FAILED_MSG: &str = "could not move";
 const MOVE_DECLINED_MSG: &str = "declined to move";
-const RECEIPT_TAIL: &str = "Its result arrives as a message when it finishes. Do not poll or \
-     sleep for it: continue with other work or end your turn. Stop it with task_stop if it is no \
-     longer needed.";
+const RECEIPT_TAIL: &str = "Its result arrives as a message. Do not poll or sleep for it: \
+     continue other work or end your turn. Stop it with task_stop if no longer needed.";
 /// Only the session's own agent has `task_stop`: a subagent's calls move only
 /// when the user moves them, which is too rare to pay for the tool in every
 /// subagent request.
 const SUBAGENT_RECEIPT_TAIL: &str = "Its result arrives as a message before you finish. Do not \
-     poll or sleep for it: continue with other work or end your turn.";
+     poll or sleep for it: continue other work or end your turn.";
 
 pub type LoadResult = Result<(), PluginError>;
 pub(crate) enum HintContent {

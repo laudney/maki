@@ -219,12 +219,12 @@ maki -r <session-id>
 
 ## Background tasks
 
-By default the [`task`](/docs/tools/#task) tool waits for its subagent. Turn on `allow_background` and the model gets a `background` input:
+The [`task`](/docs/tools/#task) tool has a `background` input. To make every task wait for its subagent, turn it off:
 
 ```lua
 maki.setup({
     plugins = {
-        task = { allow_background = true },
+        task = { allow_background = false },
     },
 })
 ```

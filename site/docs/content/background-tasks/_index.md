@@ -78,7 +78,7 @@ Running in the background. Last 3 lines:
 ...
 Full output: <path>
 
-Moved to the background by the user (task <id>). Its result arrives as a message when it finishes. Do not poll or sleep for it: ...
+Moved to the background by the user (task <id>). Its result arrives as a message. Do not poll or sleep for it: ...
 ```
 
 A subagent has no `task_stop`. Its receipt tells it that the result arrives before it finishes.
@@ -151,17 +151,17 @@ An idle chat wakes up when the message arrives. A working model gets it after th
 
 ## Let the model start tasks
 
-The model can ask for a background run up front with `bash(background = true)`. The `task` tool takes the same input once you turn it on:
+The model can ask for a background run up front with `bash(background = true)` or `task(background = true)`. To keep every subagent in the foreground, turn the `task` input off:
 
 ```lua
 maki.setup({
     plugins = {
-        task = { allow_background = true },
+        task = { allow_background = false },
     },
 })
 ```
 
-Both take the same path as `Ctrl+B`, with the same `/tasks` row, result message and stop behavior. Maki's receipt sentence then starts with `Started in the background as asked`. A `task(background = true)` call that has to wait for a free subagent slot waits in the background, so the turn goes on.
+Both inputs take the same path as `Ctrl+B`, with the same `/tasks` row, result message and stop behavior. Maki's receipt sentence then starts with `Started in the background as asked`. A `task(background = true)` call that has to wait for a free subagent slot waits in the background, so the turn goes on.
 
 Inside `batch`, a `background = true` call cannot move by itself. Once only such calls are still running, the batch moves as a whole, and the model gets the results that are already in.
 
@@ -261,7 +261,7 @@ The session records which tasks the model still waits on. When you resume, fork 
 ```
 Background bash <id> (<summary>) lost:
 
-It ended without reporting back: maki exited or reloaded, or this session was forked from the one it ran in. Its result is lost.
+Maki exited or reloaded, or this session was forked, before it reported back.
 ```
 
 The transcript names the task, as in `Background bash lost: Start the dev server`. The message does not start a turn and reaches the model with your next prompt. A fork only reports receipts that are still in its history.
