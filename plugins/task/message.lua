@@ -45,12 +45,8 @@ maki.api.register_tool({
       message = { type = "string", description = MESSAGE_DESCRIPTION },
     },
   },
-  header = function(input)
+  summary = function(input)
     return input.id
-  end,
-  -- A restore hook that returns nothing would also drop the restored header.
-  restore = function()
-    return {}
   end,
   handler = function(input, ctx)
     local task = moved[input.id]

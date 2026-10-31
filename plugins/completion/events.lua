@@ -2,8 +2,8 @@
 -- which have to take it away, and which are this plugin's own writes coming
 -- back around.
 --
--- Separate from `init.lua` so the decisions can be tested without a running
--- event loop. `init.lua` is wiring and nothing else.
+-- Separate from `ui.lua` so the decisions can be tested without a running
+-- event loop. `ui.lua` is wiring and nothing else.
 
 local Menu = require("menu")
 local Trigger = require("trigger")

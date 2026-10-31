@@ -6,12 +6,11 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Wrap;
 
 use maki_config::providers::{self, Protocol, ProviderDef, ProvidersConfig, slugify};
-use maki_providers::catalog_providers_if_available;
-use maki_storage::StateDir;
 use maki_storage::auth::{
     ProviderCredentials, load_provider_credentials, load_tokens, save_provider_credentials,
 };
 use maki_storage::model::persist_model;
+use std::sync::Arc;
 
 use crate::components::Overlay;
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
@@ -29,16 +28,16 @@ const PROTOCOLS: &[(&str, &str)] = &[
 ];
 
 #[derive(Clone)]
-struct ProviderItem {
-    slug: String,
-    display_name: String,
-    has_key: bool,
-    has_env: bool,
-    configured: bool,
-    section: Option<&'static str>,
+pub struct LoginProvider {
+    pub slug: String,
+    pub display_name: String,
+    pub has_key: bool,
+    pub has_env: bool,
+    pub configured: bool,
+    pub section: Option<&'static str>,
 }
 
-impl PickerItem for ProviderItem {
+impl PickerItem for LoginProvider {
     fn label(&self) -> &str {
         &self.display_name
     }
@@ -91,7 +90,7 @@ struct CustomInfo {
 
 enum Step {
     Closed,
-    PickProvider(ListPicker<ProviderItem>),
+    PickProvider(ListPicker<LoginProvider>),
     PickPlan {
         picker: ListPicker<PlanItem>,
         slug: String,
@@ -161,17 +160,21 @@ enum StepAction {
     Close,
 }
 
+pub type LoginCatalog = Arc<dyn Fn() -> Option<Vec<LoginProvider>> + Send + Sync>;
+
 pub struct LoginPicker {
     step: Step,
-    provider_items: Vec<ProviderItem>,
+    provider_items: Vec<LoginProvider>,
+    catalog: Option<LoginCatalog>,
     storage: Option<maki_storage::StateDir>,
 }
 
 impl LoginPicker {
-    pub fn new() -> Self {
+    pub fn new(catalog: Option<LoginCatalog>) -> Self {
         Self {
             step: Step::Closed,
             provider_items: Vec::new(),
+            catalog,
             storage: None,
         }
     }
@@ -179,7 +182,7 @@ impl LoginPicker {
     pub fn open(&mut self, storage: maki_storage::StateDir) {
         let builtins = providers::all_builtins();
         let config = providers::ProvidersConfig::load();
-        let mut items: Vec<ProviderItem> = builtins
+        let mut items: Vec<LoginProvider> = builtins
             .iter()
             .map(|b| {
                 let has_key = load_provider_credentials(&storage, b.slug).is_some()
@@ -188,7 +191,7 @@ impl LoginPicker {
                 let configured = !has_key
                     && !has_env
                     && config.get(b.slug).is_some_and(|d| d.base_url.is_some());
-                ProviderItem {
+                LoginProvider {
                     slug: b.slug.to_string(),
                     display_name: b.display_name.to_string(),
                     has_key,
@@ -208,7 +211,7 @@ impl LoginPicker {
                 .api_key_env
                 .as_deref()
                 .is_some_and(|e| std::env::var(e).is_ok());
-            items.push(ProviderItem {
+            items.push(LoginProvider {
                 slug: slug.clone(),
                 display_name: def.display_name.clone().unwrap_or_else(|| slug.clone()),
                 has_key,
@@ -218,25 +221,10 @@ impl LoginPicker {
             });
         }
 
-        if let Some(catalog) = catalog_providers_if_available() {
-            let state_dir = StateDir::resolve().ok();
-            for cat in catalog {
-                let has_key = state_dir
-                    .as_ref()
-                    .and_then(|s| cat.load_key_from_storage(s))
-                    .is_some();
-                let has_env = cat.env_key_set().is_some();
-                items.push(ProviderItem {
-                    slug: cat.slug.clone(),
-                    display_name: cat.display_name.clone(),
-                    has_key,
-                    has_env,
-                    configured: false,
-                    section: Some("Providers from Models.dev"),
-                });
-            }
+        if let Some(catalog) = self.catalog.as_ref().and_then(|catalog| catalog()) {
+            items.extend(catalog);
         } else {
-            items.push(ProviderItem {
+            items.push(LoginProvider {
                 slug: CATALOG_UNAVAILABLE_SLUG.to_string(),
                 display_name: "Models.dev providers (not yet downloaded)".to_string(),
                 has_key: false,
@@ -246,7 +234,7 @@ impl LoginPicker {
             });
         }
 
-        items.push(ProviderItem {
+        items.push(LoginProvider {
             slug: "custom".to_string(),
             display_name: "Custom provider...".to_string(),
             has_key: false,

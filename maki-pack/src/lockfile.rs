@@ -8,12 +8,30 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+/// The part of maki that installed or declared a package in a site, so a
+/// host that loads one part never removes what the other still uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Owner {
+    Agent,
+    Ui,
+}
+
 /// One recorded package. The source is stored alongside the revision so a
 /// lockfile entry describes where its commit came from, not just what it was.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LockEntry {
     pub src: String,
     pub rev: String,
+    /// Sorted. An entry without the field was written before owners
+    /// existed, or by a build that drops them, and only the agent installed
+    /// packages then.
+    #[serde(default = "legacy_owners")]
+    pub owners: Vec<Owner>,
+}
+
+fn legacy_owners() -> Vec<Owner> {
+    vec![Owner::Agent]
 }
 
 /// A `BTreeMap` rather than a hash map, so the file serializes in a stable
@@ -31,19 +49,62 @@ impl Lockfile {
 
     /// Records a package at a revision. Called only after the change on disk
     /// succeeded, so a failed fetch never moves a recorded revision.
+    ///
+    /// A recorded package keeps its owners, since a new revision is not a new
+    /// owner; a new one reads as the agent's, as an entry from before owners
+    /// did, until its host names them with [`Lockfile::set_owners`].
     pub fn record(
         &mut self,
         name: impl Into<String>,
         src: impl Into<String>,
         rev: impl Into<String>,
     ) {
+        let name = name.into();
+        let owners = self
+            .packages
+            .remove(&name)
+            .map_or_else(legacy_owners, |entry| entry.owners);
         self.packages.insert(
-            name.into(),
+            name,
             LockEntry {
                 src: src.into(),
                 rev: rev.into(),
+                owners,
             },
         );
+    }
+
+    /// Replaces the owners of a recorded package; whether anything changed.
+    pub fn set_owners(&mut self, name: &str, owners: &[Owner]) -> bool {
+        let Some(entry) = self.packages.get_mut(name) else {
+            return false;
+        };
+        let mut owners = owners.to_vec();
+        owners.sort();
+        owners.dedup();
+        let changed = entry.owners != owners;
+        entry.owners = owners;
+        changed
+    }
+
+    /// Adds {owners} to a recorded package; whether anything changed.
+    pub fn add_owners(&mut self, name: &str, owners: &[Owner]) -> bool {
+        let Some(entry) = self.packages.get_mut(name) else {
+            return false;
+        };
+        let before = entry.owners.len();
+        entry.owners.extend_from_slice(owners);
+        entry.owners.sort();
+        entry.owners.dedup();
+        entry.owners.len() != before
+    }
+
+    /// Takes {owners} off a recorded package, keeping the entry even when
+    /// no owner is left: removing it goes with removing the checkout.
+    pub fn remove_owners(&mut self, name: &str, owners: &[Owner]) {
+        if let Some(entry) = self.packages.get_mut(name) {
+            entry.owners.retain(|owner| !owners.contains(owner));
+        }
     }
 
     pub fn remove(&mut self, name: &str) {
@@ -103,6 +164,46 @@ mod tests {
         other.record("mid", "https://x/mid", "bbb");
         other.record("zebra", "https://x/zebra", "ccc");
         assert_eq!(json(&other), json(&filled()));
+    }
+
+    /// An entry an older build wrote, or one before owners existed, is the
+    /// agent's, and an unknown owner list is never guessed at.
+    #[test]
+    fn an_entry_without_owners_reads_as_the_agents() {
+        let lock: Lockfile =
+            serde_json::from_str(r#"{"packages":{"demo":{"src":"https://x/demo","rev":"aaa"}}}"#)
+                .unwrap();
+        assert_eq!(lock.get("demo").unwrap().owners, [Owner::Agent]);
+    }
+
+    #[test]
+    fn a_new_revision_keeps_the_owners() {
+        let mut lock = filled();
+        lock.set_owners("alpha", &[Owner::Ui]);
+        lock.record("alpha", "https://x/alpha", "ddd");
+        assert_eq!(lock.get("alpha").unwrap().owners, [Owner::Ui]);
+    }
+
+    #[test]
+    fn owners_are_added_once_and_removed_alone() {
+        let mut lock = filled();
+        assert!(lock.add_owners("alpha", &[Owner::Ui]));
+        assert!(!lock.add_owners("alpha", &[Owner::Ui, Owner::Agent]));
+        lock.remove_owners("alpha", &[Owner::Ui]);
+        assert_eq!(lock.get("alpha").unwrap().owners, [Owner::Agent]);
+    }
+
+    #[test]
+    fn owners_round_trip_by_name() {
+        let mut lock = filled();
+        lock.set_owners("alpha", &[Owner::Ui, Owner::Agent]);
+        let text = json(&lock);
+        assert!(
+            text.contains(r#""agent","#) && text.contains(r#""ui""#),
+            "{text}"
+        );
+        let back: Lockfile = serde_json::from_str(&text).unwrap();
+        assert_eq!(back, lock);
     }
 
     #[test]

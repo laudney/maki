@@ -1896,4 +1896,28 @@ case("provider_parse_models_keeps_the_first_row_per_id_sorted", function()
   eq(#parse.models({}, function() end), 0, "a body without data")
 end)
 
+local path_text = require("maki.path_text")
+local shorten_path = require("maki.shorten_path")
+
+local SESSION_CWD, SESSION_HOME = "/work/repo", "/home/me"
+
+case("path_text_shortens_against_the_session_cwd_and_home", function()
+  local shorten = path_text.shorten
+  eq(shorten("/work/repo/src/main.rs", SESSION_CWD, SESSION_HOME), "src/main.rs", "inside cwd")
+  eq(shorten("/work/repo", SESSION_CWD, SESSION_HOME), "/work/repo", "the cwd itself")
+  eq(shorten("/home/me/notes.md", SESSION_CWD, SESSION_HOME), "~/notes.md", "under home")
+  eq(shorten("/srv/data.txt", SESSION_CWD, SESSION_HOME), "/srv/data.txt", "elsewhere")
+  eq(shorten("/work/repository/x", SESSION_CWD, SESSION_HOME), "/work/repository/x", "a sibling sharing a prefix")
+  eq(shorten("C:\\work\\a.txt", "C:\\work"), "a.txt", "backslashes")
+end)
+
+case("path_text_skips_a_home_the_session_does_not_know", function()
+  eq(path_text.shorten("/home/me/notes.md", SESSION_CWD, nil), "/home/me/notes.md")
+end)
+
+case("shorten_path_reads_the_drawing_process", function()
+  local cwd = maki.uv.cwd()
+  eq(shorten_path(cwd .. "/a.txt"), "a.txt")
+end)
+
 th.report()

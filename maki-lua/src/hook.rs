@@ -16,8 +16,9 @@ use serde_json::{Value, json};
 
 use crate::api::slot::{ANY_TOOL, LayerCost, LayeredTools, PERMISSION_PROMPT_SLOT, host_slot_name};
 use crate::api::util::ctx::LuaCtx;
+use crate::domains::agent::{HookRun, PromptRun, RunHook, RunPrompt};
 use crate::plugin_permissions::Permission;
-use crate::runtime::{HookRun, KILL_GRACE, PromptRun, Request, SLICE_KILL, WATCHDOG_POLL_INTERVAL};
+use crate::runtime::{KILL_GRACE, Request, SLICE_KILL, WATCHDOG_POLL_INTERVAL};
 
 /// Every `agent.*` slot steers what the agent does next: the prompt it
 /// answers, whether it stops, what it remembers after a compaction. No
@@ -31,17 +32,11 @@ const AGENT_SLOT_COST: LayerCost<'static> = LayerCost::TOTAL;
 /// refuse with any text it likes, or turn a command into `echo`. Without this
 /// a `net`-only plugin could ship the input `ToolDone` keeps from it, or put
 /// words in front of the model.
-const TOOL_LAYER_CONTENT: &[Permission] = &[Permission::SessionRead, Permission::SessionWrite];
-
-/// How long past a chain's deadline this thread may still answer it. It polls
-/// a chain before it checks the deadline, so a layer that finishes in its
-/// first slice is reported however late it started. That slice may queue
-/// behind another task's, which the watchdog cuts at [`SLICE_KILL`], and may
-/// itself run [`KILL_GRACE`] before it is shot. Each kill lands within a
-/// watchdog poll, which also covers the round trip of the reply.
 const ANSWER_GRACE: Duration = SLICE_KILL
     .saturating_add(KILL_GRACE)
     .saturating_add(WATCHDOG_POLL_INTERVAL.saturating_mul(2));
+
+const TOOL_LAYER_CONTENT: &[Permission] = &[Permission::SessionRead, Permission::SessionWrite];
 
 /// What every layer on a tool call pays, `permission.prompt` included: the
 /// call's {authority}, plus [`TOOL_LAYER_CONTENT`].
@@ -69,7 +64,7 @@ impl SlotHook {
     /// failure of whatever asked for it.
     fn send(&self, run: HookRun) -> BoxFuture<'_, Verdict> {
         let (reply, answer) = flume::bounded(1);
-        let request = Request::RunHook { run, reply };
+        let request = Request::domain(RunHook { run, reply });
         Box::pin(async move {
             if self.tx.send_async(request).await.is_err() {
                 return Verdict::Unchanged;
@@ -95,6 +90,7 @@ impl ToolHook for SlotHook {
         call: &'a HookCall<'a>,
     ) -> BoxFuture<'a, Verdict> {
         self.send(HookRun {
+            working_dir: Some(Arc::from(call.working_dir)),
             slots: vec![
                 host_slot_name(call.tool, stage),
                 host_slot_name(ANY_TOOL, stage),
@@ -141,10 +137,10 @@ impl ToolHook for SlotHook {
                     "input": input,
                     "scopes": scopes,
                 }),
-                ctx: Box::new(LuaCtx::handler(ctx)),
+                ctx: Box::new(LuaCtx::detached_handler(ctx)),
             };
             self.tx
-                .send_async(Request::RunPrompt { run, reply })
+                .send_async(Request::domain(RunPrompt { run, reply }))
                 .await
                 .ok()?;
             answer.recv_async().await.ok().flatten()
@@ -168,6 +164,7 @@ impl AgentHook for SlotHook {
         call: &'a AgentCall<'a>,
     ) -> BoxFuture<'a, Verdict> {
         self.send(HookRun {
+            working_dir: None,
             slots: vec![slot.name().to_owned()],
             cost: AGENT_SLOT_COST,
             cancel: call.cancel.clone(),

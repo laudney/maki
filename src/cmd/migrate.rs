@@ -12,7 +12,7 @@ use color_eyre::eyre::Context;
 use maki_storage::input_history::MAX_ENTRIES;
 use maki_storage::paths::{self, tilde};
 
-use crate::provider_scripts::{self, MIGRATE_COMMAND, Reference, Script};
+use maki_host::provider_scripts::{self, MIGRATE_COMMAND, Reference, Script};
 
 #[cfg(unix)]
 const AUTH_FILE_MODE: u32 = 0o600;

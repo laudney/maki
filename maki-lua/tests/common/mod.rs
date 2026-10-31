@@ -14,10 +14,10 @@ use maki_agent::tools::test_support::{stub_ctx_with, stub_seed};
 use maki_agent::tools::{CallOrigin, ToolContext, ToolRegistry};
 use maki_agent::{
     AgentEvent, AgentMode, AgentSeed, CallScope, CancelToken, Envelope, EventSender,
-    SessionMailbox, SharedBuf, ToolDoneEvent,
+    SessionMailbox, ToolDoneEvent,
 };
 use maki_lua::test_support::runtime;
-use maki_lua::{EventHandle, MoveOutcome, UiAction};
+use maki_lua::{AgentHandle, MoveOutcome};
 use maki_providers::provider::{BoxFuture, Provider};
 use maki_providers::{
     AgentError, ContentBlock, Message, Model, ModelInfo, ProviderEvent, RequestOptions, Role,
@@ -40,6 +40,7 @@ pub struct Chat {
     pub id: MakiId,
     pub mailbox: SessionMailbox,
     pub seed: Arc<AgentSeed>,
+    pub events: flume::Receiver<Envelope>,
 }
 
 impl Chat {
@@ -47,7 +48,14 @@ impl Chat {
         let id = MakiId::generate();
         let mailbox = SessionMailbox::register(id);
         let seed = mailbox.publish_seed(stub_seed(id));
-        Self { id, mailbox, seed }
+        let (tx, events) = flume::unbounded();
+        mailbox.publish_events(EventSender::new(tx, 0));
+        Self {
+            id,
+            mailbox,
+            seed,
+            events,
+        }
     }
 }
 
@@ -68,6 +76,7 @@ pub fn call_ctx(
     let scope = Arc::new(CallScope::new(call_id.to_owned(), run));
     ctx.cancel = scope.cancel().clone();
     ctx.call = Some(scope);
+    ctx.progress = Some(maki_agent::tools::ProgressScope::default());
     ctx.session_id = Some(SessionRef::from(chat));
     ctx.mailbox = SessionMailbox::open(chat).ok();
     ctx.registry = Arc::clone(reg);
@@ -120,15 +129,14 @@ pub fn wait_movable(events: &flume::Receiver<Envelope>, call_id: &str) {
     });
 }
 
-pub fn wait_live_buf(events: &flume::Receiver<Envelope>, call_id: &str) -> Arc<SharedBuf> {
-    next_event(events, |event| match event {
-        AgentEvent::LiveToolBuf { id, body } if id == call_id => Some(body),
-        _ => None,
-    })
+pub fn wait_progress(events: &flume::Receiver<Envelope>, call_id: &str) {
+    next_event(events, |event| {
+        matches!(&event, AgentEvent::ToolProgress(progress) if progress.id == call_id).then_some(())
+    });
 }
 
 /// What Ctrl+B on the call's row gets back.
-pub fn request_move(handle: &EventHandle, call_id: &str) -> MoveOutcome {
+pub fn request_move(handle: &AgentHandle, call_id: &str) -> MoveOutcome {
     handle
         .request_background(call_id.to_owned())
         .recv_timeout(WAIT)
@@ -136,10 +144,10 @@ pub fn request_move(handle: &EventHandle, call_id: &str) -> MoveOutcome {
 }
 
 /// The next event a task tab was sent.
-pub fn next_task_event(ui: &flume::Receiver<UiAction>) -> Envelope {
+pub fn next_task_event(ui: &flume::Receiver<Envelope>) -> Envelope {
     loop {
-        if let UiAction::PluginTaskEvent { envelope, .. } =
-            ui.recv_timeout(WAIT).expect("task tab event")
+        if let AgentEvent::PluginTask { envelope, .. } =
+            ui.recv_timeout(WAIT).expect("task tab event").event
         {
             return *envelope;
         }
@@ -147,7 +155,7 @@ pub fn next_task_event(ui: &flume::Receiver<UiAction>) -> Envelope {
 }
 
 /// The next final reply a task tab got, of a moved call or of a subagent's.
-pub fn next_task_done(ui: &flume::Receiver<UiAction>) -> ToolDoneEvent {
+pub fn next_task_done(ui: &flume::Receiver<Envelope>) -> ToolDoneEvent {
     loop {
         if let AgentEvent::ToolDone(done) = next_task_event(ui).event {
             return *done;

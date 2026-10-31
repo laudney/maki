@@ -2,13 +2,14 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use maki_types::command::ARGUMENTS_PLACEHOLDER;
+pub use maki_types::command::{CommandScope, CustomCommand};
 use serde::Deserialize;
 use tracing::{debug, warn};
 
 const COMMANDS_DIR: &str = "commands";
 const PROJECT_COMMAND_DIRS: &[&str] = &[".maki/commands", ".claude/commands"];
 const GLOBAL_THIRD_PARTY_COMMAND_DIRS: &[&str] = &[".claude/commands"];
-const ARGUMENTS_PLACEHOLDER: &str = "$ARGUMENTS";
 
 #[derive(Debug, Default, Deserialize)]
 struct Frontmatter {
@@ -68,39 +69,6 @@ fn parse_frontmatter(content: &str) -> (Frontmatter, &str) {
 
     let fm = serde_saphyr::from_str(yaml).unwrap_or_default();
     (fm, body)
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CommandScope {
-    Project,
-    User,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CustomCommand {
-    pub name: String,
-    pub description: String,
-    pub content: String,
-    pub scope: CommandScope,
-    pub accepts_args: bool,
-}
-
-impl CustomCommand {
-    pub fn display_name(&self) -> String {
-        let prefix = match self.scope {
-            CommandScope::Project => "/project",
-            CommandScope::User => "/user",
-        };
-        format!("{prefix}:{}", self.name)
-    }
-
-    pub fn has_args(&self) -> bool {
-        self.accepts_args
-    }
-
-    pub fn render(&self, args: &str) -> String {
-        self.content.replace(ARGUMENTS_PLACEHOLDER, args)
-    }
 }
 
 pub fn discover_commands(cwd: &Path) -> Vec<CustomCommand> {

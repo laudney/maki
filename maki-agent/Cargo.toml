@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+event-listener = { workspace = true }
 maki-providers = { workspace = true }
 maki-config = { workspace = true }
 maki-otel = { workspace = true }
@@ -12,7 +13,6 @@ serde_json = { workspace = true }
 serde_path_to_error = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-ignore = { workspace = true }
 strum = { workspace = true }
 maki-storage = { workspace = true }
 maki-types = { workspace = true }
@@ -23,7 +23,7 @@ tokio = { workspace = true }
 flume = { workspace = true }
 arc-swap = { workspace = true }
 bitflags = { workspace = true }
-event-listener = { workspace = true }
+futures-lite = { workspace = true }
 toml = { workspace = true }
 toml_edit = { workspace = true }
 reqwest = { workspace = true }
@@ -41,6 +41,7 @@ url = { workspace = true }
 
 
 [dev-dependencies]
+ignore = { workspace = true }
 maki-config = { workspace = true, features = ["test-util"] }
 maki-providers = { workspace = true, features = ["test-support"] }
 test-case = { workspace = true }

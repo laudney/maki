@@ -1,11 +1,15 @@
 use super::mouse::FLASH_COPIED;
-use super::session::{FORK_EMPTY_MSG, FORK_TITLE_PREFIX};
-use super::view::FINISHED_TAB_HINT;
 use super::*;
 use crate::AppSession;
+use crate::agent::capabilities::SESSION_OPENING;
+use crate::agent::fake_agent::remote_settled;
+use crate::agent::remote_plan::{self, RemotePlan};
 use crate::agent::shared_queue;
-use crate::app::tasks::{TaskParent, TaskStatus};
-use crate::chat::{CANCELLED_TEXT, DONE_TEXT, ERROR_TEXT, INBOX_DROPPED_SUFFIX, LOST_TEXT};
+use crate::agent::{RemoteSession, SessionBinding};
+use crate::app::tasks::TaskStatus;
+use crate::app::view::FINISHED_TAB_HINT;
+use crate::chat::LOST_TEXT;
+use crate::chat::{CANCELLED_TEXT, DONE_TEXT, ERROR_TEXT, INBOX_DROPPED_SUFFIX};
 use crate::components::btw_modal::BtwEvent;
 use crate::components::command::{PROMPT_NEEDS, ParsedCommand, USER_ONLY_SUFFIX};
 use crate::components::file_picker::UNREADABLE_DIR_MSG;
@@ -13,67 +17,67 @@ use crate::components::keybindings::{KeybindContext, key as kb};
 use crate::components::messages::{ClickOutcome, ScrollPos};
 use crate::components::rewind_picker::RewindEntry;
 use crate::components::split_layout::MIN_CHAT_ROWS;
-use crate::components::{ExitRequest, buffer_text, key, test_model};
+use crate::components::{ExitRequest, buffer_text, key};
 use crate::decor_worker;
 use crate::highlight::TAB_SPACES;
+use crate::lua_handle::test_support::{RequestProbe, probed_event_handle};
 use crate::repaint::expect::{OWED, QUIET};
 use crate::selection::{RowPos, SelectableZone, SelectionState, SelectionZone};
 use crate::text_buffer::{Decoration, EDIT_CONFLICT_ERR, INPUT_REPLACED_ERR, Mark};
 use crate::theme;
-use arc_swap::ArcSwap;
+use agent_client_protocol_schema::v1::SessionConfigOption;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
-use maki_agent::agent::TranscriptError;
-use maki_agent::command::{CommandScope, CustomCommand};
-use maki_agent::permissions::{PermissionAnswer, PermissionManager};
-use maki_agent::session::NOTHING_TO_STORE;
-use maki_agent::tools::ToolRegistry;
-use maki_agent::{
-    AgentMode, BackgroundNotice, CallRecord, DoneReason, HistorySnapshot, ImageMediaType,
-    McpConfigErrors, McpPromptArg, McpPromptInfo, McpServerInfo, McpServerStatus, McpSnapshot,
-    McpSnapshotReader, RunTotals, SharedBuf, SteerKind, SubagentInbox, TaskLabel, ToolDoneEvent,
-    ToolOutput, ToolStartEvent, Transcript, TurnCompleteEvent, result_notice,
+use maki_config::{PluginsConfig, ToolKey, UiConfig};
+use maki_lua_core::pack::{PackCommand, PackPlan, PackPreparation, PackReport};
+use maki_lua_core::plugin_permissions::{Missing, Permission, PluginPermissions};
+use maki_lua_ui::test_support::{
+    HintWriterHandle, TestBinding, hint_writer_pair, keymap_reader_from, set_mode,
 };
-use maki_config::{
-    Effect, PermissionRule, PermissionsConfig, PluginsConfig, ProjectConfig, ToolKey, UiConfig,
-};
-use maki_lua::test_support::{
-    HintWriterHandle, RequestProbe, TestBinding, hint_writer_pair, keymap_reader_from,
-    probed_event_handle, set_mode,
-};
-use maki_lua::{
+use maki_lua_ui::{
     BuiltinAction, Dimension, FloatConfig, HintEntry, HintReader, InputRequest, InputRulesReader,
-    InputSubmit, KeybindTicket, KeymapReader, LuaCommandInfo, LuaCommandReader, Missing, PASTE,
-    PackCommand, PackPlan, PackPreparation, PackReport, Permission, PluginHost, PluginPermissions,
-    SessionEndReason, Split, TextEdit, UiAction, WinCommand, WinEvent,
-};
-use maki_providers::{
-    ContentBlock, Effort, Message, Model, RequestOptions, Role, THINKING_USAGE, TaskSettled,
-    ThinkingSupport, TokenUsage,
+    InputSubmit, KeybindTicket, KeymapReader, LuaCommandInfo, LuaCommandReader, PASTE, Split,
+    TabRef, TextEdit, UiAction, WinCommand, WinEvent,
 };
 use maki_storage::id::MakiId;
-use maki_storage::model::read_thinking;
+use maki_storage::sessions::Effort;
+use maki_storage::sessions::StoredSubagent;
 use maki_storage::sessions::{
-    SessionClaim, SessionMeta, StoredMode, StoredSubagent, StoredThinking, StoredTokenUsage,
-    StoredWriters, THINKING_ADAPTIVE, ThinkingParseError,
+    SessionMeta, StoredMode, StoredThinking, StoredTokenUsage, StoredWriters,
 };
 use maki_storage::trusted_folders::{CanonicalFolder, TrustedFolders};
+use maki_types::command::{CommandScope, CustomCommand};
+use maki_types::event::{CallRecord, RunTotals};
+use maki_types::event::{SessionEndReason, ToolDoneEvent, ToolStartEvent, TurnCompleteEvent};
+use maki_types::inbox::SubagentInbox;
+use maki_types::input::AgentMode;
+use maki_types::mcp::{
+    McpPromptArg, McpPromptInfo, McpServerInfo, McpServerStatus, McpSnapshot, McpSnapshotReader,
+};
+use maki_types::message::{ContentBlock, ImageMediaType, Message, Role};
+use maki_types::message::{TaskEnd, TaskSettled};
+use maki_types::snapshot::SharedBuf;
+use maki_types::stop_reason::DoneReason;
+use maki_types::thinking::{RequestOptions, ThinkingConfig};
+use maki_types::tool::{DEFAULT_DATA_VERSION, ToolOutput};
+use maki_types::usage::TokenUsage;
+use maki_wire::client::{AcpClient, Link};
+use maki_wire::extensions::Agreed;
+use maki_wire::plan::PlanWritten;
+use maki_wire::session::METHOD as SESSION_METHOD;
+use maki_wire::usage::SessionLedger;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Modifier, Style};
-use std::env;
-use std::fs;
-use std::iter;
+use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{env, fs, iter};
 use tempfile::TempDir;
 use test_case::test_case;
-use tokio::runtime::EnterGuard;
+use tokio::runtime::{EnterGuard, Handle};
 
-const WRITER_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
-const NATIVE_OUTPUT_CAP: u32 = 8192;
-const ALL_LANDED: &str = "a drain that wrote everything reports nothing unsaved";
 const TASK_ID: &str = "task1";
 pub(crate) const STARTED_AT_KEY: &str = "started_at";
 const ENDED_AT_KEY: &str = "ended_at";
@@ -84,31 +88,16 @@ const PACKDEL_USAGE: &str = "/packdel: name a package, or pass ++all";
 const PACK_FAILURES: &str = "first; second";
 const PACK_REVIEW_PROMPT: &str = "Apply these package changes?";
 pub(crate) const RESEARCH_NAME: &str = "research";
-const SUB_TOOL_ID: &str = "sub_t1";
-const TOOL_OUTPUT_LINE: &str = "hello from the subagent";
-const LATE_MODEL_SPEC: &str = "zai/glm-5";
 const PRIMARY_TEXT: &str = "selected text";
 const HINT_PLUGIN: &str = "statusline";
 const HINT_TEXT: &str = "2/4 staged";
 const HINT_STYLE: &str = "fg";
 const RETRY_MESSAGE: &str = "overloaded";
 const RETRY_DELAY: Duration = Duration::from_secs(5);
-const NOTICE_BODY: &str = "Background task find auth finished:\n\nok";
-const NOTICE_LINE: &str = "Background agent finished: find auth";
-const SECOND_NOTICE_LINE: &str = "Background agent failed: lint";
-const NOTICE_PROMPT: &str = "what changed";
-const QUEUED_PROMPT: &str = "and then";
-const LAST_QUEUED_PROMPT: &str = "one more";
-const NOTICE_REPLY: &str = "the build is green";
-const STEERED_TEXT: &str = "rewritten by a plugin";
+
 const MISSING_DIR: &str = "gone";
 const RESUMED_PROMPT: &str = "carry me over";
-const SONNET_SPEC: &str = "anthropic/claude-sonnet-4-5";
 const OPUS_SPEC: &str = "anthropic/claude-opus-4-8";
-const PLAIN_MODEL_SPEC: &str = "ollama/qwen3";
-const THINKING_OPTIONS: &str = "thinking_options";
-const THINKING_SHOWN: &str = "thinking_shown";
-const FIXED_ADAPTIVE_PROVIDER: &str = "xai";
 const MODEL_CHANGED_EVENT: &str = "ModelChanged";
 const INPUT_CHANGED_EVENT: &str = "InputChanged";
 const PLAN_READY_EVENT: &str = "PlanReady";
@@ -136,9 +125,7 @@ const OVERLAY_TAKES_THE_CURSOR: &str = "an overlay unfocuses the input box, so n
 const MEASURED_CONTEXT: u32 = 100_000;
 const TEST_MODEL_SPEC: &str = "test-model";
 const TEST_CWD: &str = "/tmp/test";
-const DOCUMENT_TEXT: &str = "moved in from another maki";
-const UNKNOWN_THINKING: &str = "lukewarm";
-const PERMISSIONS_CWD: &str = "/tmp";
+
 /// The rewind fixture holds a few dozen bytes of chat, far below this, so it
 /// doubles as the window the gauge is allowed to land in.
 const SMALL_HISTORY: u32 = 1_000;
@@ -164,86 +151,63 @@ fn set_zone(app: &mut App, zone: SelectionZone, area: Rect) {
     app.zones.push(SelectableZone { area, zone });
 }
 
-fn build_app(dir: StateDir, writer: Arc<StorageWriter>) -> App {
-    build_app_with_lua(dir, writer, LuaCommandReader::empty())
+fn build_app(dir: StateDir) -> App {
+    build_app_with_lua(dir, LuaCommandReader::empty())
 }
 
-fn build_app_with_lua(
-    dir: StateDir,
-    writer: Arc<StorageWriter>,
-    lua_commands: LuaCommandReader,
-) -> App {
+fn build_app_with_lua(dir: StateDir, lua_commands: LuaCommandReader) -> App {
     let tab = OpenSession::fresh(TEST_MODEL_SPEC, TEST_CWD, &dir);
-    build_app_with_session(dir, writer, lua_commands, tab, test_permissions(false))
-}
-
-fn test_permissions(yolo: bool) -> Arc<PermissionManager> {
-    Arc::new(PermissionManager::new(
-        PermissionsConfig {
-            yolo,
-            ..Default::default()
-        },
-        PathBuf::from(PERMISSIONS_CWD),
-        ProjectConfig::for_project(Path::new(PERMISSIONS_CWD)),
-        Arc::default(),
-    ))
+    build_app_with_session(dir, lua_commands, tab, false)
 }
 
 fn build_app_with_session(
     dir: StateDir,
-    writer: Arc<StorageWriter>,
     lua_commands: LuaCommandReader,
     tab: OpenSession,
-    permissions: Arc<PermissionManager>,
+    yolo: bool,
 ) -> App {
-    // Mirrors the event loop, where the session's own spec decides and the
-    // startup model catches one that will not resolve.
-    let model = Model::from_spec(&tab.session.model).unwrap_or_else(|_| test_model());
-    App::new(
-        &model,
+    if Handle::try_current().is_err() {
+        thread_local! { static RUNTIME: EnterGuard<'static> = crate::test_runtime().enter(); }
+        RUNTIME.with(|_| {});
+    }
+    let mut app = App::new(
         tab,
         dir,
-        Arc::new(ArcSwapOption::empty()),
         McpSnapshotReader::empty(),
-        McpConfigErrors::new(PathBuf::new()),
         lua_commands,
         KeymapReader::empty(),
         HintReader::empty(),
         InputRulesReader::empty(),
-        writer,
         UiConfig::default(),
         100,
-        permissions,
+        yolo,
         Arc::from([]),
-        maki_lua::EventHandle::disconnected_for_test(),
-        Arc::new(maki_config::ModelPolicy::default()),
-    )
-}
-
-fn test_writer(dir: StateDir) -> StorageWriter {
-    StorageWriter::new(dir, flume::unbounded().0)
-}
-
-/// A synchronous test that spawns tasks or blocks on them the way the UI
-/// thread does holds this for its whole body.
-pub(crate) fn enter_runtime() -> EnterGuard<'static> {
-    maki_lua::test_support::runtime().enter()
+        crate::EventHandle::disconnected_for_test(),
+        None,
+    );
+    app.backend = AgentBackend::Remote {
+        native: true,
+        host: true,
+        images: true,
+        plan: true,
+        settings: true,
+        btw: true,
+        usage_ledger: true,
+        login: true,
+        plan_file: true,
+        reload: true,
+    };
+    app
 }
 
 pub(crate) fn test_app() -> App {
-    spawned_app(
-        tmp_tab(AppSession::new(TEST_MODEL_SPEC, TEST_CWD)),
-        test_permissions(false),
-    )
+    spawned_app(tmp_tab(AppSession::new(TEST_MODEL_SPEC, TEST_CWD)), false)
 }
 
-/// A tab the way `Ctrl-N` and a resume build one. `App::new` takes the session
-/// plus a fork of the prototype manager, and everything the permissions do has
-/// to come back out of that meta.
-fn spawned_app(tab: OpenSession, permissions: Arc<PermissionManager>) -> App {
+/// Builds a tab from its stored session and the invocation's yolo default.
+fn spawned_app(tab: OpenSession, yolo: bool) -> App {
     let dir = tmp_state();
-    let writer = Arc::new(test_writer(dir.clone()));
-    let mut app = build_app_with_session(dir, writer, LuaCommandReader::empty(), tab, permissions);
+    let mut app = build_app_with_session(dir, LuaCommandReader::empty(), tab, yolo);
     let (shared_queue, _rx) = shared_queue::queue();
     app.queue.set_shared(shared_queue);
     app
@@ -269,15 +233,6 @@ fn app_without_splash() -> App {
     app
 }
 
-/// Hands back the slot providers publish their model lists into, since the app
-/// keeps no handle to it once the picker owns it.
-fn app_with_model_slot() -> (App, Arc<ArcSwapOption<ModelList>>) {
-    let models = Arc::new(ArcSwapOption::empty());
-    let mut app = test_app();
-    app.model_picker = ModelPicker::new(Arc::clone(&models));
-    (app, models)
-}
-
 /// Hands back the end a plugin publishes hints through. That is the Lua thread
 /// in production, and this test here. Seeding the watch from the new reader is
 /// what `App::new` does, and skipping it would make the first poll report the
@@ -290,19 +245,11 @@ fn app_with_hints() -> (App, HintWriterHandle) {
     (app, writer)
 }
 
-fn tempdir_app() -> (TempDir, StateDir, Arc<StorageWriter>, App) {
+fn tempdir_app() -> (TempDir, StateDir, App) {
     let tmp = TempDir::new().unwrap();
     let dir = StateDir::from_path(tmp.path().to_path_buf());
-    let writer = Arc::new(test_writer(dir.clone()));
-    let app = build_app(dir.clone(), Arc::clone(&writer));
-    (tmp, dir, writer, app)
-}
-
-/// What the event loop does on a load. It reads the session, resolves its
-/// model and hands both to the app, which adopts them.
-fn load_session(app: &mut App, id: MakiId, model: &Model) {
-    let tab = OpenSession::load(id, &app.storage).unwrap();
-    app.apply_loaded_session(tab, model);
+    let app = build_app(dir.clone());
+    (tmp, dir, app)
 }
 
 fn mouse_event(kind: MouseEventKind, column: u16, row: u16) -> Msg {
@@ -347,21 +294,13 @@ pub(crate) fn end_turn(app: &mut App) {
 }
 
 pub(crate) fn subagent_info(parent_id: &str, name: &str) -> SubagentInfo {
-    subagent_info_with_tx(parent_id, name, None)
-}
-
-fn subagent_info_with_tx(
-    parent_id: &str,
-    name: &str,
-    answer_tx: Option<flume::Sender<String>>,
-) -> SubagentInfo {
     SubagentInfo {
         parent_tool_use_id: parent_id.into(),
         name: name.into(),
         prompt: None,
         model: None,
         opts: None,
-        answer_tx,
+        answer_tx: None,
         inbox: None,
         parent_call: None,
     }
@@ -418,7 +357,7 @@ pub(crate) fn tool_start(id: &str, tool: &str) -> AgentEvent {
         input: None,
         raw_input: None,
         output: None,
-        render_header: None,
+        data_version: DEFAULT_DATA_VERSION,
     }))
 }
 
@@ -429,6 +368,7 @@ fn turn_complete(usage: TokenUsage, model: &str, cost: Option<f64>) -> AgentEven
         model: model.into(),
         cost,
         subsidised_list_cost: None,
+        subsidised_by: None,
         context_size: None,
         context_window: 0,
     }))
@@ -456,158 +396,6 @@ fn typing_and_submit() {
         Some(&DisplayRole::User),
     );
     assert_eq!(app.main_chat().last_message_text(), "hi");
-}
-
-#[test]
-fn mailbox_wake_starts_without_an_empty_user_bubble() {
-    let mut app = test_app();
-    let actions = app.start_mailbox_run(vec![Message::observation("failed".into())]);
-
-    assert!(matches!(
-        &actions[..],
-        [Action::SendMessage(input)]
-            if input.message.is_empty()
-                && input.preamble.len() == 1
-                && input.preamble[0].is_observation()
-    ));
-    assert_eq!(app.status, Status::Streaming);
-    assert!(app.main_chat().segment_search_texts().is_empty());
-}
-
-fn labelled_notice(line: &str) -> Message {
-    let mut message = Message::observation(NOTICE_BODY.into());
-    message.display_text = Some(line.into());
-    message
-}
-
-#[test]
-fn a_notice_line_appears_when_the_loop_accepts_it() {
-    let mut app = test_app();
-    app.start_mailbox_run(vec![labelled_notice(NOTICE_LINE)]);
-    assert!(
-        app.main_chat().segment_search_texts().is_empty(),
-        "the line waits for the loop to accept the notice"
-    );
-
-    app.update(agent_msg_with_run_id(
-        AgentEvent::ObservationLine {
-            text: NOTICE_LINE.into(),
-            detail: None,
-            end: None,
-        },
-        app.run_id,
-    ));
-
-    assert_eq!(
-        app.main_chat().last_message_role(),
-        Some(&DisplayRole::Notice)
-    );
-    assert_eq!(app.main_chat().last_message_text(), NOTICE_LINE);
-    assert_eq!(app.chats.len(), 1, "a notice must not open a chat");
-}
-
-/// What the TUI sees during a notice scenario, in order.
-#[derive(Clone, Copy)]
-enum LiveStep {
-    Submit(&'static str),
-    Consumed(&'static str),
-    Reply,
-    Steered,
-    Accepted(&'static str),
-    Done,
-    Wake,
-}
-
-/// The saved history the same scenario leaves behind.
-#[derive(Clone, Copy)]
-enum SavedStep {
-    Notice(&'static str),
-    Prompt(&'static str),
-    Reply,
-}
-
-fn notice_and_prompt_rows<'a>(
-    rows: impl Iterator<Item = &'a DisplayMessage>,
-) -> Vec<(DisplayRole, String)> {
-    rows.filter(|row| matches!(row.role, DisplayRole::Notice | DisplayRole::User))
-        .map(|row| (row.role.clone(), row.text.clone()))
-        .collect()
-}
-
-/// History keeps a notice ahead of the prompts it landed with, while the live
-/// transcript drew them first. A restore must still show notices and prompts
-/// in the order the user watched them arrive.
-#[test_case(&[LiveStep::Submit(NOTICE_PROMPT), LiveStep::Accepted(NOTICE_LINE)],
-    &[SavedStep::Notice(NOTICE_LINE), SavedStep::Prompt(NOTICE_PROMPT), SavedStep::Reply] ; "single_prompt")]
-#[test_case(&[LiveStep::Consumed(NOTICE_PROMPT), LiveStep::Consumed(QUEUED_PROMPT), LiveStep::Accepted(NOTICE_LINE)],
-    &[SavedStep::Notice(NOTICE_LINE), SavedStep::Prompt(NOTICE_PROMPT), SavedStep::Prompt(QUEUED_PROMPT), SavedStep::Reply] ; "batched_prompts")]
-#[test_case(&[LiveStep::Submit(NOTICE_PROMPT), LiveStep::Steered, LiveStep::Accepted(NOTICE_LINE)],
-    &[SavedStep::Notice(NOTICE_LINE), SavedStep::Prompt(NOTICE_PROMPT), SavedStep::Reply] ; "steered_prompt")]
-#[test_case(&[LiveStep::Submit(NOTICE_PROMPT), LiveStep::Accepted(NOTICE_LINE), LiveStep::Accepted(SECOND_NOTICE_LINE)],
-    &[SavedStep::Notice(NOTICE_LINE), SavedStep::Notice(SECOND_NOTICE_LINE), SavedStep::Prompt(NOTICE_PROMPT), SavedStep::Reply] ; "two_notices")]
-#[test_case(&[LiveStep::Submit(NOTICE_PROMPT), LiveStep::Reply, LiveStep::Consumed(QUEUED_PROMPT), LiveStep::Accepted(NOTICE_LINE)],
-    &[SavedStep::Prompt(NOTICE_PROMPT), SavedStep::Reply, SavedStep::Notice(NOTICE_LINE), SavedStep::Prompt(QUEUED_PROMPT), SavedStep::Reply] ; "interrupt")]
-#[test_case(&[LiveStep::Submit(NOTICE_PROMPT), LiveStep::Reply, LiveStep::Consumed(QUEUED_PROMPT), LiveStep::Consumed(LAST_QUEUED_PROMPT), LiveStep::Accepted(NOTICE_LINE)],
-    &[SavedStep::Prompt(NOTICE_PROMPT), SavedStep::Reply, SavedStep::Prompt(QUEUED_PROMPT), SavedStep::Notice(NOTICE_LINE), SavedStep::Prompt(LAST_QUEUED_PROMPT), SavedStep::Reply] ; "interrupt_burst")]
-#[test_case(&[LiveStep::Submit(NOTICE_PROMPT), LiveStep::Done, LiveStep::Wake, LiveStep::Accepted(NOTICE_LINE)],
-    &[SavedStep::Prompt(NOTICE_PROMPT), SavedStep::Reply, SavedStep::Notice(NOTICE_LINE), SavedStep::Reply] ; "wake_without_prompt")]
-fn a_notice_line_keeps_its_history_position(live: &[LiveStep], saved: &[SavedStep]) {
-    let mut app = test_app();
-    for step in live {
-        let event = match *step {
-            LiveStep::Submit(text) => {
-                type_and_submit(&mut app, text);
-                continue;
-            }
-            LiveStep::Wake => {
-                app.start_mailbox_run(Vec::new());
-                continue;
-            }
-            LiveStep::Consumed(text) => AgentEvent::QueueItemConsumed {
-                text: text.into(),
-                images: Vec::new(),
-            },
-            LiveStep::Reply => AgentEvent::TextDelta {
-                text: NOTICE_REPLY.into(),
-            },
-            LiveStep::Steered => AgentEvent::Steered {
-                kind: SteerKind::MessageRewritten,
-                text: STEERED_TEXT.into(),
-            },
-            LiveStep::Accepted(text) => AgentEvent::ObservationLine {
-                text: text.into(),
-                detail: None,
-                end: None,
-            },
-            LiveStep::Done => done(),
-        };
-        app.update(agent_msg_with_run_id(event, app.run_id));
-    }
-    let history: Vec<Message> = saved
-        .iter()
-        .map(|step| match *step {
-            SavedStep::Notice(line) => labelled_notice(line),
-            SavedStep::Prompt(text) => Message::user(text.into()),
-            SavedStep::Reply => Message {
-                role: Role::Assistant,
-                content: vec![ContentBlock::Text {
-                    text: NOTICE_REPLY.into(),
-                }],
-                ..Default::default()
-            },
-        })
-        .collect();
-    let (restored, _) = crate::chat::history_to_display(
-        &history,
-        &HashMap::new(),
-        &app.ui_config.tool_output_lines,
-    );
-
-    let chat = app.main_chat();
-    let shown = notice_and_prompt_rows(
-        (0..chat.message_count()).filter_map(|index| chat.message_at(index)),
-    );
-    assert_eq!(shown, notice_and_prompt_rows(restored.iter()));
 }
 
 const TYPED_TEXT: &str = "hi";
@@ -746,64 +534,16 @@ fn reset_session_clears_exit_request_source() {
 
 #[test]
 fn toggle_mode_state_machine() {
-    let tab = |app: &mut App| app.update(Msg::Key(key(KeyCode::Tab)));
-
     let mut app = test_app();
-    assert_eq!(app.state.mode, Mode::Build);
-
-    tab(&mut app);
-    assert_eq!(app.state.mode, Mode::Plan);
-    let first_path = app.state.plan.path().unwrap().to_path_buf();
-    assert!(first_path.to_str().unwrap().contains("plans"));
-
-    tab(&mut app);
-    assert_eq!(app.state.mode, Mode::Build);
-    assert!(!app.state.plan.is_ready());
-
-    tab(&mut app);
-    assert_eq!(app.state.mode, Mode::Plan);
-    assert_eq!(app.state.plan.path().unwrap(), first_path);
-
-    app.state.plan.mark_ready();
-    tab(&mut app);
+    for expected in [Mode::Plan, Mode::Build, Mode::Plan] {
+        app.update(Msg::Key(key(KeyCode::Tab)));
+        assert_eq!(app.state.mode, expected);
+        assert!(app.state.plan.path().is_none());
+    }
+    app.state.plan = PlanState::Ready(PathBuf::from("/agent/plan.md"));
+    app.update(Msg::Key(key(KeyCode::Tab)));
     assert_eq!(app.state.mode, Mode::Build);
     assert!(app.state.plan.is_ready());
-    assert_eq!(app.state.plan.path().unwrap(), first_path);
-
-    app.state.mode = Mode::Build;
-    app.status = Status::Streaming;
-    app.run_id = 1;
-    tab(&mut app);
-    assert_eq!(app.state.mode, Mode::Plan);
-    assert_eq!(app.state.plan.path().unwrap(), first_path);
-}
-
-#[test_case(ToolOutput::Plain("wrote 100 bytes to /tmp/plans/test.md".into()), Some("/tmp/plans/test.md".into()), true  ; "write_matching")]
-#[test_case(ToolOutput::Diff { path: "/tmp/plans/test.md".into(), before: String::new(), after: String::new(), summary: String::new() }, None, true  ; "edit_matching")]
-#[test_case(ToolOutput::Plain("wrote 100 bytes to /tmp/other.rs".into()), Some("/tmp/other.rs".into()), false ; "write_non_matching")]
-fn tool_done_transitions_plan_to_ready(
-    output: ToolOutput,
-    written_path: Option<String>,
-    expect_ready: bool,
-) {
-    let mut app = test_app();
-    app.state.mode = Mode::Plan;
-    app.state.plan = PlanState::Drafting(PathBuf::from("/tmp/plans/test.md"));
-    app.status = Status::Streaming;
-    app.run_id = 1;
-
-    app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
-        call: None,
-        id: "t1".into(),
-        tool: "write".into(),
-        output: Arc::new(output),
-        is_error: false,
-        annotation: None,
-        written_path,
-        backgrounded: false,
-    }))));
-
-    assert_eq!(app.state.plan.is_ready(), expect_ready);
 }
 
 #[test]
@@ -1006,17 +746,9 @@ fn submit_prompt_rejects(mk: fn() -> App, text: &str, expected: &str) {
 
 fn streaming_app_without_queue() -> App {
     let dir = StateDir::from_path(env::temp_dir());
-    let mut app = build_app(dir.clone(), Arc::new(test_writer(dir)));
+    let mut app = build_app(dir.clone());
     app.status = Status::Streaming;
     app
-}
-
-fn session_rule() -> PermissionRule {
-    PermissionRule {
-        tool: ToolKey::parse("bash").unwrap(),
-        scope: None,
-        effect: Effect::Allow,
-    }
 }
 
 fn queued_msg(text: &str) -> QueuedMessage {
@@ -1092,7 +824,7 @@ fn enter_executes_new_command() {
     type_slash(&mut app);
     app.update(Msg::Key(key(KeyCode::Char('n'))));
     let actions = app.update(Msg::Key(key(KeyCode::Enter)));
-    assert!(matches!(&actions[0], Action::RestartAgent(h) if h.is_empty()));
+    assert!(matches!(&actions[0], Action::RestartAgent));
     assert!(!palette_open(&mut app));
 }
 
@@ -1157,7 +889,7 @@ fn reset_session_clears_plan() {
     let (_tx, rx) = flume::bounded::<crate::components::btw_modal::BtwEvent>(1);
     app.btw_modal.open("q", rx);
     let actions = app.reset_session();
-    assert!(matches!(&actions[0], Action::RestartAgent(h) if h.is_empty()));
+    assert!(matches!(&actions[0], Action::RestartAgent));
     assert_eq!(app.status, Status::Idle);
     assert_eq!(app.state.token_usage.input, 0);
     assert_eq!(app.chats[0].context_size, 0);
@@ -1189,8 +921,7 @@ fn blank_session_carries_the_settings_that_outlive_a_turn() {
     app.state.context_size = MEASURED_CONTEXT;
     app.input_box.set_input("half a thought");
     app.queue_and_notify(queued_msg("q"));
-    app.permissions.load_session_rules(vec![session_rule()]);
-    app.permissions.set_session_yolo(Some(true));
+    app.yolo.set_session_yolo(Some(true));
     app.checkpoint();
 
     let session = app.blank_session().session;
@@ -1209,112 +940,8 @@ fn blank_session_carries_the_settings_that_outlive_a_turn() {
         }
     );
     assert!(session.messages().is_empty());
-    assert_eq!(session.model, app.state.model.spec());
+    assert_eq!(session.model, app.state.session.model.clone());
     assert_eq!(session.cwd, app.state.session.cwd);
-}
-
-/// `maki.session.new` lays its document over this same blank session, so a
-/// plugin's "new session" starts where `Ctrl-N` would. A blank one keeps the
-/// tab's yolo like `Ctrl-N` does, and a conversation never brings it along.
-#[test_case(Vec::new(), Some(true) ; "blank_keeps_yolo")]
-#[test_case(vec![Message::user(DOCUMENT_TEXT.into())], None ; "conversation_drops_yolo")]
-fn a_plugin_made_session_starts_from_the_focused_tab(messages: Vec<Message>, yolo: Option<bool>) {
-    let mut app = test_app();
-    app.state.fast = true;
-    app.state.workflow = true;
-    app.permissions.set_session_yolo(Some(true));
-    let transcript = Transcript {
-        messages,
-        ..Default::default()
-    };
-
-    let session = app.session_from(transcript).unwrap().session;
-
-    assert_eq!(session.cwd, app.state.session.cwd);
-    assert_eq!(session.model, app.state.model.spec());
-    assert!(session.meta.fast);
-    assert!(session.meta.workflow);
-    assert_eq!(session.meta.yolo, yolo);
-}
-
-/// Without `prompt` or `focus`, `maki.session.new` only stores, and a bad
-/// document has to fail before anything reaches the disk.
-#[test_case(None ; "a_valid_document_is_stored")]
-#[test_case(Some(UNKNOWN_THINKING) ; "an_invalid_document_answers_its_error_and_stores_nothing")]
-fn a_plugin_made_session_is_stored_only_when_valid(thinking: Option<&str>) {
-    let (_tmp, dir, _writer, app) = tempdir_app();
-    let transcript = Transcript {
-        thinking: thinking.map(str::to_owned),
-        messages: vec![Message::user(DOCUMENT_TEXT.into())],
-        ..Default::default()
-    };
-
-    let stored = app
-        .session_from(transcript)
-        .map(|open| open.store(&dir).unwrap());
-
-    let listed: Vec<MakiId> = AppSession::list_all(&dir)
-        .unwrap()
-        .into_iter()
-        .map(|summary| summary.id)
-        .collect();
-    match (thinking, stored) {
-        (None, Ok(id)) => assert_eq!(listed, [id]),
-        (Some(bad), Err(e)) => {
-            let expected = TranscriptError::from(ThinkingParseError::Unknown(bad.into()));
-            assert_eq!(e, expected.to_string());
-            assert!(listed.is_empty());
-        }
-        (_, stored) => panic!("unexpected outcome {stored:?}"),
-    }
-}
-
-/// A history that repairs down to nothing would be a dead entry in the
-/// picker, so it is refused at the write rather than stored empty.
-#[test]
-fn a_plugin_made_session_without_messages_is_not_stored() {
-    let (_tmp, dir, _writer, app) = tempdir_app();
-    let emptied = Message {
-        content: Vec::new(),
-        ..Message::user(DOCUMENT_TEXT.into())
-    };
-    let transcript = Transcript {
-        messages: vec![emptied],
-        ..Default::default()
-    };
-
-    let error = app
-        .session_from(transcript)
-        .unwrap()
-        .store(&dir)
-        .unwrap_err();
-
-    assert_eq!(error.to_string(), NOTHING_TO_STORE);
-    assert!(AppSession::list_all(&dir).unwrap().is_empty());
-}
-
-/// `maki.session.export` answers an open tab from memory, so a turn that has
-/// not reached disk and a setting changed since the last checkpoint both
-/// travel.
-#[test_case(true ; "from_the_agents_mirror")]
-#[test_case(false ; "from_a_tab_whose_agent_never_started")]
-fn a_tab_exports_its_unsaved_messages_and_live_settings(agent_started: bool) {
-    let mut app = test_app();
-    let unsaved = vec![Message::user(DOCUMENT_TEXT.into())];
-    if agent_started {
-        let mirror = HistorySnapshot::new(unsaved.clone());
-        app.shared_history = Some(Arc::new(ArcSwap::from_pointee(mirror)));
-    } else {
-        app.state.session_mut().push_message(unsaved[0].clone());
-    }
-    app.state.fast = true;
-    app.state.mode = Mode::Plan;
-
-    let export = app.export();
-
-    assert_eq!(*export.messages, unsaved);
-    assert!(export.header.fast);
-    assert_eq!(export.header.mode, Some(StoredMode::Plan));
 }
 
 /// A setting written into the meta but never read back still opens the tab
@@ -1324,63 +951,55 @@ fn a_tab_exports_its_unsaved_messages_and_live_settings(agent_started: bool) {
 #[test]
 fn a_spawned_tab_opens_on_the_settings_it_was_started_with() {
     let mut app = test_app();
-    set_opus_model(&mut app);
     app.state.thinking = ThinkingConfig::Effort(Effort::High);
     app.state.fast = true;
     app.state.workflow = true;
     app.state.mode = Mode::Plan;
-    app.permissions.toggle_yolo();
+    app.yolo.toggle_yolo();
 
-    let spawned = spawned_app(app.blank_session(), test_permissions(false));
+    let spawned = spawned_app(app.blank_session(), false);
 
     assert_eq!(spawned.state.thinking, app.state.thinking);
     assert_eq!(spawned.state.fast, app.state.fast);
     assert_eq!(spawned.state.workflow, app.state.workflow);
     assert_eq!(spawned.state.mode, app.state.mode);
     assert!(
-        spawned.permissions.is_yolo(),
+        spawned.yolo.is_yolo(),
         "the toggle is the user's, so it opens the next tab too"
     );
-    assert!(
-        spawned.state.plan.path().is_some(),
-        "a plan-mode tab owes itself a plan file"
-    );
+    assert!(spawned.state.plan.path().is_none());
 }
 
-/// `--yolo` seeds the prototype every tab forks from, and `/yolo` off only ever
-/// reaches the fork the tab holds. A new tab that trusts its fork reopens
-/// auto-approving everything, so the meta `blank_session` just wrote is the one
-/// place that answer survives.
+/// A stored choice overrides the invocation's one-shot --yolo flag.
 #[test]
 fn a_spawned_tab_honours_the_yolo_turned_off_under_the_flag() {
-    let prototype = test_permissions(true);
+    let prototype = true;
     let app = spawned_app(
         tmp_tab(AppSession::new(TEST_MODEL_SPEC, TEST_CWD)),
-        Arc::new(prototype.fork()),
+        prototype,
     );
-    assert!(app.permissions.is_yolo(), "--yolo seeds the first tab");
+    assert!(app.yolo.is_yolo(), "--yolo seeds the first tab");
 
-    app.permissions.toggle_yolo();
+    app.yolo.toggle_yolo();
     let session = app.blank_session();
     assert_eq!(session.session.meta.yolo, Some(false));
 
-    let spawned = spawned_app(session, Arc::new(prototype.fork()));
+    let spawned = spawned_app(session, prototype);
 
     assert!(
-        !spawned.permissions.is_yolo(),
+        !spawned.yolo.is_yolo(),
         "forking the prototype must not bring the flag back"
     );
 }
 
 #[test]
-fn reset_session_assigns_new_plan_path_in_plan_mode() {
+fn reset_session_waits_for_a_host_plan_path() {
     let mut app = test_app();
     app.state.mode = Mode::Plan;
     app.state.plan = PlanState::Drafting(PathBuf::from("old-plan.md"));
     app.reset_session();
     assert_eq!(app.state.mode, Mode::Plan);
-    assert!(app.state.plan.path().is_some());
-    assert_ne!(app.state.plan.path(), Some(Path::new("old-plan.md")));
+    assert!(app.state.plan.path().is_none());
 }
 
 #[test]
@@ -1450,7 +1069,8 @@ fn an_unlayered_plan_form_opens_without_asking(hosted: bool) {
 #[test]
 fn a_layered_plan_form_waits_for_the_slots() {
     let mut app = test_app();
-    let (handle, _probe) = maki_lua::test_support::probed_event_handle_layering_plan_form();
+    let (handle, _probe) =
+        crate::lua_handle::test_support::probed_event_handle_layering_plan_form();
     app.lua_event_handle = handle;
 
     app.state.mode = Mode::Plan;
@@ -1461,8 +1081,8 @@ fn a_layered_plan_form_waits_for_the_slots() {
     assert!(app.plan_answers.form.is_some());
 }
 
-fn plugin_row(id: &str) -> maki_lua::PlanFormRow {
-    maki_lua::PlanFormRow {
+fn plugin_row(id: &str) -> maki_lua_ui::PlanFormRow {
+    maki_lua_ui::PlanFormRow {
         id: id.to_owned(),
         label: PLUGIN_ROW_LABEL.to_owned(),
         desc: String::new(),
@@ -1471,15 +1091,15 @@ fn plugin_row(id: &str) -> maki_lua::PlanFormRow {
     }
 }
 
-fn plan_menu(rows: Vec<maki_lua::PlanFormRow>) -> maki_lua::PlanMenu {
-    maki_lua::PlanMenu {
+fn plan_menu(rows: Vec<maki_lua_ui::PlanFormRow>) -> maki_lua_ui::PlanMenu {
+    maki_lua_ui::PlanMenu {
         generation: PLAN_MENU_GENERATION,
         rows,
     }
 }
 
 /// Arms the form's answer slot with a wait that has not run out yet.
-fn awaiting_plan_form(app: &mut App) -> flume::Sender<Option<maki_lua::PlanMenu>> {
+fn awaiting_plan_form(app: &mut App) -> flume::Sender<Option<maki_lua_ui::PlanMenu>> {
     let (tx, rx) = flume::bounded(1);
     app.plan_answers.form = Some((Instant::now() + WAIT_AHEAD, rx));
     tx
@@ -1552,7 +1172,7 @@ fn a_silent_plan_form_slot_leaves_the_form_closed() {
 #[test]
 fn a_plan_form_answer_that_never_comes_falls_back_to_the_builtin() {
     let mut app = test_app();
-    let (_tx, rx) = flume::bounded::<Option<maki_lua::PlanMenu>>(1);
+    let (_tx, rx) = flume::bounded::<Option<maki_lua_ui::PlanMenu>>(1);
     app.plan_answers.form = Some((Instant::now() - WAIT_AHEAD, rx));
 
     assert_eq!(app.tick_plan_form(), Dirty::YES);
@@ -1566,7 +1186,7 @@ fn a_plan_form_answer_that_never_comes_falls_back_to_the_builtin() {
 /// of a plugin row that kept {then}.
 fn awaiting_plan_action(
     app: &mut App,
-    then: Option<maki_lua::PlanRowAction>,
+    then: Option<maki_lua_ui::PlanRowAction>,
 ) -> flume::Sender<PlanActionOutcome> {
     let (tx, rx) = flume::bounded(1);
     let pick = app.plan_answers.abandon();
@@ -1587,7 +1207,7 @@ fn a_plugin_row_handler_that_agrees_runs_the_builtin_action() {
     let mut app = test_app();
     app.state.mode = Mode::Plan;
     app.state.plan = PlanState::Ready(PathBuf::from(PLAN_DRAFT_PATH));
-    let tx = awaiting_plan_action(&mut app, Some(maki_lua::PlanRowAction::Implement));
+    let tx = awaiting_plan_action(&mut app, Some(maki_lua_ui::PlanRowAction::Implement));
 
     tx.send(PlanActionOutcome::Proceed).unwrap();
     assert_eq!(app.tick(), Dirty::YES);
@@ -1607,7 +1227,7 @@ fn a_plugin_row_handler_that_declines_drops_the_builtin_action() {
     let mut app = test_app();
     app.state.mode = Mode::Plan;
     app.state.plan = PlanState::Ready(PathBuf::from(PLAN_DRAFT_PATH));
-    let tx = awaiting_plan_action(&mut app, Some(maki_lua::PlanRowAction::Implement));
+    let tx = awaiting_plan_action(&mut app, Some(maki_lua_ui::PlanRowAction::Implement));
 
     tx.send(PlanActionOutcome::Vetoed).unwrap();
     assert_eq!(app.tick(), Dirty::YES);
@@ -1628,7 +1248,7 @@ fn a_plugin_row_handler_that_failed_is_flashed() {
     let mut app = test_app();
     app.state.mode = Mode::Plan;
     app.state.plan = PlanState::Ready(PathBuf::from(PLAN_DRAFT_PATH));
-    let tx = awaiting_plan_action(&mut app, Some(maki_lua::PlanRowAction::Implement));
+    let tx = awaiting_plan_action(&mut app, Some(maki_lua_ui::PlanRowAction::Implement));
 
     tx.send(PlanActionOutcome::Failed).unwrap();
     assert_eq!(app.tick(), Dirty::YES);
@@ -1668,7 +1288,7 @@ fn a_parked_plan_row_handler_gives_up_and_flashes() {
     let pick = app.plan_answers.abandon();
     app.plan_answers.action = Some(PlanAction {
         pick,
-        then: Some(maki_lua::PlanRowAction::Implement),
+        then: Some(maki_lua_ui::PlanRowAction::Implement),
         deadline: Instant::now() - WAIT_AHEAD,
         answer: rx,
     });
@@ -1692,7 +1312,7 @@ fn a_parked_plan_row_handler_gives_up_and_flashes() {
 fn plan_pick_action(pick: u64, answer: flume::Receiver<PlanActionOutcome>) -> PlanAction {
     PlanAction {
         pick,
-        then: Some(maki_lua::PlanRowAction::Implement),
+        then: Some(maki_lua_ui::PlanRowAction::Implement),
         deadline: Instant::now() + WAIT_AHEAD,
         answer,
     }
@@ -1794,8 +1414,7 @@ fn a_pick_answered_after_another_session_loaded_submits_nothing() {
     loaded.meta.mode = Some(StoredMode::Plan);
     loaded.meta.plan_path = Some(other_draft.display().to_string());
     loaded.meta.plan_written = true;
-    let model = app.state.model.clone();
-    app.apply_loaded_session(OpenSession::claimed(loaded, &app.storage), &model);
+    app.apply_loaded_session(OpenSession::claimed(loaded, &app.storage));
     assert!(
         app.plan_answers.form.is_none(),
         "the abandoned draft's menu answer does not follow the user"
@@ -1828,7 +1447,7 @@ fn a_pick_answered_after_another_session_loaded_submits_nothing() {
 #[test]
 fn the_plan_form_fallback_outlasts_the_host_budget() {
     let mut app = test_app();
-    let (_tx, rx) = flume::bounded::<Option<maki_lua::PlanMenu>>(1);
+    let (_tx, rx) = flume::bounded::<Option<maki_lua_ui::PlanMenu>>(1);
     // Armed one whole host budget ago, so the chains have just run out of
     // their own time and the answer is still on its way.
     let armed = Instant::now() - PLAN_FORM_SLOT_DEADLINE;
@@ -1859,7 +1478,7 @@ fn the_plan_action_fallback_outlasts_the_handler_budget() {
     let armed = Instant::now() - PLAN_ROW_HANDLER_DEADLINE;
     app.plan_answers.action = Some(PlanAction {
         pick,
-        then: Some(maki_lua::PlanRowAction::Implement),
+        then: Some(maki_lua_ui::PlanRowAction::Implement),
         deadline: armed + PLAN_ACTION_ANSWER_WAIT,
         answer: rx,
     });
@@ -1954,7 +1573,7 @@ fn prompting_without_set_mode_stays_in_plan_mode() {
 
 #[test]
 fn load_session_clears_plan() {
-    let (_tmp, _dir, _writer, mut app) = tempdir_app();
+    let (_tmp, _dir, mut app) = tempdir_app();
     app.state
         .session_mut()
         .push_message(Message::user("test".into()));
@@ -1963,7 +1582,7 @@ fn load_session_clears_plan() {
     let session = AppSession::load(app.state.session.id, &app.storage).unwrap();
     app.state.mode = Mode::Build;
     app.state.plan = PlanState::Ready(PathBuf::from("old-plan.md"));
-    app.apply_loaded_session(OpenSession { session, claim }, &test_model());
+    app.apply_loaded_session(OpenSession { session, claim });
     assert_eq!(app.state.mode, Mode::Build);
     assert_eq!(app.state.plan.path(), None);
 }
@@ -1990,6 +1609,8 @@ fn tool_lifecycle_events_name_the_session_and_tool() {
         is_error: false,
         annotation: None,
         written_path: None,
+        data: None,
+
         backgrounded: false,
     }))));
 
@@ -2086,7 +1707,7 @@ fn subagent_prompt_shown_once_and_not_duplicated() {
 }
 
 #[test]
-fn turn_complete_tracks_usage_and_context_per_chat() {
+fn turn_complete_updates_child_context_without_rebilling_the_session() {
     let mut app = app_with_subagent();
 
     let main_usage = TokenUsage {
@@ -2107,9 +1728,8 @@ fn turn_complete_tracks_usage_and_context_per_chat() {
         None,
     ));
 
-    assert_eq!(app.state.token_usage.input, 300);
-    assert_eq!(app.state.token_usage.output, 125);
-    assert_eq!(app.chats[0].context_size, main_usage.context_tokens());
+    assert_eq!(app.state.token_usage, TokenUsage::default());
+    assert_eq!(app.chats[0].context_size, 0);
     assert_eq!(app.chats[1].context_size, sub_usage.context_tokens());
 }
 
@@ -2150,48 +1770,15 @@ fn sub_usage_text() -> String {
     SUB_TOKENS.format_sum_cost(SUB_COST)
 }
 
-/// Each turn bills at the rates of the model that ran it, subagent tiers
-/// included, so the session total is the sum of what the turns recorded.
-#[test]
-fn session_cost_sums_what_each_model_recorded() {
-    let mut app = streaming_app();
-    app.update(main_turn());
-    app.update(agent_msg(tool_start(TASK_ID, "task")));
-    app.update(sub_turn_complete());
-
-    let expected = MAIN_COST.unwrap() + SUB_COST.unwrap();
-    assert_eq!(app.state.cost, Some(expected));
-    let stored: f64 = app
-        .state
-        .session
-        .usage_by_model()
-        .values()
-        .filter_map(|u| u.cost)
-        .sum();
-    assert_eq!(stored, expected);
-}
-
-const RESTORED_COST: f64 = 0.42;
-/// Counters big enough that re-pricing them could never land on
-/// [`RESTORED_COST`], so a total derived from them stands out.
-const RESTORED_TOKENS: TokenUsage = TokenUsage {
-    input: 1_000_000,
-    output: 0,
-    cache_creation: 0,
-    cache_read: 0,
-    cost: None,
-};
-const RESTORED_MODEL: &str = "model-that-ran-before";
-const SIGMA_MISSING: &str = "the status bar must draw the session total";
-const COST_WAS_NOT_BILLED: &str = "the turn must bill something for the reset to prove anything";
-
 /// A new session opens on a clean bill. The total is never re-derived from the
 /// counters, so anything left behind here follows the user forever.
 #[test]
 fn reset_session_clears_the_bill_and_the_model_breakdown() {
     let mut app = streaming_app();
-    app.update(main_turn());
-    assert_eq!(app.state.cost, MAIN_COST, "{COST_WAS_NOT_BILLED}");
+    app.apply_remote_usage(SessionUsage {
+        cost: MAIN_COST,
+        ..remote_usage()
+    });
 
     app.reset_session();
 
@@ -2199,56 +1786,20 @@ fn reset_session_clears_the_bill_and_the_model_breakdown() {
     assert!(app.state.session.usage_by_model().is_empty());
 }
 
-/// `None` is what hides the cost, so an unpriced turn must leave the total
-/// alone. `Some(0.0)` would advertise a free session.
-#[test_case(None, None ; "unpriced_turns_only")]
-#[test_case(MAIN_COST, MAIN_COST ; "priced_turn_after_an_unpriced_one")]
-fn session_cost_counts_only_priced_turns(second: Option<f64>, expected: Option<f64>) {
-    let mut app = streaming_app();
-    // How an unpriced session opens; `session_state` covers the seeding.
-    app.state.cost = None;
-    app.update(agent_msg(turn_complete(MAIN_TOKENS, MAIN_MODEL, None)));
-
-    app.update(agent_msg(turn_complete(MAIN_TOKENS, MAIN_MODEL, second)));
-
-    assert_eq!(app.state.cost, expected);
-}
-
-/// The restored bill is a running total later turns add to, so a resumed
-/// session shows what it paid back then plus what it pays now, never its
-/// counters re-priced at today's rates.
-#[test]
-fn resumed_session_keeps_adding_to_the_restored_bill() {
-    let mut app = test_app();
-    let mut stored = AppSession::new("test-model", "/tmp");
-    stored.token_usage = RESTORED_TOKENS;
-    stored.add_model_usage(RESTORED_MODEL, RESTORED_TOKENS.billed(Some(RESTORED_COST)));
-
-    app.apply_loaded_session(OpenSession::claimed(stored, &app.storage), &test_model());
-    assert_eq!(app.state.cost, Some(RESTORED_COST));
-    assert_eq!(app.chats[0].cost, Some(RESTORED_COST));
-
-    app.status = Status::Streaming;
-    app.run_id = 1;
-    app.update(main_turn());
-
-    assert_eq!(app.state.cost, Some(RESTORED_COST + MAIN_COST.unwrap()));
-}
-
 /// The sigma the status bar draws once subagents split the bill is the session
 /// total itself, so it cannot drift from what `/usage` sums.
 #[test]
 fn status_bar_sigma_draws_the_session_cost() {
     let mut app = app_with_subagent();
+    let total = MAIN_COST.unwrap() + SUB_COST.unwrap();
+    app.apply_remote_usage(SessionUsage {
+        cost: Some(total),
+        ..remote_usage()
+    });
     app.update(main_turn());
     app.update(sub_turn_complete());
-
-    let total = app.state.cost.expect("both turns were priced");
     let sigma = format!("\u{03a3}${total:.3}");
-    assert!(
-        rendered(&mut app).contains(&sigma),
-        "{SIGMA_MISSING}: {sigma}"
-    );
+    assert!(rendered(&mut app).contains(&sigma), "{sigma}");
 }
 
 #[test]
@@ -2322,45 +1873,6 @@ fn tool_inside_subagent_chat_gets_its_turn_usage() {
         app.chats[1].tool_turn_usage(TOOL_ID),
         Some(SUB_TOKENS.format(SUB_COST).as_str())
     );
-}
-
-#[test]
-fn turn_complete_accumulates_usage_by_model() {
-    let mut app = app_with_subagent();
-
-    app.update(agent_msg(turn_complete(
-        TokenUsage {
-            input: 100,
-            output: 50,
-            cache_read: 10,
-            ..Default::default()
-        },
-        "main-model",
-        None,
-    )));
-    app.update(subagent_msg(
-        turn_complete(
-            TokenUsage {
-                input: 200,
-                output: 75,
-                ..Default::default()
-            },
-            "sub-model",
-            None,
-        ),
-        TASK_ID,
-        None,
-    ));
-
-    let by_model = app.state.session.usage_by_model();
-    assert_eq!(by_model.len(), 2);
-    let main = &by_model["main-model"];
-    assert_eq!(main.input, 100);
-    assert_eq!(main.output, 50);
-    assert_eq!(main.cache_read, 10);
-    let sub = &by_model["sub-model"];
-    assert_eq!(sub.input, 200);
-    assert_eq!(sub.output, 75);
 }
 
 const MONITOR_TURN: StoredTokenUsage = StoredTokenUsage {
@@ -2561,7 +2073,10 @@ fn plugin_task_restores_with_its_owner_and_cost() {
     let mut app = app_with_plugin_task();
     plugin_event(&mut app, monitor_turn());
     assert_eq!(app.chats[1].cost, MONITOR_TURN.cost);
-    assert_eq!(app.state.cost, MONITOR_TURN.cost);
+    app.apply_remote_usage(SessionUsage {
+        cost: MONITOR_TURN.cost,
+        ..remote_usage()
+    });
     plugin_event(&mut app, monitor_history(vec![]));
     plugin_event(&mut app, AgentEvent::StreamClosed);
 
@@ -2617,7 +2132,14 @@ fn rewind_leaves_a_live_plugin_task_alone() {
     plugin_event(&mut app, monitor_history(vec![]));
     plugin_event(&mut app, done());
 
-    app.rewind_to(rewind_to_second_turn());
+    let entry = rewind_to_second_turn();
+    let mut snapshot = (*app.state.session).clone();
+    snapshot.meta.context_size = maki_types::session::truncate_to_turn(
+        &mut snapshot,
+        entry.turn_index,
+        app.state.context_size,
+    );
+    app.finish_remote_rewind(snapshot, entry);
 
     assert_eq!(app.chats.len(), 2);
     let chat = &app.chats[1];
@@ -2657,18 +2179,9 @@ fn cancel_resets_all_chats_and_indices() {
             input: None,
             raw_input: None,
             output: None,
-            render_header: None,
+            data_version: DEFAULT_DATA_VERSION,
         })),
         TASK_ID,
-        None,
-    ));
-    let buf = Arc::new(maki_agent::SharedBuf::new());
-    app.update(subagent_msg(
-        AgentEvent::LiveToolBuf {
-            id: "sub_t1".into(),
-            body: buf,
-        },
-        "task1",
         None,
     ));
 
@@ -2699,6 +2212,8 @@ pub(crate) fn finish_subagent(app: &mut App, id: &str, is_error: bool) {
         is_error,
         annotation: None,
         written_path: None,
+        data: None,
+
         backgrounded: false,
     }))));
 }
@@ -2904,12 +2419,15 @@ fn page_keys_scroll_the_transcript_by_one_page() {
 }
 
 const COMPACT_GUIDANCE: &str = "keep the failing test names";
+const BTW_QUESTION: &str = "what is rust?";
+const BTW_COMMAND: &str = "/btw what is rust?";
 const COMPACT_WITH_GUIDANCE: &str = "/compact keep the failing test names";
 
+/// A remote agent advertises `compact`, so its tab compacts as a local one.
 #[test_case("/compact", None ; "no_guidance")]
 #[test_case(COMPACT_WITH_GUIDANCE, Some(COMPACT_GUIDANCE) ; "guidance_forwarded")]
 fn compact_command_sets_streaming(cmdline: &str, expected: Option<&str>) {
-    let mut app = test_app();
+    let mut app = remote_app();
     let actions = app.execute_command(cmd(cmdline), 0);
     assert!(
         matches!(&actions[0], Action::Compact(instructions) if instructions.as_deref() == expected)
@@ -2920,7 +2438,7 @@ fn compact_command_sets_streaming(cmdline: &str, expected: Option<&str>) {
 #[test_case("/compact" ; "bare")]
 #[test_case(COMPACT_WITH_GUIDANCE ; "guidance_shown_in_panel")]
 fn compact_during_streaming_queues_item(cmdline: &str) {
-    let mut app = test_app();
+    let mut app = remote_app();
     app.status = Status::Streaming;
     app.run_id = 1;
 
@@ -2928,14 +2446,6 @@ fn compact_during_streaming_queues_item(cmdline: &str) {
     assert!(actions.is_empty());
     assert_eq!(app.queue.len(), 1);
     assert_eq!(app.queue.panel_entries()[0].text, cmdline);
-}
-
-#[test]
-fn cancel_clears_main_auth_park() {
-    let mut app = streaming_app();
-    app.chats[MAIN_CHAT].auth_parked = true;
-    cancel_app(&mut app);
-    assert!(!app.awaiting_input());
 }
 
 #[test]
@@ -3074,7 +2584,7 @@ fn double_esc_cancels_flushes_and_fails_tools() {
         input: None,
         raw_input: None,
         output: None,
-        render_header: None,
+        data_version: DEFAULT_DATA_VERSION,
     }))));
 
     let actions = app.update(Msg::Key(key(KeyCode::Esc)));
@@ -3142,49 +2652,10 @@ fn usage_quota_arriving_in_the_background_owes_a_frame() {
     let slot = Arc::clone(&app.usage_slot);
 
     assert_owes_one_frame(&mut app, || {
-        slot.store(Some(Arc::new(UsageFetchState::Loading)));
-    });
-}
-
-/// Providers publish their model list into a shared slot that wakes nothing,
-/// so an open picker keeps showing the stale list until the user happens to
-/// press a key.
-#[test]
-fn model_list_arriving_in_the_background_owes_a_frame() {
-    let (mut app, models) = app_with_model_slot();
-    app.execute_command(cmd("/model"), 0);
-    assert!(app.model_picker.is_open());
-
-    assert_owes_one_frame(&mut app, || {
-        models.store(Some(Arc::new(ModelList {
-            specs: vec![LATE_MODEL_SPEC.into()],
-            loading: false,
+        slot.store(Some(Arc::new(UsageFetch {
+            provider: String::new(),
+            state: UsageFetchState::Loading,
         })));
-    });
-}
-
-/// Tool output streams into a subagent's chat while the parent chat is the one
-/// on screen. Draining only the active chat would lose it, and the task picker
-/// and a later switch would show nothing.
-#[test]
-fn tick_drains_live_bufs_of_background_chats() {
-    let mut app = test_app();
-    app.run_id = 1;
-    app.update(agent_msg(tool_start(TASK_ID, "task")));
-    app.update(subagent_msg(tool_start(SUB_TOOL_ID, "bash"), TASK_ID, None));
-    let buf = Arc::new(maki_agent::SharedBuf::new());
-    app.update(subagent_msg(
-        AgentEvent::LiveToolBuf {
-            id: SUB_TOOL_ID.into(),
-            body: Arc::clone(&buf),
-        },
-        TASK_ID,
-        None,
-    ));
-    assert_eq!(app.active_chat, 0, "the subagent's chat is the hidden one");
-
-    assert_owes_one_frame(&mut app, || {
-        buf.append(maki_agent::SnapshotLine::plain(TOOL_OUTPUT_LINE.into()));
     });
 }
 
@@ -3212,7 +2683,7 @@ fn status_hints_published_by_a_plugin_reach_the_screen() {
 fn hint_for(session: Option<MakiId>) -> HintEntry {
     HintEntry {
         plugin: Arc::from(HINT_PLUGIN),
-        session,
+        session: session.map(TabRef::from),
         spans: vec![(HINT_TEXT.into(), HINT_STYLE.into())],
     }
 }
@@ -3418,17 +2889,17 @@ const CARET_EXPECTED: &str = "the input box draws a caret with nothing in its wa
 /// screen says, so a test can find the row it was placed on.
 fn open_caret_float(app: &mut App) {
     let buf = Arc::new(SharedBuf::new());
-    buf.append(maki_agent::SnapshotLine {
-        spans: vec![maki_agent::SnapshotSpan {
+    buf.append(maki_types::snapshot::SnapshotLine {
+        spans: vec![maki_types::snapshot::SnapshotSpan {
             text: CARET_FLOAT_MARK.into(),
-            style: maki_agent::SpanStyle::Default,
+            style: maki_types::snapshot::SpanStyle::Default,
         }],
     });
     let config = FloatConfig {
         width: Dimension::Abs(CARET_FLOAT_WIDTH),
         height: Dimension::Abs(CARET_FLOAT_HEIGHT),
-        anchor: maki_lua::Anchor::InputCaret,
-        border: maki_lua::Border::None,
+        anchor: maki_lua_ui::Anchor::InputCaret,
+        border: maki_lua_ui::Border::None,
         ..FloatConfig::default()
     };
     let (event_tx, _event_rx) = flume::bounded::<WinEvent>(8);
@@ -3676,12 +3147,11 @@ fn an_input_edit_meets_a_prompt_opened_since_the_last_frame() {
     app.input_box.set_input("hello");
     draw_to_buffer(&mut app);
 
-    app.permission_prompt.push(
+    app.permission_prompt.push_choices(
         "perm-1".into(),
         maki_config::ToolKey::native("bash"),
         vec!["execute".into()],
-        None,
-        true,
+        permission_choices(),
         None,
     );
 
@@ -3809,11 +3279,11 @@ fn open_overlay_motion_reaches_app_cadence() {
     let mut app = app_without_splash();
     assert_eq!(app.cadence(), Cadence::IDLE);
 
-    let (event_tx, _event_rx) = flume::bounded::<maki_lua::WinEvent>(8);
-    let (_cmd_tx, cmd_rx) = flume::bounded::<maki_lua::WinCommand>(8);
+    let (event_tx, _event_rx) = flume::bounded::<maki_lua_ui::WinEvent>(8);
+    let (_cmd_tx, cmd_rx) = flume::bounded::<maki_lua_ui::WinCommand>(8);
     app.float_mgr.open(
-        Arc::new(maki_agent::SharedBuf::new()),
-        maki_lua::FloatConfig::default(),
+        Arc::new(maki_types::snapshot::SharedBuf::new()),
+        maki_lua_ui::FloatConfig::default(),
         true,
         event_tx,
         cmd_rx,
@@ -4237,7 +3707,7 @@ fn resolve_or_create_chat_sets_model_id_and_annotation() {
         input: None,
         raw_input: None,
         output: None,
-        render_header: None,
+        data_version: DEFAULT_DATA_VERSION,
     }))));
 
     app.update(subagent_msg_with_model(
@@ -4350,7 +3820,7 @@ fn a_tab_stays_blank_until_the_user_touches_it() {
 
     app.update(Msg::Key(key(KeyCode::Tab)));
     app.checkpoint();
-    assert_eq!(app.state.session.meta.mode, Some(StoredMode::Plan));
+    assert_eq!(app.state.mode, Mode::Plan);
     assert!(!app.is_blank());
 
     let mut queued = app_with_queued_message();
@@ -4359,7 +3829,7 @@ fn a_tab_stays_blank_until_the_user_touches_it() {
     assert!(session.messages().is_empty());
     assert!(session.meta.input_draft.is_none());
     assert_eq!(session.meta.mode, Some(StoredMode::Build));
-    assert_eq!(session.meta.queued_messages, vec!["queued".to_string()]);
+    assert_eq!(queued.unsent().queued_messages, vec!["queued".to_string()]);
     assert!(!queued.is_blank());
 
     let mut chatted = test_app();
@@ -4371,134 +3841,13 @@ fn a_tab_stays_blank_until_the_user_touches_it() {
 }
 
 #[test]
-fn checkpoint_persists_observations_without_using_them_as_title() {
-    let mut app = test_app();
-    let initial_title = app.state.session.title.clone();
-    let _history = attach_live_history(
-        &mut app,
-        vec![
-            Message::observation("build failed".into()),
-            Message {
-                role: Role::Assistant,
-                content: vec![ContentBlock::Text {
-                    text: "I will fix it".into(),
-                }],
-                ..Default::default()
-            },
-        ],
-    );
-
-    app.checkpoint();
-
-    assert_eq!(app.state.session.messages().len(), 2);
-    assert!(app.state.session.messages()[0].is_observation());
-    assert_eq!(app.state.session.title, initial_title);
-}
-
-fn drain_writer(app: App, writer: Arc<StorageWriter>) {
-    drop(app);
-    let unsaved = Arc::try_unwrap(writer)
-        .ok()
-        .expect("app must hold the only other writer reference")
-        .shutdown(WRITER_DRAIN_TIMEOUT);
-    assert!(unsaved.is_empty(), "{ALL_LANDED}");
-}
-
-#[test]
-fn reload_persists_session_with_content_to_disk() {
-    let (_tmp, dir, writer, mut app) = tempdir_app();
-    app.state
-        .session_mut()
-        .push_message(Message::user("hello".into()));
-    let actions = app.execute_command(cmd("/reload"), 0);
-    assert_eq!(app.exit_request, ExitRequest::Reload);
-    assert!(matches!(actions.as_slice(), [Action::ManualExit]));
-    app.checkpoint();
-    let id = app.state.session.id;
-    drain_writer(app, writer);
-
-    assert_eq!(AppSession::load(id, &dir).unwrap().messages().len(), 1);
-}
-
-#[test]
-fn reload_leaves_empty_session_unpersisted_on_disk() {
-    let (tmp, _dir, writer, mut app) = tempdir_app();
-    app.execute_command(cmd("/reload"), 0);
-    drain_writer(app, writer);
-
-    let storage = StateDir::from_path(tmp.path().to_path_buf());
-    assert!(AppSession::list_all(&storage).unwrap().is_empty());
-}
-
-#[test]
-fn restore_resumed_session_flushes_queued_messages_and_round_trips() {
-    let mut app = test_app();
-    app.state.session_mut().meta.queued_messages = vec!["q1".into(), "q2".into()];
-
-    app.restore_resumed_session();
-    assert_eq!(app.queue.text_messages(), ["q1", "q2"]);
-
-    app.checkpoint();
-    assert_eq!(app.state.session.meta.queued_messages, ["q1", "q2"]);
-}
-
-const LOST_ID: &str = "toolu_lost";
-const STORED_RECEIPT_ID: &str = "toolu_stored";
-const RECEIPTS_KEPT: &str = "a checkpoint must never erase receipts it cannot read";
-
-/// What the agent hands the app, see `AgentHandles::apply_to_app`.
-fn hold_mailbox(app: &mut App) -> SessionMailbox {
-    let mailbox = SessionMailbox::register(app.state.session.id);
-    app.mailbox = Some(mailbox.clone());
-    mailbox
-}
-
-/// The app holds its agent's mailbox, so a receipt outlives every other
-/// clone of it. Before any agent hands one over, the stored receipts stay.
-#[test_case(true, &[LOST_ID] ; "held_mailbox_outlives_its_other_clones")]
-#[test_case(false, &[STORED_RECEIPT_ID] ; "no_mailbox_keeps_the_stored_receipts")]
-fn checkpoint_keeps_pending_background(held: bool, expected: &[&str]) {
-    let mut app = test_app();
-    app.state.session_mut().meta.pending_background = vec![STORED_RECEIPT_ID.into()];
-    if held {
-        hold_mailbox(&mut app).track(LOST_ID);
-    }
-
-    app.checkpoint();
-    assert_eq!(
-        app.state.session.meta.pending_background, expected,
-        "{RECEIPTS_KEPT}"
-    );
-}
-
-/// Receipts the stored session left unanswered come back as lost notices,
-/// once however often it is installed, and the meta keeps them until a run
-/// takes them.
-#[test]
-fn restore_resumed_session_queues_lost_notices_the_meta_keeps_until_drained() {
-    let mut app = test_app();
-    let mailbox = hold_mailbox(&mut app);
-    app.state.session_mut().meta.pending_background = vec![LOST_ID.into()];
-
-    app.restore_resumed_session();
-    app.restore_lost_background();
-    app.checkpoint();
-    assert_eq!(app.state.session.meta.pending_background, [LOST_ID]);
-
-    assert_eq!(mailbox.drain().len(), 1);
-    app.checkpoint();
-    assert!(app.state.session.meta.pending_background.is_empty());
-}
-
-#[test]
 fn apply_loaded_session_defers_queued_messages_until_respawn() {
     let mut app = test_app();
     let mut session = AppSession::new("test-model", "/tmp/test");
     session.meta.queued_messages = vec!["deferred".into()];
     session.push_message(Message::user("hello".into()));
 
-    let model = app.state.model.clone();
-    app.apply_loaded_session(OpenSession::claimed(session, &app.storage), &model);
+    app.apply_loaded_session(OpenSession::claimed(session, &app.storage));
 
     assert!(app.queue.is_empty());
     assert_eq!(app.state.session.meta.queued_messages, ["deferred"]);
@@ -4506,33 +3855,16 @@ fn apply_loaded_session_defers_queued_messages_until_respawn() {
 
 #[test]
 fn yolo_toggle() {
-    let mut app = test_app();
-    assert!(!app.permissions.is_yolo());
+    let mut app = remote_settings_app(remote_settings_options(false), true);
+    assert!(!app.yolo.is_yolo());
     app.execute_command(cmd("/yolo"), 0);
-    assert!(app.permissions.is_yolo());
+    assert!(app.yolo.is_yolo());
     let flash = app.status_bar.flash_text().unwrap();
     assert!(flash.contains("enabled"), "flash={flash:?}");
     app.execute_command(cmd("/yolo"), 0);
-    assert!(!app.permissions.is_yolo());
+    assert!(!app.yolo.is_yolo());
     let flash = app.status_bar.flash_text().unwrap();
     assert!(flash.contains("disabled"), "flash={flash:?}");
-}
-
-/// The toggle is session state like mode and thinking, so a checkpoint has to
-/// mirror it or a resume silently downgrades the session's permissions.
-#[test]
-fn checkpoint_mirrors_the_yolo_toggle_into_meta() {
-    let mut app = test_app();
-    app.checkpoint();
-    assert_eq!(app.state.session.meta.yolo, None);
-
-    app.execute_command(cmd("/yolo"), 0);
-    app.checkpoint();
-    assert_eq!(app.state.session.meta.yolo, Some(true));
-
-    app.execute_command(cmd("/yolo"), 0);
-    app.checkpoint();
-    assert_eq!(app.state.session.meta.yolo, Some(false));
 }
 
 fn session_with_yolo(stored: Option<bool>) -> AppSession {
@@ -4540,23 +3872,6 @@ fn session_with_yolo(stored: Option<bool>) -> AppSession {
     session.meta.yolo = stored;
     session.push_message(Message::user(RESUMED_PROMPT.into()));
     session
-}
-
-/// The restored permissions, then what the next checkpoint writes back. Both
-/// matter: `--yolo` and `always_yolo` are properties of the invocation, so a
-/// resume under the flag must neither mark an untouched session nor erase the
-/// intent a marked one already carries.
-#[test_case(false, None        => (false, None)        ; "no_flag_and_nothing_stored_stays_off")]
-#[test_case(true,  None        => (true,  None)        ; "the_flag_applies_without_marking_the_session")]
-#[test_case(false, Some(true)  => (true,  Some(true))  ; "stored_on_comes_back_without_the_flag")]
-#[test_case(true,  Some(true)  => (true,  Some(true))  ; "the_flag_does_not_wipe_stored_on")]
-#[test_case(true,  Some(false) => (false, Some(false)) ; "stored_off_overrides_the_flag")]
-fn resume_applies_stored_yolo(seed: bool, stored: Option<bool>) -> (bool, Option<bool>) {
-    let mut app = spawned_app(tmp_tab(session_with_yolo(stored)), test_permissions(seed));
-
-    app.restore_resumed_session();
-    app.checkpoint();
-    (app.permissions.is_yolo(), app.state.session.meta.yolo)
 }
 
 /// `focus_session` sends the same key press down this path instead of a fresh
@@ -4568,40 +3883,27 @@ fn resume_applies_stored_yolo(seed: bool, stored: Option<bool>) -> (bool, Option
 #[test_case(true,  Some(true)  => (true,  Some(true))  ; "the_flag_does_not_wipe_stored_on")]
 #[test_case(true,  Some(false) => (false, Some(false)) ; "stored_off_overrides_the_flag")]
 fn loading_a_session_applies_stored_yolo(seed: bool, stored: Option<bool>) -> (bool, Option<bool>) {
-    let mut app = spawned_app(
-        tmp_tab(AppSession::new(TEST_MODEL_SPEC, TEST_CWD)),
-        test_permissions(seed),
-    );
-    let model = app.state.model.clone();
+    let mut app = spawned_app(tmp_tab(AppSession::new(TEST_MODEL_SPEC, TEST_CWD)), seed);
 
-    app.apply_loaded_session(
-        OpenSession::claimed(session_with_yolo(stored), &app.storage),
-        &model,
-    );
+    app.apply_loaded_session(OpenSession::claimed(
+        session_with_yolo(stored),
+        &app.storage,
+    ));
     app.checkpoint();
-    (app.permissions.is_yolo(), app.state.session.meta.yolo)
+    (app.yolo.is_yolo(), app.state.session.meta.yolo)
 }
 
-/// A tab keeps one permission manager for its whole life, so without an
-/// explicit reset `/new` would carry the rules the user allowed last time into
-/// a session nobody granted them for. The yolo toggle is not one of those. The
-/// user set it, like the mode, so it rides along and only the grants go.
 #[test_case(false => (true,  Some(true))  ; "a_fresh_session_keeps_the_toggle_on")]
 #[test_case(true  => (false, Some(false)) ; "a_fresh_session_keeps_the_toggle_off")]
-fn resetting_the_session_drops_what_the_last_one_was_granted(seed: bool) -> (bool, Option<bool>) {
-    let mut app = spawned_app(
-        tmp_tab(session_with_yolo(Some(!seed))),
-        test_permissions(seed),
-    );
-    app.permissions.load_session_rules(vec![session_rule()]);
-    assert_eq!(app.permissions.is_yolo(), !seed);
+fn resetting_the_session_keeps_the_yolo_choice(seed: bool) -> (bool, Option<bool>) {
+    let mut app = spawned_app(tmp_tab(session_with_yolo(Some(!seed))), seed);
+    assert_eq!(app.yolo.is_yolo(), !seed);
 
     app.reset_session();
     app.checkpoint();
 
-    assert!(app.permissions.session_rules_snapshot().is_empty());
     assert!(app.state.session.meta.session_rules.is_empty());
-    (app.permissions.is_yolo(), app.state.session.meta.yolo)
+    (app.yolo.is_yolo(), app.state.session.meta.yolo)
 }
 
 #[test]
@@ -4640,104 +3942,77 @@ fn ctrl_r_refreshes_usage_while_modal_open() {
     assert!(app.usage_modal.is_open(), "modal should stay open");
 }
 
-#[test]
-fn cd_command_behavior() {
-    let mut app = test_app();
+fn host_cd(app: &mut App, path: &str, answer: Result<String, String>) {
+    let (handles, peer) = remote_settled(
+        false,
+        None,
+        None,
+        Agreed {
+            sessions: true,
+            ..Default::default()
+        },
+    );
+    app.remote_link = Some(handles.remote_link.clone());
+    let requested = path.to_owned();
+    let reply = std::thread::spawn(move || {
+        let request = peer.recv();
+        assert_eq!(request["method"], SESSION_METHOD);
+        assert_eq!(request["params"]["operation"], "change_directory");
+        assert_eq!(request["params"]["path"], requested);
+        match answer {
+            Ok(cwd) => peer.respond(&request, cwd),
+            Err(message) => peer.send(serde_json::json!({
+                "jsonrpc": "2.0", "id": request["id"],
+                "error": {"code": -32603, "message": message},
+            })),
+        }
+    });
     app.execute_command(
         ParsedCommand {
             name: "/cd".into(),
-            args: "/tmp".into(),
+            args: path.into(),
             bang: false,
         },
         0,
     );
-    let flash = app.status_bar.flash_text().unwrap();
-    assert!(flash.starts_with("cd /tmp"), "flash={flash:?}");
-    // Use `canonicalize_clean` (resolves symlinks like the OS does) rather
-    // than `absolute` which preserves symlinks. On macOS `/tmp` is a symlink
-    // to `/private/tmp`; production `cmd_cd` reads back `current_dir()` which
-    // returns the resolved form, so the test expectation must match.
-    let resolved = maki_storage::paths::canonicalize_clean(Path::new("/tmp"));
-    assert_eq!(app.state.session.cwd, resolved.to_string_lossy());
-
-    app.execute_command(
-        ParsedCommand {
-            name: "/cd".into(),
-            args: "/nonexistent_path_12345".into(),
-            bang: false,
-        },
-        0,
-    );
-    let flash = app.status_bar.flash_text().unwrap();
-    assert!(flash.starts_with("cd: "), "error flash={flash:?}");
-}
-
-/// Plugins that track the working directory retitle windows and rerun
-/// project detection on this event, so it has to fire only on a real move.
-#[test]
-fn cd_fires_cwd_changed_with_the_new_directory() {
-    let mut app = test_app();
-    let probe = probe_events(&mut app);
-
-    app.execute_command(
-        ParsedCommand {
-            name: "/cd".into(),
-            args: "/tmp".into(),
-            bang: false,
-        },
-        0,
-    );
-
-    let (event, data) = probe.try_recv_autocmd().expect("SessionCwdChanged fired");
-    assert_eq!(event, "SessionCwdChanged");
-    let resolved = maki_storage::paths::canonicalize_clean(Path::new("/tmp"));
-    assert_eq!(data["cwd"], serde_json::json!(resolved.to_string_lossy()));
-    assert_eq!(
-        data["session_id"],
-        serde_json::json!(app.state.session.id.to_string())
-    );
+    reply.join().unwrap();
 }
 
 #[test]
-fn failed_cd_fires_no_cwd_changed() {
-    let mut app = test_app();
-    let probe = probe_events(&mut app);
-
-    app.execute_command(
-        ParsedCommand {
-            name: "/cd".into(),
-            args: "/nonexistent_path_12345".into(),
-            bang: false,
-        },
-        0,
-    );
-
-    assert!(
-        probe.try_recv_autocmd().is_none(),
-        "no event on a failed cd"
-    );
-}
-
-#[test]
-fn cd_swaps_input_history_to_the_new_dir() {
-    let (tmp, dir, _writer, mut app) = tempdir_app();
+fn cd_updates_the_tab_and_input_history_from_the_host() {
+    let (tmp, dir, mut app) = tempdir_app();
     let target = tmp.path().join(CD_TARGET_DIR);
     fs::create_dir(&target).unwrap();
     let target = maki_storage::paths::canonicalize_clean(&target);
+    let cwd = target.to_string_lossy().into_owned();
     let mut seeded = InputHistory::load(&dir, &target, app.input_box.history().max_entries());
     seeded.push(CD_TARGET_PROMPT.into());
     seeded.save().unwrap();
+    let probe = probe_events(&mut app);
 
-    app.execute_command(
-        ParsedCommand {
-            name: "/cd".into(),
-            args: target.to_string_lossy().into_owned(),
-            bang: false,
-        },
-        0,
-    );
+    host_cd(&mut app, CD_TARGET_DIR, Ok(cwd.clone()));
 
+    assert_eq!(app.state.session.cwd, cwd);
     assert_eq!(app.input_box.history().get(0), Some(CD_TARGET_PROMPT));
+    assert_eq!(app.status_bar.flash_text().unwrap(), format!("cd {cwd}"));
+    let (event, data) = probe.try_recv_autocmd().expect("SessionCwdChanged fired");
+    assert_eq!(event, "SessionCwdChanged");
+    assert_eq!(data["cwd"], cwd);
+    assert_eq!(data["session_id"], app.state.session.id.to_string());
+}
+
+#[test]
+fn failed_cd_keeps_the_tab_and_fires_no_event() {
+    const FAILURE: &str = "no such directory";
+    let (_tmp, _dir, mut app) = tempdir_app();
+    let cwd = app.state.session.cwd.clone();
+    let probe = probe_events(&mut app);
+
+    host_cd(&mut app, CD_TARGET_DIR, Err(FAILURE.into()));
+
+    assert_eq!(app.state.session.cwd, cwd);
+    assert!(app.status_bar.flash_text().unwrap().contains(FAILURE));
+    assert!(probe.try_recv_autocmd().is_none());
 }
 
 #[test]
@@ -4746,34 +4021,6 @@ fn typed_slash_command_executes() {
     let actions = type_and_submit(&mut app, "/help");
     assert!(actions.is_empty());
     assert!(app.help_modal.is_open());
-}
-
-const LUA_COMMAND_RAN: &str = "lua command with args must reach the plugin";
-const LUA_COMMAND_NOT_SENT: &str = "lua command with args must not reach the model";
-
-/// The palette hides a lua command once the typed words pass its `max_args`,
-/// and a hidden command falls through to `handle_submit`, so a multi word
-/// `nargs` command must still be routed to its plugin.
-#[test]
-fn typed_lua_command_with_args_executes() {
-    let dir = StateDir::from_path(env::temp_dir());
-    let mut app = build_app_with_lua(
-        dir.clone(),
-        Arc::new(test_writer(dir)),
-        LuaCommandReader::from_commands(vec![LuaCommandInfo {
-            name: "/rename".into(),
-            description: "Rename the current session".into(),
-            plugin: "sessions".into(),
-            reach: trusted(),
-            max_args: usize::MAX,
-        }]),
-    );
-    let probe = probe_events(&mut app);
-
-    let actions = type_and_submit(&mut app, "/rename my title");
-
-    assert!(actions.is_empty(), "{LUA_COMMAND_NOT_SENT}");
-    assert!(probe.try_recv().is_some(), "{LUA_COMMAND_RAN}");
 }
 
 const RUN_CMDLINE_REJECTED: &str = "a rejected cmdline must not run anything";
@@ -4791,7 +4038,7 @@ fn run_cmdline_executes_builtin(cmdline: &str) {
         .run_cmdline(cmdline, 0, &only(Permission::SessionWrite))
         .unwrap();
 
-    assert!(matches!(&actions[..], [Action::RestartAgent(h)] if h.is_empty()));
+    assert!(matches!(&actions[..], [Action::RestartAgent]));
 }
 
 #[test]
@@ -4937,7 +4184,7 @@ fn run_cmdline_leaves_user_only_commands_to_the_user(cmdline: &str) {
         app.run_cmdline(cmdline, 1, &trusted()).err(),
         Some(format!("{cmdline}{USER_ONLY_SUFFIX}"))
     );
-    assert!(!app.permissions.is_yolo());
+    assert!(!app.yolo.is_yolo());
     assert_eq!(app.exit_request, ExitRequest::None);
 }
 
@@ -4949,7 +4196,6 @@ fn run_cmdline_forwards_depth_to_lua_command() {
     let dir = StateDir::from_path(env::temp_dir());
     let mut app = build_app_with_lua(
         dir.clone(),
-        Arc::new(test_writer(dir)),
         LuaCommandReader::from_commands(vec![LuaCommandInfo {
             name: "/Sessions".into(),
             description: "Browse sessions".into(),
@@ -5012,8 +4258,6 @@ fn seed_rewind_session(session: &mut AppSession) {
     );
 }
 
-const RESTART_EXPECTED: &str = "a rewind must respawn the agent on the truncated history";
-
 fn rewind_to_second_turn() -> RewindEntry {
     rewind_to_prompt("second prompt")
 }
@@ -5026,48 +4270,14 @@ fn rewind_to_prompt(text: &str) -> RewindEntry {
     }
 }
 
-#[test]
-fn rewind_to_middle_truncates_and_populates_input() {
-    let mut app = build_rewind_app();
-    let old_run_id = app.run_id;
-    let actions = app.rewind_to(rewind_to_second_turn());
-
-    assert_eq!(app.state.session.messages().len(), 2);
-    assert!(app.state.session.tool_outputs().contains_key("tool-1"));
-    assert_eq!(app.input_box.buffer.value(), "second prompt");
-    assert_eq!(app.run_id, old_run_id);
-
-    let Action::RestartAgent(ref history) = actions[0] else {
-        panic!("{RESTART_EXPECTED}");
-    };
-    assert_eq!(history.len(), 2);
-}
-
-/// Dropping two short messages may shave a few tokens off the gauge, never the
-/// baseline underneath it. A session that never ran a turn has no baseline, so
-/// there the rough estimate is all we get.
-#[test_case(MEASURED_CONTEXT, MEASURED_CONTEXT - SMALL_HISTORY ; "keeps_measured_baseline")]
-#[test_case(0,                0                                ; "falls_back_to_estimate")]
-fn rewind_recomputes_context_size(measured: u32, floor: u32) {
-    let mut app = build_rewind_app();
-    app.state.context_size = measured;
-    app.rewind_to(rewind_to_second_turn());
-
-    let size = app.state.context_size;
-    assert!(
-        size > floor && size < floor + SMALL_HISTORY,
-        "context {size} left the {floor}..{} window",
-        floor + SMALL_HISTORY
-    );
-    assert_eq!(app.chats[0].context_size, size);
-}
-
 /// Left at the pre-compaction value, a session compacted just before exit
-/// compacts itself again on resume.
+/// compacts itself again on resume. A remote gauge comes from the usage
+/// slot alone, which can hold a newer turn's size by the time the event is
+/// drawn.
 #[test]
-fn compaction_lowers_the_stored_context_size() {
+fn compaction_does_not_override_host_usage() {
     const AFTER: u32 = SMALL_HISTORY;
-    let mut app = test_app();
+    let mut app = remote_app();
     app.run_id = 1;
     app.state.context_size = MEASURED_CONTEXT;
     app.chats[0].context_size = MEASURED_CONTEXT;
@@ -5079,30 +4289,9 @@ fn compaction_lowers_the_stored_context_size() {
         summary: String::new(),
     }));
 
-    assert_eq!(app.state.context_size, AFTER);
-    assert_eq!(app.chats[0].context_size, AFTER);
-}
-
-#[test]
-fn rewind_to_first_turn_clears_everything() {
-    let mut app = build_rewind_app();
-    app.state.context_size = MEASURED_CONTEXT;
-    app.state.token_usage.input = 500;
-    app.state.token_usage.output = 200;
-    let entry = RewindEntry {
-        turn_index: 0,
-        prompt_preview: "1: first".into(),
-        prompt_text: "first prompt".into(),
-    };
-    let actions = app.rewind_to(entry);
-
-    assert!(app.state.session.messages().is_empty());
-    assert!(!app.state.session.tool_outputs().contains_key("tool-1"));
-    assert_eq!(app.state.token_usage.input, 500);
-    assert_eq!(app.state.token_usage.output, 200);
-    assert_eq!(app.state.context_size, 0);
-    assert_eq!(app.chats[0].context_size, 0);
-    assert!(matches!(&actions[0], Action::RestartAgent(_)));
+    let expected = MEASURED_CONTEXT;
+    assert_eq!(app.state.context_size, expected);
+    assert_eq!(app.chats[0].context_size, expected);
 }
 
 #[test_case(Duration::ZERO,          true  ; "keeps_fresh_error")]
@@ -5166,49 +4355,19 @@ fn retry_clears_subagent_in_progress_tools() {
     assert!(app.retry_info.is_none());
 }
 
-fn auth_retry_enter(app: &mut App) -> Vec<Action> {
-    app.update(Msg::Key(key(KeyCode::Enter)))
+fn permission_choices() -> Vec<maki_types::event::PermissionChoice> {
+    vec![maki_types::event::PermissionChoice {
+        id: "allow-once".into(),
+        label: "Allow once".into(),
+        allow: true,
+    }]
 }
 
-fn auth_retry_type_then_enter(app: &mut App) -> Vec<Action> {
-    type_and_submit(app, "ignored")
-}
-
-#[test_case(auth_retry_enter          ; "bare_enter")]
-#[test_case(auth_retry_type_then_enter ; "typed_text_then_enter")]
-fn auth_retry_sends_empty_answer(submit: fn(&mut App) -> Vec<Action>) {
-    let mut app = test_app();
-    app.status = Status::Streaming;
-    app.run_id = 1;
-    let (tx, rx) = flume::unbounded();
-    app.answer_tx = Some(tx);
-
-    app.update(agent_msg(AgentEvent::AuthRequired));
-    assert!(app.awaiting_input());
-
-    let actions = submit(&mut app);
-    assert!(actions.is_empty());
-    assert!(!app.awaiting_input());
-    assert_eq!(rx.try_recv().unwrap(), "");
-}
-
-fn app_with_subagent_tx(id: &str) -> (App, flume::Receiver<String>, flume::Receiver<String>) {
-    let (sub_tx, sub_rx) = flume::unbounded();
-    let (main_tx, main_rx) = flume::unbounded();
-    let mut app = test_app();
-    app.status = Status::Streaming;
-    app.run_id = 1;
-    app.answer_tx = Some(main_tx);
-    app.update(Msg::Agent(Box::new(Envelope {
-        event: AgentEvent::TextDelta { text: "x".into() },
-        subagent: Some(subagent_info_with_tx(id, "research", Some(sub_tx))),
-        run_id: 1,
-    })));
-    (app, sub_rx, main_rx)
-}
-
-fn allow_once(ask_id: &str) -> String {
-    TaggedAnswer::new(ask_id, PermissionAnswer::AllowOnce).encode()
+fn allow_once(ask_id: &str) -> AnsweredRequest {
+    AnsweredRequest {
+        id: ask_id.into(),
+        answer: Some("allow-once".into()),
+    }
 }
 
 /// Subagents run in parallel and each parks its own tool call on its own ask.
@@ -5216,96 +4375,27 @@ fn allow_once(ask_id: &str) -> String {
 /// or that tool call waits forever.
 #[test]
 fn concurrent_subagent_permission_requests_are_each_answered() {
-    let (first_tx, first_rx) = flume::unbounded();
-    let (second_tx, second_rx) = flume::unbounded();
     let mut app = test_app();
-    app.status = Status::Streaming;
-    app.run_id = 1;
-    for (parent, ask, tx) in [
-        ("sub-a", FIRST_ASK, first_tx),
-        ("sub-b", SECOND_ASK, second_tx),
-    ] {
+    let replies = answer_channel(&mut app);
+    for (parent, ask) in [("sub-a", FIRST_ASK), ("sub-b", SECOND_ASK)] {
         app.update(Msg::Agent(Box::new(Envelope {
             event: AgentEvent::PermissionRequest {
                 id: ask.into(),
                 tool: ToolKey::native("bash"),
                 scopes: vec!["ls".into()],
                 reason: None,
+                choices: permission_choices(),
             },
-            subagent: Some(subagent_info_with_tx(parent, RESEARCH_NAME, Some(tx))),
+            subagent: Some(subagent_info(parent, RESEARCH_NAME)),
             run_id: 1,
         })));
     }
-
-    app.update(Msg::Key(key(KeyCode::Char('y'))));
-    assert_eq!(first_rx.try_recv().unwrap(), allow_once(FIRST_ASK));
-    assert!(second_rx.is_empty(), "the queued ask is still unanswered");
-
-    app.update(Msg::Key(key(KeyCode::Char('y'))));
-    assert_eq!(second_rx.try_recv().unwrap(), allow_once(SECOND_ASK));
+    for ask in [FIRST_ASK, SECOND_ASK] {
+        app.update(Msg::Key(key(KeyCode::Char('1'))));
+        assert_eq!(replies.try_recv().unwrap(), allow_once(ask));
+        assert!(replies.is_empty());
+    }
     assert!(!app.permission_prompt.is_open());
-}
-
-#[test]
-fn auth_required_in_subagent_shows_in_both_chats() {
-    let (mut app, _sub_rx, _main_rx) = app_with_subagent_tx("sub1");
-    app.update(subagent_msg(
-        AgentEvent::AuthRequired,
-        "sub1",
-        Some("research"),
-    ));
-
-    assert_eq!(app.chats[1].last_message_text(), AUTH_EXPIRED_MSG);
-    assert_eq!(app.chats[0].last_message_text(), AUTH_EXPIRED_MSG);
-    assert!(app.chats[1].auth_parked);
-    assert!(app.awaiting_input(), "a subagent on the turn holds it");
-}
-
-#[test]
-fn auth_retry_in_subagent_routes_to_subagent_channel() {
-    let (mut app, sub_rx, main_rx) = app_with_subagent_tx("sub1");
-    app.update(subagent_msg(
-        AgentEvent::AuthRequired,
-        "sub1",
-        Some("research"),
-    ));
-    let actions = app.update(Msg::Key(key(KeyCode::Enter)));
-
-    assert!(actions.is_empty());
-    assert!(!app.chats[1].auth_parked);
-    assert_eq!(sub_rx.try_recv().unwrap(), "");
-    assert!(main_rx.try_recv().is_err());
-}
-
-#[test]
-fn cancel_clears_subagent_auth_retry() {
-    let (mut app, sub_rx, _main_rx) = app_with_subagent_tx("sub1");
-    app.update(subagent_msg(
-        AgentEvent::AuthRequired,
-        "sub1",
-        Some("research"),
-    ));
-
-    cancel_app(&mut app);
-
-    assert!(!app.chats[1].auth_parked);
-    assert!(!app.awaiting_input());
-    assert!(sub_rx.try_recv().is_err());
-}
-
-#[test]
-fn stale_auth_required_after_cancel_is_dropped() {
-    let mut app = test_app();
-    app.status = Status::Streaming;
-    app.run_id = 2;
-    let count_before = app.chats[0].message_count();
-    app.update(Msg::Agent(Box::new(Envelope {
-        event: AgentEvent::AuthRequired,
-        subagent: None,
-        run_id: 1,
-    })));
-    assert!(!app.awaiting_input());
-    assert_eq!(app.chats[0].message_count(), count_before);
 }
 
 /// Output that mutates a segment already on screen, rather than appending a
@@ -5329,6 +4419,8 @@ fn search_reaches_output_that_lands_in_an_existing_segment() {
         is_error: false,
         annotation: None,
         written_path: None,
+        data: None,
+
         backgrounded: false,
     }))));
     rendered(&mut app);
@@ -5394,25 +4486,23 @@ fn mcp_command_opens_picker() {
 #[test]
 fn mcp_toggle_dispatches_action() {
     let mut app = test_app();
-    app.mcp_picker = McpPicker::new(
-        McpSnapshotReader::from_snapshot(McpSnapshot {
-            infos: vec![McpServerInfo {
-                name: "test-srv".into(),
-                transport_kind: "stdio",
-                tool_count: 2,
-                prompt_count: 0,
-                status: McpServerStatus::Running,
-                config_path: PathBuf::from("/tmp/config.toml"),
-                url: None,
-                oauth: None,
-                ca_file: None,
-            }],
-            prompts: vec![],
-            pids: vec![],
-            generation: 0,
-        }),
-        McpConfigErrors::new(PathBuf::new()),
-    );
+    app.mcp_picker = McpPicker::new(McpSnapshotReader::from_snapshot(McpSnapshot {
+        config_error: None,
+        infos: vec![McpServerInfo {
+            name: "test-srv".into(),
+            transport_kind: "stdio".into(),
+            tool_count: 2,
+            prompt_count: 0,
+            status: McpServerStatus::Running,
+            config_path: PathBuf::from("/tmp/config.toml"),
+            url: None,
+            oauth: None,
+            ca_file: None,
+        }],
+        prompts: vec![],
+        pids: vec![],
+        generation: 0,
+    }));
     app.execute_command(cmd("/mcp"), 0);
 
     let actions = app.update(Msg::Key(key(KeyCode::Enter)));
@@ -5567,28 +4657,10 @@ fn streaming_app_with_history() -> App {
             ..Default::default()
         },
     ];
-    app.shared_history = Some(Arc::new(ArcSwap::from_pointee(
-        maki_agent::HistorySnapshot::new(history),
-    )));
+    for message in history {
+        app.state.session_mut().push_message(message);
+    }
     app
-}
-
-/// The stale event is dropped, yet the cancelled turn still reaches disk: the
-/// next frame's checkpoint syncs the mirror whatever event arrived.
-#[test_case(done() ; "stale_done")]
-#[test_case(
-    AgentEvent::Error { message: "timeout".into(), auth: false, totals: RunTotals::default() } ; "stale_error"
-)]
-fn checkpoint_after_cancel_persists_the_cancelled_turn(event: AgentEvent) {
-    let mut app = streaming_app_with_history();
-    let old_run_id = app.run_id;
-    cancel_app(&mut app);
-    assert_ne!(app.run_id, old_run_id);
-    assert!(app.state.session.messages().is_empty());
-
-    app.update(agent_msg_with_run_id(event, old_run_id));
-    app.checkpoint();
-    assert_eq!(app.state.session.messages().len(), 2);
 }
 
 #[test]
@@ -5602,7 +4674,7 @@ fn parent_done_reconciles_unresolved_children_and_tools() {
         input: None,
         raw_input: None,
         output: None,
-        render_header: None,
+        data_version: DEFAULT_DATA_VERSION,
     }))));
     app.update(subagent_msg(
         AgentEvent::ToolStart(Box::new(ToolStartEvent {
@@ -5613,19 +4685,10 @@ fn parent_done_reconciles_unresolved_children_and_tools() {
             input: None,
             raw_input: None,
             output: None,
-            render_header: None,
+            data_version: DEFAULT_DATA_VERSION,
         })),
         "task1",
         Some("research"),
-    ));
-    let buf = Arc::new(maki_agent::SharedBuf::new());
-    app.update(subagent_msg(
-        AgentEvent::LiveToolBuf {
-            id: "child-tool".into(),
-            body: buf,
-        },
-        "task1",
-        None,
     ));
 
     app.update(done_event());
@@ -5741,7 +4804,7 @@ fn active_shell_survives_agent_error_while_agent_and_child_tools_fail() {
         input: None,
         raw_input: None,
         output: None,
-        render_header: None,
+        data_version: DEFAULT_DATA_VERSION,
     }))));
     app.update(subagent_msg(
         AgentEvent::ToolStart(Box::new(ToolStartEvent {
@@ -5752,7 +4815,7 @@ fn active_shell_survives_agent_error_while_agent_and_child_tools_fail() {
             input: None,
             raw_input: None,
             output: None,
-            render_header: None,
+            data_version: DEFAULT_DATA_VERSION,
         })),
         "task1",
         Some("research"),
@@ -5796,7 +4859,7 @@ fn main_shell_exclusion_does_not_protect_same_id_in_child_chat() {
             input: None,
             raw_input: None,
             output: None,
-            render_header: None,
+            data_version: DEFAULT_DATA_VERSION,
         })),
         "task1",
         Some("research"),
@@ -5822,36 +4885,14 @@ fn error_event_matching_run_id_saves_session_and_queued_messages() {
     app.checkpoint();
 
     assert_eq!(app.state.session.messages().len(), 2);
-    assert_eq!(app.state.session.meta.queued_messages, ["next"]);
+    assert_eq!(app.unsent().queued_messages, ["next"]);
     assert!(app.queue.is_empty());
 
-    assert_eq!(app.state.session.meta.queued_messages, ["next"]);
+    assert_eq!(app.unsent().queued_messages, ["next"]);
 
     type_and_submit(&mut app, "replacement");
     app.checkpoint();
-    assert!(app.state.session.meta.queued_messages.is_empty());
-}
-
-#[test]
-fn flush_restored_queue_drops_recovery_snapshot() {
-    let mut app = streaming_app_with_history();
-    app.queue_and_notify(queued_msg("next"));
-    app.update(agent_msg(AgentEvent::Error {
-        message: "boom".into(),
-        auth: false,
-        totals: RunTotals::default(),
-    }));
-    app.checkpoint();
-    assert_eq!(app.state.session.meta.queued_messages, ["next"]);
-
-    app.flush_restored_queue();
-    app.checkpoint();
-    assert_eq!(app.state.session.meta.queued_messages, ["next"]);
-    assert!(app.recoverable_queue.is_empty());
-
-    app.queue.clear();
-    app.checkpoint();
-    assert!(app.state.session.meta.queued_messages.is_empty());
+    assert!(app.unsent().queued_messages.is_empty());
 }
 
 // --- Plan form integration tests ---
@@ -5865,48 +4906,18 @@ fn implement_msg(parallel: bool) -> String {
 }
 
 fn plan_app() -> App {
-    let mut app = test_app();
-    app.status = Status::Streaming;
-    app.run_id = 1;
-    app.state.mode = Mode::Plan;
-    app.state.plan = PlanState::Drafting(PathBuf::from("test-plan.md"));
-    app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
-        call: None,
-        id: "t1".into(),
-        tool: "write".into(),
-        output: Arc::new(ToolOutput::Plain("wrote 42 bytes to test-plan.md".into())),
-        is_error: false,
-        annotation: None,
-        written_path: Some("test-plan.md".into()),
-        backgrounded: false,
-    }))));
+    let (plan, _seen) = remote_plan::test_support::answering(|_| {
+        Ok(json!({"path": "test-plan.md", "text": REMOTE_PLAN_TEXT, "revision": "r"}))
+    });
+    keep_write(
+        &plan,
+        PLAN_CALL,
+        Path::new("test-plan.md"),
+        REMOTE_PLAN_TEXT,
+    );
+    let mut app = plan_remote_app(plan);
+    app.update(plan_write_done(PLAN_CALL, Path::new("test-plan.md")));
     app
-}
-
-#[test_case(Mode::Plan,  true  ; "plan_mode_tooldone_opens_form")]
-#[test_case(Mode::Build, false ; "build_mode_tooldone_no_form")]
-fn tool_done_write_opens_plan_form(mode: Mode, expect_form: bool) {
-    let mut app = test_app();
-    app.status = Status::Streaming;
-    app.run_id = 1;
-    app.state.mode = mode;
-    app.state.plan = PlanState::Drafting(PathBuf::from("/tmp/plans/test.md"));
-    app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
-        call: None,
-        id: "t1".into(),
-        tool: "write".into(),
-        output: Arc::new(ToolOutput::Plain(
-            "wrote 42 bytes to /tmp/plans/test.md".into(),
-        )),
-        is_error: false,
-        annotation: None,
-        written_path: Some("/tmp/plans/test.md".into()),
-        backgrounded: false,
-    }))));
-    assert_eq!(app.plan_form.is_visible(), expect_form);
-    if expect_form {
-        assert!(app.state.plan.is_ready());
-    }
 }
 
 #[test]
@@ -5923,21 +4934,8 @@ fn done_event_does_not_open_plan_form() {
 #[test]
 fn re_edit_keeps_plan_form_visible() {
     let mut app = plan_app();
+    rewrite_plan(&mut app);
     assert!(app.state.plan.is_ready());
-    assert!(app.plan_form.is_visible());
-
-    // Agent edits the plan again (second write to same path) — idempotent, stays Ready
-    app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
-        call: None,
-        id: "t2".into(),
-        tool: "write".into(),
-        output: Arc::new(ToolOutput::Plain("wrote 50 bytes to test-plan.md".into())),
-        is_error: false,
-        annotation: None,
-        written_path: Some("test-plan.md".into()),
-        backgrounded: false,
-    }))));
-    assert!(matches!(app.state.plan, PlanState::Ready(_)));
     assert!(app.plan_form.is_visible());
 }
 
@@ -5960,9 +4958,7 @@ fn plan_form_menu_options(
     assert_eq!(app.state.mode, expected_mode);
     assert_eq!(app.state.plan, PlanState::None);
     assert_eq!(
-        actions
-            .iter()
-            .any(|a| matches!(a, Action::RestartAgent(h) if h.is_empty())),
+        actions.iter().any(|a| matches!(a, Action::RestartAgent)),
         has_new_session
     );
     let expected_msg = implement_msg(PlanForm::new().parallel());
@@ -5995,20 +4991,17 @@ fn plan_form_open_editor() {
 
     let actions = app.update(Msg::Key(kb::OPEN_EDITOR.to_key_event()));
     assert!(app.plan_form.is_visible());
-    assert!(matches!(&actions[..], [Action::OpenEditor(p)] if p == Path::new("test-plan.md")));
+    assert!(matches!(&actions[..], [Action::EditRemotePlan]));
 }
 
 fn rewrite_plan(app: &mut App) {
-    app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
-        call: None,
-        id: "t2".into(),
-        tool: "write".into(),
-        output: Arc::new(ToolOutput::Plain("wrote 99 bytes to test-plan.md".into())),
-        is_error: false,
-        annotation: None,
-        written_path: Some("test-plan.md".into()),
-        backgrounded: false,
-    }))));
+    keep_write(
+        app.remote_plan.as_ref().unwrap(),
+        PLAN_CALL,
+        Path::new("test-plan.md"),
+        REMOTE_PLAN_TEXT,
+    );
+    app.update(plan_write_done(PLAN_CALL, Path::new("test-plan.md")));
 }
 
 fn dismiss_plan_esc(app: &mut App) {
@@ -6288,7 +5281,7 @@ fn assert_unsent(app: &App, actions: &[Action], left: &str) {
 }
 
 /// Streams a turn on {app}, and returns where its answers to the agent go.
-fn answer_channel(app: &mut App) -> flume::Receiver<String> {
+fn answer_channel(app: &mut App) -> flume::Receiver<AnsweredRequest> {
     app.status = Status::Streaming;
     app.run_id = 1;
     let (answer_tx, answer_rx) = flume::unbounded();
@@ -6302,6 +5295,7 @@ fn ask_permission(app: &mut App) {
         tool: ToolKey::native("bash"),
         scopes: vec!["ls".into()],
         reason: None,
+        choices: permission_choices(),
     }));
 }
 
@@ -6310,11 +5304,11 @@ fn open_plan_form(app: &mut App) {
     app.plan_form.on_plan_ready();
 }
 
-/// The `y` was typed before the agent asked, so it must not approve the
+/// The `1` was typed before the agent asked, so it must not approve the
 /// call. That holds whether the handler finishes or the prompt taking the
 /// keyboard lets the keys go first. A plan form that already waited on the
 /// user makes the keyboard look the same before and after the prompt opens
-/// in front of it, and the `y` still was not typed at that prompt.
+/// in front of it, and the `1` still was not typed at that prompt.
 #[test_case(|_| {}, true         ; "when_the_handler_is_done")]
 #[test_case(|_| {}, false        ; "when_the_prompt_takes_the_keyboard")]
 #[test_case(open_plan_form, true ; "over_another_prompt")]
@@ -6328,7 +5322,7 @@ fn held_keys_never_answer_a_prompt_that_opened_while_they_waited(
     let answer_rx = answer_channel(&mut app);
 
     let tab = press_bound(&mut app, &probe, KeyCode::Tab);
-    type_keys(&mut app, "y");
+    type_keys(&mut app, "1");
     ask_permission(&mut app);
     if handler_done {
         app.keybind_done(tab.id());
@@ -6337,7 +5331,7 @@ fn held_keys_never_answer_a_prompt_that_opened_while_they_waited(
     }
 
     assert!(app.permission_prompt.is_open());
-    assert!(answer_rx.is_empty(), "the held y answered the prompt");
+    assert!(answer_rx.is_empty(), "the held choice answered the prompt");
     assert_eq!(app.status_bar.flash_text(), Some(HELD_KEYS_DROPPED));
 }
 
@@ -6377,7 +5371,7 @@ fn a_modal_toggled_open_counts_as_a_prompt_opened(cmdline: &str) {
 fn held_keys_follow_a_window_the_handler_opened_over_a_prompt() {
     let mut app = test_app();
     let probe = install_override(&mut app, KeyCode::Tab, KeyModifiers::NONE);
-    app.chats[MAIN_CHAT].auth_parked = true;
+    ask_permission(&mut app);
 
     let tab = press_bound(&mut app, &probe, KeyCode::Tab);
     type_keys(&mut app, "x");
@@ -6579,27 +5573,6 @@ fn ctrl_z_suspends_at_once_and_keeps_the_held_keys() {
 
     app.keybind_done(tab.id());
     assert_eq!(app.input_box.buffer.value(), "hi");
-}
-
-/// The keys after a replayed `/fork` must replay once the fork has the
-/// keyboard, or they land in the tab the user left. The event loop runs the
-/// fork's action, which hands the rest to the new tab, and replays them there.
-#[test]
-fn keys_held_behind_a_fork_land_in_the_fork() {
-    const TYPED: &str = "hello";
-    let (mut app, probe) = app_binding(KeyCode::Tab);
-    let _live = attach_live_history(&mut app, vec![Message::user(LIVE_AGENT_TEXT.into())]);
-
-    let tab = press_bound(&mut app, &probe, KeyCode::Tab);
-    type_and_submit(&mut app, "/fork");
-    type_and_submit(&mut app, TYPED);
-    opened_fork(app.keybind_done(tab.id()));
-    assert_eq!(app.input_box.buffer.value(), "", "the original got no keys");
-
-    let mut fork = test_app();
-    app.hand_typeahead_to(&mut fork);
-    let actions = fork.replay_typeahead();
-    assert!(matches!(&actions[..], [Action::SendMessage(s)] if s.message == TYPED));
 }
 
 const FRONT_PLUGIN: &str = "front";
@@ -6977,12 +5950,11 @@ fn a_primary_paste_waits_behind_held_keys(paste_bound: bool) {
 }
 
 fn open_permission_prompt(app: &mut App) {
-    app.permission_prompt.push(
+    app.permission_prompt.push_choices(
         "perm-1".into(),
         ToolKey::native("bash"),
         vec!["execute".into()],
-        None,
-        true,
+        permission_choices(),
         None,
     );
 }
@@ -7061,20 +6033,20 @@ const HANDLER_NEVER_DONE: &str = "the key handler never reported done";
 const ASKED_EDIT: &str = "edit";
 const ASKED_FALLBACK: &str = "fallback";
 
-fn new_host() -> PluginHost {
-    PluginHost::new(Arc::new(ToolRegistry::new())).unwrap()
+fn new_host() -> maki_lua_ui::UiHost {
+    maki_lua_ui::UiHost::bare()
 }
 
 /// Wires {host} into a fresh app the way the event loop does.
-fn hosted_app(host: &PluginHost) -> (App, flume::Receiver<UiAction>) {
+fn hosted_app(host: &maki_lua_ui::UiHost) -> (App, flume::Receiver<UiAction>) {
     let mut app = test_app();
     app.keymap_reader = host.keymap_reader();
-    app.lua_event_handle = host.event_handle();
+    app.lua_event_handle = crate::EventHandle::from_ui_host(host);
     (app, host.ui_action_rx())
 }
 
 /// A host running {source} as {plugin}, and a fresh app wired to it.
-fn plugin_app(plugin: &str, source: &str) -> (PluginHost, App, flume::Receiver<UiAction>) {
+fn plugin_app(plugin: &str, source: &str) -> (maki_lua_ui::UiHost, App, flume::Receiver<UiAction>) {
     let host = new_host();
     host.load_source(plugin, source).unwrap();
     let (app, ui) = hosted_app(&host);
@@ -7175,7 +6147,7 @@ end)
 "#;
 
 /// A host running {source} with only {grants}.
-fn granted_host(source: &str, grants: &[&str]) -> PluginHost {
+fn granted_host(source: &str, grants: &[&str]) -> maki_lua_ui::UiHost {
     let host = new_host();
     host.load_source_with_permissions(
         GRANTED_PLUGIN,
@@ -7241,7 +6213,7 @@ fn an_enter_held_while_a_handler_changed_the_input_sends_nothing(
 
     assert_eq!(app.input_box.buffer.value(), left);
     assert_eq!(app.status_bar.flash_text(), flash);
-    assert!(!app.permissions.is_yolo());
+    assert!(!app.yolo.is_yolo());
 }
 
 /// The first send uses the version it read, which its own edit just made
@@ -7313,7 +6285,7 @@ fn a_submit_is_refused_where_enter_would_not_send(setup: fn(&mut App), text: &st
     assert_eq!(app.submit_input(req, TEST_AREA).err().as_deref(), Some(err));
     assert_eq!(app.input_box.buffer.value(), text);
     assert_eq!(app.queue.len(), 1);
-    assert!(!app.permissions.is_yolo());
+    assert!(!app.yolo.is_yolo());
 }
 
 #[test]
@@ -7552,28 +6524,14 @@ fn a_refusal_names_each_writer_once() {
 /// theirs.
 #[test]
 fn a_command_a_plugin_wrote_runs_once_the_user_retypes_it() {
-    let mut app = test_app();
+    let mut app = remote_settings_app(remote_settings_options(false), true);
     write_as(&mut app, YOLO, named(only(Permission::Input)));
     assert!(press_enter(&mut app).is_err());
 
     backspaces(&mut app, YOLO.len());
     type_keys(&mut app, YOLO);
     press_enter(&mut app).unwrap();
-    assert!(app.permissions.is_yolo());
-}
-
-/// A login retry sends none of the text, so the input stays as it was and
-/// history does not keep it for a recall to bring back as the user's.
-#[test]
-fn a_login_retry_leaves_the_input_alone() {
-    let (_tmp, _dir, _writer, mut app) = tempdir_app();
-    app.chats[MAIN_CHAT].auth_parked = true;
-    write_as(&mut app, SHELL_LINE, named(only(Permission::Input)));
-
-    app.update(Msg::Key(key(KeyCode::Enter)));
-    assert!(!app.chats[MAIN_CHAT].auth_parked);
-    assert_eq!(app.input_box.buffer.value(), SHELL_LINE);
-    assert!(app.input_box.history().is_empty());
+    assert!(app.yolo.is_yolo());
 }
 
 /// `Esc` closes the palette, and Enter then sends the text as a message.
@@ -7583,7 +6541,7 @@ fn a_login_retry_leaves_the_input_alone() {
 #[test_case(PARTIAL_YOLO, false => true  ; "a_command_prefix_the_user_typed")]
 #[test_case(PLAIN_LINE,   true  => true  ; "a_message_a_plugin_wrote")]
 fn enter_after_esc_keeps_in_history(text: &str, by_plugin: bool) -> bool {
-    let (_tmp, _dir, _writer, mut app) = tempdir_app();
+    let (_tmp, _dir, mut app) = tempdir_app();
     if by_plugin {
         write_as(&mut app, text, named(sender()));
     } else {
@@ -7592,7 +6550,7 @@ fn enter_after_esc_keeps_in_history(text: &str, by_plugin: bool) -> bool {
     app.update(Msg::Key(key(KeyCode::Esc)));
 
     press_enter(&mut app).unwrap();
-    assert!(!app.permissions.is_yolo());
+    assert!(!app.yolo.is_yolo());
     !app.input_box.history().is_empty()
 }
 
@@ -7600,11 +6558,11 @@ fn enter_after_esc_keeps_in_history(text: &str, by_plugin: bool) -> bool {
 /// is theirs.
 #[test]
 fn a_blank_text_a_plugin_left_is_no_ones() {
-    let mut app = test_app();
+    let mut app = remote_settings_app(remote_settings_options(false), true);
     write_as(&mut app, " ", named(only(Permission::Input)));
     type_keys(&mut app, YOLO);
     press_enter(&mut app).unwrap();
-    assert!(app.permissions.is_yolo());
+    assert!(app.yolo.is_yolo());
 }
 
 /// Switching chats changes no text, so it needs no `input`. The draft that
@@ -7747,7 +6705,7 @@ fn selected_the_words_before(app: &mut App) {
 #[test_case(BuiltinAction::Newline,     selected_the_words_before, true  ; "a_newline_by_a_plugin")]
 #[test_case(BuiltinAction::Undo,        deleted_the_bang,          false ; "an_undo_by_the_user")]
 fn a_shell_line_a_builtin_left(action: BuiltinAction, setup: fn(&mut App), by_plugin: bool) {
-    let (_tmp, _dir, _writer, mut app) = tempdir_app();
+    let (_tmp, _dir, mut app) = tempdir_app();
     setup(&mut app);
     let caller = named(only(Permission::Input));
 
@@ -7763,10 +6721,10 @@ fn a_shell_line_a_builtin_left(action: BuiltinAction, setup: fn(&mut App), by_pl
 #[test_case(only(Permission::Input)                       => Some(StoredWriters::Unknown) ; "without_agent")]
 #[test_case(holding(&[Permission::Input, Permission::Agent, Permission::SessionWrite]) => Some(StoredWriters::Agent) ; "with_what_a_prompt_takes")]
 fn a_draft_a_plugin_wrote_goes_to_disk(writer: PluginReach) -> Option<StoredWriters> {
-    let (_tmp, _dir, _writer, mut app) = tempdir_app();
+    let (_tmp, _dir, mut app) = tempdir_app();
     write_as(&mut app, SHELL_LINE, named(writer));
     app.checkpoint();
-    app.state.session.meta.input_draft_writers
+    app.unsent().input_draft_writers
 }
 
 /// A draft read back from disk comes back as written by a plugin with no
@@ -7778,7 +6736,7 @@ fn a_draft_a_plugin_wrote_goes_to_disk(writer: PluginReach) -> Option<StoredWrit
 #[test_case(StoredWriters::Unknown, PLAIN_LINE   => Err(written(UNKNOWN_WRITER, WRITTEN_MESSAGE, &message_refused()))             ; "an_unknown_writer_sends_no_message")]
 #[test_case(StoredWriters::Agent,   PLAIN_LINE   => Ok(())                                                                          ; "a_turn_writer_sends_a_message")]
 fn enter_on_a_restored_draft(writers: StoredWriters, text: &str) -> Result<(), String> {
-    let (_tmp, _dir, _writer, mut app) = tempdir_app();
+    let (_tmp, _dir, mut app) = tempdir_app();
     let meta = &mut app.state.session_mut().meta;
     meta.input_draft = Some(text.into());
     meta.input_draft_writers = Some(writers);
@@ -7796,6 +6754,7 @@ fn with_mcp_prompt(app: &mut App) {
     app.command_palette = CommandPalette::new(
         Arc::from([]),
         McpSnapshotReader::from_snapshot(McpSnapshot {
+            config_error: None,
             infos: vec![],
             prompts: vec![McpPromptInfo {
                 display_name: MCP_PROMPT.into(),
@@ -7826,28 +6785,18 @@ fn with_mcp_prompt(app: &mut App) {
 fn enter_on_a_rewound_turn(text: &str) -> Result<(), String> {
     let mut app = build_rewind_app();
     with_mcp_prompt(&mut app);
-    app.rewind_to(rewind_to_prompt(&format!("\n\n{text}")));
+    let entry = rewind_to_prompt(&format!("\n\n{text}"));
+    app.finish_remote_rewind((*app.state.session).clone(), entry);
     let entered = press_enter(&mut app);
-    assert!(!app.permissions.is_yolo());
+    assert!(!app.yolo.is_yolo());
     entered
 }
 
 #[test]
 fn a_rewound_message_is_the_users() {
     let mut app = build_rewind_app();
-    app.rewind_to(rewind_to_prompt(PLAIN_LINE));
+    app.finish_remote_rewind((*app.state.session).clone(), rewind_to_prompt(PLAIN_LINE));
     assert!(app.input_box.buffer.writers().is_empty());
-}
-
-#[test_case(SHELL_LINE      => Some(StoredWriters::Agent) ; "a_shell_line")]
-#[test_case(MCP_PROMPT_TURN => Some(StoredWriters::Agent) ; "a_command")]
-#[test_case(EXIT_WORD       => Some(StoredWriters::Agent) ; "exit")]
-#[test_case(PLAIN_LINE      => None                       ; "a_message")]
-fn a_forked_turn_keeps_its_writers(text: &str) -> Option<StoredWriters> {
-    let mut app = test_app();
-    seed_rewind_session(app.state.session_mut());
-    let fork = opened_fork(app.fork_to(rewind_to_prompt(text)));
-    fork.meta.input_draft_writers
 }
 
 /// `init.lua` with no `plugin.toml` next to it holds no grants, so its edit
@@ -8301,8 +7250,8 @@ fn tab_composed_in_init_lua_accepts_a_completion_or_falls_back(
     grants: &[&str],
     missing: Option<Permission>,
 ) {
-    let mut host = new_host();
-    host.load_builtins(&PluginsConfig {
+    let host = new_host();
+    host.load_builtins_for_test(&PluginsConfig {
         enabled: true,
         names: vec!["completion".into()],
         ..PluginsConfig::default()
@@ -8368,7 +7317,7 @@ fn input_actions_say_when_there_was_nothing_to_do() {
     const SENT: &str = "sent";
     const TYPED: &str = "ab";
     const TYPED_LINE: &str = "ab\n";
-    let (_tmp, _dir, _writer, mut app) = tempdir_app();
+    let (_tmp, _dir, mut app) = tempdir_app();
     app.input_box.set_input(SENT);
     app.input_box.submit();
     type_keys(&mut app, TYPED);
@@ -8688,7 +7637,7 @@ fn the_command_palette_outranks_the_keys_a_popup_claimed() {
 
     let actions = app.update(Msg::Key(key(KeyCode::Enter)));
     assert!(
-        matches!(&actions[0], Action::RestartAgent(h) if h.is_empty()),
+        matches!(&actions[0], Action::RestartAgent),
         "Enter ran the command the user was typing"
     );
     assert!(!took_a_key(&events), "{CLAIM_NOT_DELIVERED}");
@@ -8719,7 +7668,7 @@ fn a_popup_that_closed_gives_its_keys_back() {
 fn dead_host_override_falls_back_to_builtin() {
     let mut app = test_app();
     let _probe = install_override(&mut app, kb::HELP.code, kb::HELP.modifiers);
-    app.lua_event_handle = maki_lua::EventHandle::disconnected_for_test();
+    app.lua_event_handle = crate::EventHandle::disconnected_for_test();
 
     app.update(Msg::Key(kb::HELP.to_key_event()));
 
@@ -8809,13 +7758,13 @@ fn the_first_esc_arms_the_streaming_cancel_with_no_popup_up() {
 #[test]
 fn the_keys_a_plugin_cannot_bind_are_the_keys_the_host_answers_itself() {
     let app = test_app();
-    let reserved: Vec<maki_lua::Key> = [kb::QUIT, kb::SUSPEND]
+    let reserved: Vec<maki_lua_ui::Key> = [kb::QUIT, kb::SUSPEND]
         .iter()
         .map(|b| plugin_key(b.code, b.modifiers))
         .collect();
 
-    assert_eq!(reserved, maki_lua::RESERVED_KEYS.to_vec());
-    for reserved in maki_lua::RESERVED_KEYS {
+    assert_eq!(reserved, maki_lua_ui::RESERVED_KEYS.to_vec());
+    for reserved in maki_lua_ui::RESERVED_KEYS {
         assert!(
             app.reserved_by_host(KeyEvent::new(reserved.code(), reserved.modifiers())),
             "the host has to answer {} itself, whatever a plugin bound",
@@ -8924,16 +7873,15 @@ fn a_pending_permission_prompt_answers_before_the_package_review() {
         prompt: PACK_REVIEW_PROMPT.into(),
         plan: PackPlan::default(),
     });
-    app.permission_prompt.push(
+    app.permission_prompt.push_choices(
         "id".into(),
         maki_config::ToolKey::native("bash"),
         vec!["execute".into()],
-        None,
-        true,
+        permission_choices(),
         None,
     );
 
-    app.update(Msg::Key(KeyEvent::from(KeyCode::Char('y'))));
+    app.update(Msg::Key(KeyEvent::from(KeyCode::Char('1'))));
 
     assert!(!app.permission_prompt.is_open());
     assert!(app.pack_review.is_open(), "the review waits its turn");
@@ -8952,22 +7900,13 @@ fn thinking_restored_from_session_meta() {
     let mut session = AppSession::new("test-model", "/tmp/test");
     session.meta.thinking = Some(StoredThinking::Budget { tokens: 4096 });
 
-    let state = SessionState::from_session(
-        OpenSession::claimed(session, &storage),
-        &test_model(),
-        &storage,
-    );
+    let state = SessionState::from_session(OpenSession::claimed(session, &storage));
     assert_eq!(state.thinking, ThinkingConfig::Budget(4096));
 }
 
-fn set_opus_model(app: &mut App) {
-    app.state.model = Model::from_spec(OPUS_SPEC).unwrap();
-}
-
 #[test]
-fn fast_toggle_on_off_on_opus() {
-    let mut app = test_app();
-    set_opus_model(&mut app);
+fn fast_toggle_uses_the_agents_option() {
+    let mut app = remote_settings_app(remote_settings_options(false), true);
     assert!(!app.state.fast);
 
     app.execute_command(cmd("/fast"), 0);
@@ -8981,7 +7920,7 @@ fn fast_toggle_on_off_on_opus() {
 
 #[test]
 fn workflow_toggle_flows_into_agent_input() {
-    let mut app = test_app();
+    let mut app = remote_settings_app(remote_settings_options(false), true);
     let msg = QueuedMessage {
         text: "hi".into(),
         images: Vec::new(),
@@ -9023,17 +7962,6 @@ fn subagent_history_finishes_workflow_chat() {
     assert_eq!(app.chats[1].last_message_text(), DONE_TEXT);
 }
 
-#[test_case(SONNET_SPEC ; "non_opus_anthropic")]
-#[test_case("openai/gpt-5.5" ; "non_anthropic")]
-fn fast_flashes_error_on_ineligible_model(spec: &str) {
-    let mut app = test_app();
-    app.state.model = Model::from_spec(spec).unwrap();
-
-    app.execute_command(cmd("/fast"), 0);
-    assert!(!app.state.fast);
-    assert_eq!(app.status_bar.flash_text(), Some(FAST_UNSUPPORTED_MSG));
-}
-
 #[test]
 fn fast_restored_from_session_meta() {
     let tmp = TempDir::new().unwrap();
@@ -9041,221 +7969,8 @@ fn fast_restored_from_session_meta() {
     let mut session = AppSession::new(OPUS_SPEC, "/tmp/test");
     session.meta.fast = true;
 
-    let state = SessionState::from_session(
-        OpenSession::claimed(session, &storage),
-        &Model::from_spec(OPUS_SPEC).unwrap(),
-        &storage,
-    );
+    let state = SessionState::from_session(OpenSession::claimed(session, &storage));
     assert!(state.fast);
-}
-
-#[test]
-fn fast_normalized_off_when_restored_onto_ineligible_model() {
-    let tmp = TempDir::new().unwrap();
-    let storage = StateDir::from_path(tmp.path().to_path_buf());
-    // Saved as fast=true, but sonnet cannot do fast mode, so restoring must drop
-    // it to false or the UI would show a phantom [fast] badge.
-    let mut session = AppSession::new(SONNET_SPEC, "/tmp/test");
-    session.meta.fast = true;
-
-    let state = SessionState::from_session(
-        OpenSession::claimed(session, &storage),
-        &test_model(),
-        &storage,
-    );
-    assert!(!state.fast);
-}
-
-#[test]
-fn model_state_reports_the_model_and_what_it_supports() {
-    let mut app = test_app();
-    app.state.model = Model::from_spec(PLAIN_MODEL_SPEC).unwrap();
-    assert_eq!(
-        model_state_scalars(&app),
-        serde_json::json!({
-            "spec": PLAIN_MODEL_SPEC,
-            "id": "qwen3",
-            "provider": "ollama",
-            "thinking": "off",
-            "thinking_shown": "off",
-            "fast": false,
-            "supports_thinking": false,
-            "supports_fast": false,
-        })
-    );
-
-    set_opus_model(&mut app);
-    app.set_thinking("high").unwrap();
-    app.set_fast(true).unwrap();
-    assert_eq!(
-        model_state_scalars(&app),
-        serde_json::json!({
-            "spec": OPUS_SPEC,
-            "id": "claude-opus-4-8",
-            "provider": "anthropic",
-            "thinking": "high",
-            "thinking_shown": "high",
-            "fast": true,
-            "supports_thinking": true,
-            "supports_fast": true,
-        })
-    );
-}
-
-/// The ladder moves with the model table, so it gets its own test and the
-/// pinned payloads stay on the fields that do not.
-fn model_state_scalars(app: &App) -> serde_json::Value {
-    let mut state = app.model_state();
-    state
-        .as_object_mut()
-        .expect("model_state is an object")
-        .remove(THINKING_OPTIONS);
-    state
-}
-
-/// The `/thinking` picker draws its rows from this payload alone, so the state
-/// has to carry the ladder, named rows with their budgets, and an empty one
-/// where there is nothing to pick from. Which rows there are is
-/// `Model::thinking_options`'s business.
-#[test]
-fn model_state_carries_the_thinking_ladder() {
-    let mut app = test_app();
-    set_opus_model(&mut app);
-
-    let ladder = app.model_state()[THINKING_OPTIONS].clone();
-    assert_eq!(ladder[0]["name"], "off");
-    assert!(
-        ladder
-            .as_array()
-            .expect("the ladder is an array")
-            .iter()
-            .any(|option| option["tokens"].is_u64()),
-        "an effort row carries what it costs: {ladder}"
-    );
-
-    app.state.model = Model::from_spec(PLAIN_MODEL_SPEC).unwrap();
-    assert_eq!(app.model_state()[THINKING_OPTIONS], serde_json::json!([]));
-}
-
-/// `Off` is not a state a model that requires thinking can be in, so storing it
-/// would report one level while the request sent another.
-#[test]
-fn set_thinking_clamps_to_what_the_model_will_run() {
-    let mut app = test_app();
-    app.state.model.thinking_override = Some(ThinkingSupport::Required);
-
-    let lifted = ThinkingConfig::Effort(Effort::Minimal);
-    assert_eq!(app.set_thinking("off").unwrap(), lifted);
-    assert_eq!(app.state.thinking, lifted);
-}
-
-#[test_case(ThinkingConfig::Off, true, false, "low" ; "required_native_starts_at_low")]
-#[test_case(ThinkingConfig::Effort(Effort::Minimal), false, false, "low" ; "minimal_snaps_to_low")]
-#[test_case(ThinkingConfig::Effort(Effort::High), false, false, "medium" ; "high_snaps_to_medium")]
-#[test_case(ThinkingConfig::Effort(Effort::Max), false, false, "xhigh" ; "max_snaps_to_xhigh")]
-#[test_case(ThinkingConfig::Budget(NATIVE_OUTPUT_CAP), false, false, "xhigh" ; "typed_budget_selects_native_row")]
-#[test_case(ThinkingConfig::Effort(Effort::High), false, true, "adaptive" ; "effort_on_toggle_uses_adaptive")]
-#[test_case(ThinkingConfig::Off, true, true, "adaptive" ; "required_toggle_enables_thinking")]
-fn restored_and_switched_thinking_selects_a_declared_picker_row(
-    thinking: ThinkingConfig,
-    required: bool,
-    toggle_only: bool,
-    expected: &str,
-) {
-    let (_tmp, storage, _writer, mut app) = tempdir_app();
-    let mut model = test_model();
-    model.provider = Arc::from("llama-cpp");
-    model.max_output_tokens = Some(NATIVE_OUTPUT_CAP);
-    model.thinking_override = Some(if required {
-        ThinkingSupport::Required
-    } else {
-        ThinkingSupport::Yes
-    });
-    let mut fields = serde_json::json!({
-        "off": {"reasoning_effort": "none"},
-        "adaptive": {"reasoning_effort": "medium"}
-    });
-    if !toggle_only {
-        fields["low"] = serde_json::json!({"reasoning_effort": "low"});
-        fields["medium"] = serde_json::json!({"reasoning_effort": "medium"});
-        fields["xhigh"] = serde_json::json!({"reasoning_effort": "xhigh"});
-    }
-    model.thinking_fields = Some(Box::new(serde_json::from_value(fields).unwrap()));
-
-    for restored in [false, true] {
-        if restored {
-            let mut session = AppSession::new(&model.spec(), TEST_CWD);
-            session.meta.thinking = Some(thinking.into());
-            app.apply_loaded_session(OpenSession::claimed(session, &storage), &model);
-        } else {
-            app.state.thinking = thinking;
-            app.state.update_model(&model);
-        }
-        let state = app.model_state();
-        let intent = if required && thinking == ThinkingConfig::Off {
-            ThinkingConfig::Effort(Effort::Minimal)
-        } else {
-            thinking
-        };
-        assert_eq!(state["thinking"], intent.to_string());
-        assert_eq!(state[THINKING_SHOWN], expected);
-        assert!(
-            state[THINKING_OPTIONS]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|option| option["name"] == expected)
-        );
-        assert_eq!(app.set_thinking(&intent.to_string()).unwrap(), intent);
-        assert_eq!(app.model_state(), state);
-    }
-}
-
-#[test_case("off", ThinkingConfig::Off)]
-#[test_case("low", ThinkingConfig::Effort(Effort::Low))]
-fn explicit_thinking_choice_replaces_pending_level(input: &str, expected: ThinkingConfig) {
-    let (_tmp, _dir, _writer, mut app) = tempdir_app();
-    app.set_thinking("high").unwrap();
-    let mut model = app.state.model.clone();
-    model.thinking_override = Some(ThinkingSupport::No);
-    app.state.update_model(&model);
-    assert_eq!(app.state.thinking, ThinkingConfig::Off);
-
-    model.thinking_override = Some(ThinkingSupport::Yes);
-    app.state.model = model.clone();
-    assert_eq!(app.set_thinking(input).unwrap(), expected);
-    app.state.update_model(&model);
-    app.checkpoint();
-
-    assert_eq!(app.state.thinking, expected);
-    assert_eq!(app.state.session.meta.thinking, Some(expected.into()));
-    assert_eq!(read_thinking(&app.storage), Some(expected.into()));
-}
-
-#[test_case(StoredThinking::Adaptive)]
-#[test_case(StoredThinking::Effort { level: Effort::High })]
-#[test_case(StoredThinking::Budget { tokens: 8192 })]
-fn checkpoint_preserves_thinking_until_discovery_finishes(stored: StoredThinking) {
-    let (_tmp, dir, writer, mut app) = tempdir_app();
-    let mut model = test_model();
-    model.thinking_override = Some(ThinkingSupport::No);
-    let mut session = AppSession::new(TEST_MODEL_SPEC, TEST_CWD);
-    session.meta.thinking = Some(stored);
-    session.push_message(Message::user(RESUMED_PROMPT.into()));
-    app.apply_loaded_session(OpenSession::claimed(session, &dir), &model);
-    assert_eq!(app.state.thinking, ThinkingConfig::Off);
-
-    app.checkpoint();
-    assert_eq!(app.state.session.meta.thinking, Some(stored));
-    assert_eq!(app.blank_session().session.meta.thinking, Some(stored));
-    let id = app.state.session.id;
-    drain_writer(app, writer);
-
-    let session = AppSession::load(id, &dir).unwrap();
-    assert_eq!(session.meta.thinking, Some(stored));
-    model.thinking_override = Some(ThinkingSupport::Yes);
-    let state = SessionState::from_session(OpenSession::claimed(session, &dir), &model, &dir);
-    assert_eq!(state.thinking, ThinkingConfig::from(stored));
 }
 
 /// A plugin redraws its badge from the payload alone, and only when the model
@@ -9263,15 +7978,14 @@ fn checkpoint_preserves_thinking_until_discovery_finishes(stored: StoredThinking
 /// its context window, and startup has nothing to announce yet.
 #[test]
 fn model_change_fires_once_per_real_swap() {
-    let (_tmp, _storage, _writer, mut app) = tempdir_app();
+    let (_tmp, _storage, mut app) = tempdir_app();
     let probe = probe_events(&mut app);
-    let before = app.state.model.spec();
+    let before = app.state.session.model.clone();
 
     app.emit_model_change();
     assert_eq!(probe.try_recv_autocmd(), None);
 
-    app.state
-        .update_model(&Model::from_spec(OPUS_SPEC).unwrap());
+    app.state.session_mut().set_model(OPUS_SPEC.to_owned());
     app.emit_model_change();
     app.emit_model_change();
 
@@ -9291,14 +8005,13 @@ fn model_change_fires_once_per_real_swap() {
 /// `update_model`, so the diff has to catch that one on its own.
 #[test]
 fn loading_a_session_on_another_model_announces_the_swap() {
-    let (_tmp, _storage, _writer, mut app) = tempdir_app();
+    let (_tmp, _storage, mut app) = tempdir_app();
     let probe = probe_events(&mut app);
-    let resolved = Model::from_spec(OPUS_SPEC).unwrap();
 
-    app.apply_loaded_session(
-        OpenSession::claimed(AppSession::new(OPUS_SPEC, "/tmp/test"), &app.storage),
-        &resolved,
-    );
+    app.apply_loaded_session(OpenSession::claimed(
+        AppSession::new(OPUS_SPEC, "/tmp/test"),
+        &app.storage,
+    ));
     app.emit_model_change();
 
     let (event, data) = probe.try_recv_autocmd().expect(MODEL_CHANGED_EVENT);
@@ -9652,86 +8365,6 @@ fn esc_with_a_selection(status: Status, expected_flash: Option<&str>) {
     assert_eq!(app.status_bar.flash_text(), expected_flash);
 }
 
-/// What `model_state` reports has to parse back into the same state, or a
-/// `maki.model.get` -> `maki.model.set` hop would silently change it.
-#[test_case(ThinkingConfig::Off, "off" ; "off")]
-#[test_case(ThinkingConfig::Adaptive, "adaptive" ; "adaptive")]
-#[test_case(ThinkingConfig::Effort(Effort::High), "high" ; "effort")]
-#[test_case(ThinkingConfig::Budget(8192), "8192" ; "budget")]
-fn model_state_thinking_round_trips_into_set_thinking(thinking: ThinkingConfig, expected: &str) {
-    let mut app = test_app();
-    app.state.thinking = thinking;
-
-    let reported = app.model_state()["thinking"].as_str().unwrap().to_owned();
-    assert_eq!(reported, expected);
-    assert_eq!(app.set_thinking(&reported).unwrap(), thinking);
-    assert_eq!(app.set_thinking(&reported).unwrap(), thinking);
-}
-
-/// xAI sends `high` for `adaptive`. The picker and the flash read the level,
-/// while `thinking` keeps what the session holds, so handing it back to
-/// `maki.model.set` changes nothing.
-#[test]
-fn model_state_shows_the_level_a_hidden_adaptive_is_sent_as() {
-    let mut app = test_app();
-    app.state.model.provider = Arc::from(FIXED_ADAPTIVE_PROVIDER);
-    app.state.model.thinking_override = Some(ThinkingSupport::Yes);
-    app.state.thinking = ThinkingConfig::Adaptive;
-
-    let state = app.model_state();
-    assert_eq!(state[THINKING_SHOWN], Effort::High.as_str());
-    assert_eq!(state["thinking"], THINKING_ADAPTIVE);
-    let offered = state[THINKING_OPTIONS].as_array().unwrap();
-    assert!(offered.iter().all(|row| row["name"] != THINKING_ADAPTIVE));
-}
-
-#[test]
-fn set_thinking_toggles_on_blank_input() {
-    let mut app = test_app();
-    assert_eq!(app.set_thinking("").unwrap(), ThinkingConfig::Adaptive);
-    assert_eq!(app.set_thinking("").unwrap(), ThinkingConfig::Off);
-}
-
-#[test_case(true, "garbage", THINKING_USAGE ; "unknown_word")]
-#[test_case(true, "0", THINKING_USAGE ; "zero_budget")]
-#[test_case(false, "low", THINKING_UNSUPPORTED_MSG ; "model_without_thinking")]
-fn set_thinking_keeps_state_on_rejected_input(supported: bool, input: &str, expected: &str) {
-    let mut app = test_app();
-    app.set_thinking("high").unwrap();
-    if !supported {
-        app.state.model.thinking_override = Some(ThinkingSupport::No);
-    }
-
-    assert_eq!(app.set_thinking(input).unwrap_err(), expected);
-    assert_eq!(app.state.thinking, ThinkingConfig::Effort(Effort::High));
-}
-
-/// Fast must never get stuck on: after switching to a model without fast mode,
-/// you still have to be able to turn it off.
-#[test]
-fn fast_turns_off_on_a_model_that_lost_fast_support() {
-    let mut app = test_app();
-    set_opus_model(&mut app);
-    app.execute_command(cmd("/fast"), 0);
-    assert!(app.state.fast);
-
-    app.state.model = Model::from_spec(SONNET_SPEC).unwrap();
-    app.execute_command(cmd("/fast"), 0);
-    assert!(!app.state.fast);
-    assert_eq!(app.status_bar.flash_text(), Some(FAST_OFF_MSG));
-}
-
-#[test]
-fn update_model_to_ineligible_resets_fast() {
-    let mut app = test_app();
-    set_opus_model(&mut app);
-    app.state.fast = true;
-
-    let sonnet = Model::from_spec(SONNET_SPEC).unwrap();
-    app.state.update_model(&sonnet);
-    assert!(!app.state.fast);
-}
-
 #[test]
 fn agent_error_creates_synthetic_tool_done_with_message() {
     let mut app = test_app();
@@ -9746,7 +8379,7 @@ fn agent_error_creates_synthetic_tool_done_with_message() {
         input: None,
         raw_input: None,
         output: None,
-        render_header: None,
+        data_version: DEFAULT_DATA_VERSION,
     }))));
     assert_eq!(app.main_chat().in_progress_count(), 1);
 
@@ -9768,12 +8401,11 @@ fn agent_error_creates_synthetic_tool_done_with_message() {
 #[test]
 fn ctrl_c_denies_permission_prompt() {
     let mut app = test_app();
-    app.permission_prompt.push(
+    app.permission_prompt.push_choices(
         "id".into(),
         maki_config::ToolKey::native("bash"),
         vec!["execute".into()],
-        None,
-        true,
+        permission_choices(),
         None,
     );
     assert!(app.permission_prompt.is_open());
@@ -9792,47 +8424,49 @@ const TEST_AREA: Rect = Rect {
 };
 const SPLIT_EXTENT: u16 = 8;
 
-fn open_split_window(app: &mut App, dir: maki_lua::Split) {
-    let buf = Arc::new(maki_agent::SharedBuf::new());
-    let config = maki_lua::FloatConfig {
-        width: maki_lua::Dimension::Abs(SPLIT_EXTENT),
-        height: maki_lua::Dimension::Abs(SPLIT_EXTENT),
-        border: maki_lua::Border::None,
+fn open_split_window(app: &mut App, dir: maki_lua_ui::Split) {
+    let buf = Arc::new(maki_types::snapshot::SharedBuf::new());
+    let config = maki_lua_ui::FloatConfig {
+        width: maki_lua_ui::Dimension::Abs(SPLIT_EXTENT),
+        height: maki_lua_ui::Dimension::Abs(SPLIT_EXTENT),
+        border: maki_lua_ui::Border::None,
         split: dir,
-        ..maki_lua::FloatConfig::default()
+        ..maki_lua_ui::FloatConfig::default()
     };
-    let (event_tx, _event_rx) = flume::bounded::<maki_lua::WinEvent>(8);
-    let (_cmd_tx, cmd_rx) = flume::bounded::<maki_lua::WinCommand>(8);
+    let (event_tx, _event_rx) = flume::bounded::<maki_lua_ui::WinEvent>(8);
+    let (_cmd_tx, cmd_rx) = flume::bounded::<maki_lua_ui::WinCommand>(8);
     app.float_mgr.open(buf, config, true, event_tx, cmd_rx);
 }
 
 #[test]
 fn attention_float_marks_app_as_awaiting_input_until_close() {
     let mut app = test_app();
-    let buf = Arc::new(maki_agent::SharedBuf::new());
-    let config = maki_lua::FloatConfig {
+    let buf = Arc::new(maki_types::snapshot::SharedBuf::new());
+    let config = maki_lua_ui::FloatConfig {
         needs_input: true,
-        ..maki_lua::FloatConfig::default()
+        ..maki_lua_ui::FloatConfig::default()
     };
-    let (event_tx, _event_rx) = flume::bounded::<maki_lua::WinEvent>(8);
-    let (cmd_tx, cmd_rx) = flume::bounded::<maki_lua::WinCommand>(8);
+    let (event_tx, _event_rx) = flume::bounded::<maki_lua_ui::WinEvent>(8);
+    let (cmd_tx, cmd_rx) = flume::bounded::<maki_lua_ui::WinCommand>(8);
 
     app.float_mgr.open(buf, config, true, event_tx, cmd_rx);
     assert!(app.awaiting_input());
     assert_eq!(app.attention(), Some(Notification::QuestionRequested));
 
     cmd_tx
-        .send(maki_lua::WinCommand::SetVisible(false))
+        .send(maki_lua_ui::WinCommand::SetVisible(false))
         .unwrap();
     let _ = app.float_mgr.tick();
     assert!(!app.awaiting_input());
     assert_eq!(app.attention(), None);
 
-    cmd_tx.send(maki_lua::WinCommand::SetVisible(true)).unwrap();
+    cmd_tx
+        .send(maki_lua_ui::WinCommand::SetVisible(true))
+        .unwrap();
     let _ = app.float_mgr.tick();
     assert_eq!(app.attention(), Some(Notification::QuestionRequested));
 
-    cmd_tx.send(maki_lua::WinCommand::Close).unwrap();
+    cmd_tx.send(maki_lua_ui::WinCommand::Close).unwrap();
     let _ = app.float_mgr.tick();
     assert!(!app.awaiting_input());
     assert_eq!(app.attention(), None);
@@ -9921,16 +8555,16 @@ fn below_split_reserves_bottom_and_suppresses_input() {
     let mut app = test_app();
     let (msg_before, _b, _s, input_before, splits_before) = app.layout_geometry(TEST_AREA);
     assert!(
-        splits_before.rect(maki_lua::Split::Below).is_none(),
+        splits_before.rect(maki_lua_ui::Split::Below).is_none(),
         "no split open yet"
     );
     assert!(input_before.height > 0, "input box visible before split");
 
-    open_split_window(&mut app, maki_lua::Split::Below);
+    open_split_window(&mut app, maki_lua_ui::Split::Below);
     let (msg_after, _bottom, _s, input_after, splits_after) = app.layout_geometry(TEST_AREA);
 
     let band = splits_after
-        .rect(maki_lua::Split::Below)
+        .rect(maki_lua_ui::Split::Below)
         .expect("below split should reserve a bottom band");
     assert_eq!(
         band.height, SPLIT_EXTENT,
@@ -9949,10 +8583,10 @@ fn below_split_reserves_bottom_and_suppresses_input() {
 /// `carve` already tests the per-direction geometry; this pins the app wiring:
 /// a split shrinks the chat while the full-width status bar stays put. Below is
 /// tested separately since it also hides the input box.
-#[test_case(maki_lua::Split::Above ; "above")]
-#[test_case(maki_lua::Split::Left ; "left")]
-#[test_case(maki_lua::Split::Right ; "right")]
-fn non_below_split_reserves_band_and_keeps_status_full_width(dir: maki_lua::Split) {
+#[test_case(maki_lua_ui::Split::Above ; "above")]
+#[test_case(maki_lua_ui::Split::Left ; "left")]
+#[test_case(maki_lua_ui::Split::Right ; "right")]
+fn non_below_split_reserves_band_and_keeps_status_full_width(dir: maki_lua_ui::Split) {
     let mut app = test_app();
     let (msg_before, _b, _s, _i, _sp) = app.layout_geometry(TEST_AREA);
 
@@ -9975,7 +8609,7 @@ fn closing_split_restores_layout() {
     let mut app = test_app();
     let before = app.layout_geometry(TEST_AREA);
 
-    open_split_window(&mut app, maki_lua::Split::Below);
+    open_split_window(&mut app, maki_lua_ui::Split::Below);
     app.float_mgr.close_all();
 
     let after = app.layout_geometry(TEST_AREA);
@@ -9985,29 +8619,28 @@ fn closing_split_restores_layout() {
 #[test]
 fn permission_prompt_takes_bottom_precedence_over_below_split() {
     let mut app = test_app();
-    open_split_window(&mut app, maki_lua::Split::Below);
-    open_split_window(&mut app, maki_lua::Split::Left);
-    open_split_window(&mut app, maki_lua::Split::Above);
-    app.permission_prompt.push(
+    open_split_window(&mut app, maki_lua_ui::Split::Below);
+    open_split_window(&mut app, maki_lua_ui::Split::Left);
+    open_split_window(&mut app, maki_lua_ui::Split::Above);
+    app.permission_prompt.push_choices(
         "perm-1".into(),
         maki_config::ToolKey::native("bash"),
         vec!["ls".into()],
-        None,
-        true,
+        permission_choices(),
         None,
     );
 
     let (_msg, _bottom, _status, _input, splits) = app.layout_geometry(TEST_AREA);
     assert!(
-        splits.rect(maki_lua::Split::Below).is_none(),
+        splits.rect(maki_lua_ui::Split::Below).is_none(),
         "below split must yield the bottom area to an open permission prompt",
     );
     assert!(
-        splits.rect(maki_lua::Split::Left).is_some(),
+        splits.rect(maki_lua_ui::Split::Left).is_some(),
         "the prompt must leave a left split untouched",
     );
     assert!(
-        splits.rect(maki_lua::Split::Above).is_some(),
+        splits.rect(maki_lua_ui::Split::Above).is_some(),
         "the prompt must leave an above split untouched",
     );
 }
@@ -10057,33 +8690,6 @@ fn esc_in_main_chat_with_active_subagent_no_cancel() {
     assert!(!matches!(&actions[0], Action::CancelSubagent { .. }));
 }
 
-fn new_session(app: &mut App) {
-    app.reset_session();
-}
-
-fn stop_in_its_tab(app: &mut App) {
-    app.focus_task(TASK_ID).unwrap();
-    app.last_esc = Some(Instant::now());
-    app.update(Msg::Key(key(KeyCode::Esc)));
-}
-
-/// The answer sender lives on the chat, so whatever ends the chat or drops
-/// it lets go of the sender, adopted or not.
-#[test_case(|_| {}, stop_in_its_tab         ; "stopped")]
-#[test_case(|_| {}, end_turn                ; "swept_at_turn_end")]
-#[test_case(|_| {}, new_session             ; "dropped_by_new_session")]
-#[test_case(receive_receipt, stop_in_its_tab ; "adopted_then_stopped")]
-#[test_case(receive_receipt, new_session     ; "adopted_then_new_session")]
-fn an_ended_task_lets_go_of_its_answer_sender(setup: fn(&mut App), end: fn(&mut App)) {
-    let (mut app, sub_rx, _main_rx) = app_with_subagent_tx(TASK_ID);
-    setup(&mut app);
-    assert!(!sub_rx.is_disconnected());
-
-    end(&mut app);
-
-    assert!(sub_rx.is_disconnected());
-}
-
 #[test]
 fn multiple_subagents_cancel_one_other_unaffected() {
     let mut app = app_with_subagent_id(TASK_ID);
@@ -10130,20 +8736,26 @@ fn subagent_cancel_then_navigate_back_main_unaffected() {
     assert!(!app.chats[0].is_finished());
 }
 
-/// A subagent whose session handed the UI its inbox, the way `sess:prompt`
-/// does through `SubagentInfo`, with that chat in front.
+/// A task queue owned by the ACP host, with its snapshot in the active chat.
 fn app_with_subagent_inbox() -> (App, Arc<SubagentInbox>) {
     let inbox = Arc::new(SubagentInbox::default());
-    let mut app = streaming_app();
-    let mut info = subagent_info(TASK_ID, RESEARCH_NAME);
-    info.inbox = Some(Arc::clone(&inbox));
-    app.update(Msg::Agent(Box::new(Envelope {
-        event: AgentEvent::TextDelta { text: "x".into() },
-        subagent: Some(info),
-        run_id: 1,
-    })));
-    app.run_builtin(BuiltinAction::NextChat);
-    assert_eq!(app.active_chat, 1);
+    let owned = Arc::clone(&inbox);
+    let (mut plan, _seen) = remote_plan::test_support::answering(move |request| {
+        let operation: maki_wire::session::SessionOperation =
+            serde_json::from_value(request["params"].clone()).unwrap();
+        match operation {
+            maki_wire::session::SessionOperation::TaskInput { input, .. } => owned.push(*input),
+            maki_wire::session::SessionOperation::TaskPop { .. } => {
+                owned.remove(0);
+            }
+            _ => panic!("unexpected task request"),
+        }
+        Ok(json!(owned.snapshot()))
+    });
+    plan.link.rewind_tx = Some(flume::unbounded().0);
+    let mut app = app_with_active_subagent();
+    app.remote_link = Some(plan.link);
+    app.update_task_queue(TASK_ID, inbox.snapshot());
     (app, inbox)
 }
 
@@ -10250,7 +8862,7 @@ fn finished_subagent_reports_undelivered_messages() {
     let (mut app, inbox) = app_with_subagent_inbox();
     type_and_submit(&mut app, "a");
     finish_subagent_task(&mut app, false);
-    assert!(app.chats[1].inbox.is_none());
+    assert!(app.chats[1].remote_inbox.is_none());
     assert_eq!(inbox.len(), 1);
     let notice = app.chats[1]
         .message_at(app.chats[1].message_count() - 2)
@@ -10310,10 +8922,7 @@ fn the_session_keeps_the_main_draft_while_a_subagent_chat_is_in_front() {
     app.update(Msg::Paste(SUB_DRAFT.into()));
 
     app.checkpoint();
-    assert_eq!(
-        app.state.session.meta.input_draft.as_deref(),
-        Some(MAIN_DRAFT)
-    );
+    assert_eq!(app.unsent().input_draft.as_deref(), Some(MAIN_DRAFT));
 
     app.reset_ui_chrome();
     assert_eq!(app.input_box.buffer.value(), MAIN_DRAFT);
@@ -10333,17 +8942,8 @@ fn ctrl_c_in_subagent_chat_discards_draft_before_cancelling() {
 
 // -- Every frame checkpoints: one way in for a history, one trigger to save --
 
-/// Long enough that a waiting change is still waiting when the assert runs, on
-/// any machine, so none of these tests depend on the wall clock.
-const SOFT_DELAY_HELD: Duration = Duration::from_secs(3600);
-const MID_BATCH_RESULT: &str = "file contents";
 const TYPED_DRAFT: &str = "hi";
-const UNSENT_DRAFT: &str = "half typed thought";
-const LIVE_AGENT_TEXT: &str = "live agent turn";
-const STORED_SESSION_TEXT: &str = "other session talk";
-const SWITCHED_DRAFT: &str = "draft typed after switching";
-const BUMP_TITLE: &str = "title bump ";
-const TOOL_IDS: [&str; 2] = ["tool-a", "tool-b"];
+
 const FINISHED_TASK_ID: &str = "task-finished";
 const UNFINISHED_TASK_ID: &str = "task-unfinished";
 const LATER_TASK_ID: &str = "task-later";
@@ -10398,7 +8998,6 @@ fn turn_response_stops_after_bounded_large_input() {
 #[test_case(Notification::TurnComplete { response: None }, "Agent turn complete", false ; "turn_fallback")]
 #[test_case(Notification::PermissionRequested { tool: Some("bash".into()) }, "Permission requested: bash", true ; "permission_tool")]
 #[test_case(Notification::PermissionRequested { tool: None }, "Permission requested", true ; "permission_fallback")]
-#[test_case(Notification::AuthenticationRequired, "Authentication required", true ; "authentication")]
 #[test_case(Notification::QuestionRequested, "Question requested", true ; "question")]
 #[test_case(Notification::PlanReady, "Plan ready", true ; "plan")]
 #[test_case(Notification::error_completion(), "Agent stopped with an error", false ; "error_completion")]
@@ -10414,16 +9013,14 @@ fn notification_message_and_urgency(
 #[test]
 fn attention_prioritizes_permission_and_normalizes_tool() {
     let mut app = test_app();
-    app.chats[MAIN_CHAT].auth_parked = true;
     app.state.mode = Mode::Plan;
     app.state.plan = PlanState::Ready(PathBuf::from("plan.md"));
     app.plan_form.on_plan_ready();
-    app.permission_prompt.push(
+    app.permission_prompt.push_choices(
         "id".into(),
         maki_config::ToolKey::native("bash"),
         vec!["execute".into()],
-        None,
-        true,
+        permission_choices(),
         None,
     );
     assert_eq!(
@@ -10434,12 +9031,11 @@ fn attention_prioritizes_permission_and_normalizes_tool() {
     );
 
     app.permission_prompt.close();
-    app.permission_prompt.push(
+    app.permission_prompt.push_choices(
         "id".into(),
         maki_config::ToolKey::Wildcard,
         vec![],
-        None,
-        true,
+        permission_choices(),
         None,
     );
     assert_eq!(
@@ -10449,12 +9045,9 @@ fn attention_prioritizes_permission_and_normalizes_tool() {
 }
 
 #[test]
-fn attention_classifies_auth_and_ready_plan() {
+fn attention_classifies_a_ready_plan() {
     let mut app = test_app();
-    app.chats[MAIN_CHAT].auth_parked = true;
-    assert_eq!(app.attention(), Some(Notification::AuthenticationRequired));
 
-    app.chats[MAIN_CHAT].auth_parked = false;
     app.state.mode = Mode::Plan;
     app.state.plan = PlanState::Ready(PathBuf::from("plan.md"));
     app.plan_form.on_plan_ready();
@@ -10505,364 +9098,6 @@ fn tool_use_msg(id: &str) -> Message {
     }
 }
 
-fn tool_result_msg(id: &str, text: &str) -> Message {
-    Message {
-        role: Role::User,
-        content: vec![ContentBlock::tool_result(id, text, false)],
-        display_text: Some(String::new()),
-        ..Default::default()
-    }
-}
-
-fn tool_text(id: &str) -> String {
-    format!("output of {id}")
-}
-
-fn attach_live_history(app: &mut App, messages: Vec<Message>) -> maki_agent::History {
-    let mirror: maki_agent::SharedMessages =
-        Arc::new(ArcSwap::from_pointee(maki_agent::HistorySnapshot::default()));
-    let history = maki_agent::History::new(messages).with_mirror(Arc::clone(&mirror));
-    app.shared_history = Some(mirror);
-    history
-}
-
-/// Saves a session with one message, then types [`TYPED_DRAFT`] one key per
-/// frame. The soft delay never runs out, so every key is still waiting when
-/// the caller looks. Hands back the stamp of the save.
-fn type_draft_into_saved_session(app: &mut App) -> Sent {
-    app.state
-        .session_mut()
-        .push_message(Message::user(LIVE_AGENT_TEXT.into()));
-    app.checkpoint();
-    let saved = app.last_sent.clone().expect("a message puts it on disk");
-
-    for c in TYPED_DRAFT.chars() {
-        app.update(Msg::Key(key(KeyCode::Char(c))));
-        app.checkpoint_with(SOFT_DELAY_HELD);
-    }
-    saved
-}
-
-/// Checkpointing mid-batch used to freeze the tools as failed forever. The
-/// synthetic closing message made the snapshot as long as the real results that
-/// followed, so the append cursor never saw them.
-#[test]
-fn mid_batch_checkpoint_does_not_shadow_the_real_tool_results() {
-    let (_tmp, dir, writer, mut app) = tempdir_app();
-    let mut history = attach_live_history(
-        &mut app,
-        vec![Message::user("go".into()), tool_use_msg("t1")],
-    );
-    app.checkpoint();
-
-    history.push(tool_result_msg("t1", MID_BATCH_RESULT));
-    app.checkpoint();
-
-    let id = app.state.session.id;
-    drain_writer(app, writer);
-
-    let loaded = AppSession::load(id, &dir).unwrap();
-    assert_eq!(loaded.messages().len(), 3);
-    let [
-        ContentBlock::ToolResult {
-            content, is_error, ..
-        },
-    ] = &loaded.messages()[2].content[..]
-    else {
-        panic!("expected one real tool result: {:?}", loaded.messages()[2]);
-    };
-    assert_eq!((content.as_str(), *is_error), (MID_BATCH_RESULT, false));
-}
-
-/// The plugin behind a restored call sees only the item, so a session picked
-/// from the picker has to file its calls under its own id and as a load,
-/// never under whichever session was on screen when the restore ran.
-#[test]
-fn loading_a_session_stamps_its_restores_as_a_load_of_that_session() {
-    let (_tmp, dir, _writer, mut app) = tempdir_app();
-    let mut stored = AppSession::new(TEST_MODEL_SPEC, TEST_CWD);
-    stored.push_message(tool_use_msg(SUB_TOOL_ID));
-    stored.push_message(tool_result_msg(SUB_TOOL_ID, &tool_text(SUB_TOOL_ID)));
-    stored
-        .save(&SessionClaim::acquire(stored.id, &dir).unwrap(), &dir)
-        .unwrap();
-    let probe = probe_events(&mut app);
-    app.restore_event_tx = Some(maki_agent::EventSender::new(flume::unbounded().0, 0));
-
-    load_session(&mut app, stored.id, &test_model());
-
-    let item = probe
-        .try_recv_restore_item()
-        .expect("the stored call is restored");
-    assert_eq!(item.session_id.map(|s| s.id()), Some(stored.id));
-    assert_eq!(item.task_id, None);
-    assert_eq!(item.reason, maki_lua::RestoreReason::Load);
-}
-
-/// A chat is stamped with its session when built, so the reset has to swap
-/// the session before it rebuilds the chats, or every later click and theme
-/// change would restore under the session that just ended.
-#[test]
-fn reset_session_stamps_the_new_main_chat_with_the_new_session() {
-    let mut app = test_app();
-    let previous = app.state.session.id;
-    let probe = probe_events(&mut app);
-    app.restore_event_tx = Some(maki_agent::EventSender::new(flume::unbounded().0, 0));
-    let (_, items) = crate::chat::history_to_display(
-        &[
-            tool_use_msg(SUB_TOOL_ID),
-            tool_result_msg(SUB_TOOL_ID, &tool_text(SUB_TOOL_ID)),
-        ],
-        &HashMap::new(),
-        &app.ui_config.tool_output_lines,
-    );
-
-    app.reset_session();
-    app.chats[0].request_restores(items);
-
-    let item = probe.try_recv_restore_item().expect("the call is restored");
-    assert_ne!(app.state.session.id, previous);
-    assert_eq!(item.session_id.map(|s| s.id()), Some(app.state.session.id));
-}
-
-/// In the window between a rewind and the agent respawn, syncing from the
-/// mirror would bring back the messages that were just dropped.
-#[test]
-fn checkpoint_after_rewind_persists_the_truncated_history() {
-    let (_tmp, dir, writer, mut app) = tempdir_app();
-    let _live = attach_live_history(
-        &mut app,
-        vec![
-            Message::user("first prompt".into()),
-            Message::user("second prompt".into()),
-        ],
-    );
-    app.checkpoint();
-
-    let entry = RewindEntry {
-        turn_index: 1,
-        prompt_preview: "2: second".into(),
-        prompt_text: "second prompt".into(),
-    };
-    app.rewind_to(entry);
-    app.checkpoint();
-
-    let id = app.state.session.id;
-    drain_writer(app, writer);
-    assert_eq!(AppSession::load(id, &dir).unwrap().messages().len(), 1);
-}
-
-#[test]
-fn reset_session_never_writes_the_old_conversation_under_the_new_id() {
-    let (_tmp, dir, writer, mut app) = tempdir_app();
-    let _live = attach_live_history(&mut app, vec![Message::user("old talk".into())]);
-    app.checkpoint();
-    let old_id = app.state.session.id;
-
-    app.reset_session();
-    app.checkpoint();
-    let new_id = app.state.session.id;
-    assert_ne!(new_id, old_id);
-
-    drain_writer(app, writer);
-    assert_eq!(AppSession::load(old_id, &dir).unwrap().messages().len(), 1);
-    assert!(
-        AppSession::load(new_id, &dir).is_err(),
-        "an empty session has no content to persist",
-    );
-}
-
-const ONE_FORK: &str = "a fork must hand the loop exactly one copy to open";
-const RECOVERED_PROMPT: &str = "prompt queued before the agent failed";
-
-fn opened_fork(actions: Vec<Action>) -> AppSession {
-    let Ok([Action::OpenFork(open)]) = <[Action; 1]>::try_from(actions) else {
-        panic!("{ONE_FORK}");
-    };
-    open.session
-}
-
-#[test]
-fn fork_opens_a_copy_and_leaves_the_original_alone() {
-    let mut app = test_app();
-    let _live = attach_live_history(&mut app, vec![Message::user(LIVE_AGENT_TEXT.into())]);
-    app.recoverable_queue = vec![RECOVERED_PROMPT.into()];
-    let original = app.state.session.id;
-
-    let fork = opened_fork(type_and_submit(&mut app, "/fork"));
-    assert_ne!(fork.id, original);
-    assert_eq!(fork.title, format!("{FORK_TITLE_PREFIX}{LIVE_AGENT_TEXT}"));
-    assert_eq!(
-        fork.messages().len(),
-        1,
-        "the copy carries what the agent wrote since the last frame",
-    );
-    assert_eq!(
-        fork.meta.input_draft, None,
-        "the submitted `/fork` must not linger as the copy's draft",
-    );
-    assert!(
-        fork.meta.queued_messages.is_empty(),
-        "the original runs its own queue, the copy must not run it again",
-    );
-    assert_eq!(app.state.session.id, original);
-    assert_eq!(
-        app.state.session.messages().len(),
-        1,
-        "the original keeps its transcript",
-    );
-}
-
-fn fork_to_first_prompt(app: &mut App) -> Vec<Action> {
-    seed_rewind_session(app.state.session_mut());
-    app.fork_to(RewindEntry {
-        turn_index: 0,
-        prompt_preview: "1: first".into(),
-        prompt_text: "first prompt".into(),
-    })
-}
-
-#[test_case(App::fork_session ; "blank_session")]
-#[test_case(fork_to_first_prompt ; "to_the_first_prompt")]
-fn fork_refuses_an_empty_copy(fork: fn(&mut App) -> Vec<Action>) {
-    let mut app = test_app();
-    assert!(fork(&mut app).is_empty());
-    assert_eq!(app.status_bar.flash_text(), Some(FORK_EMPTY_MSG));
-}
-
-#[test]
-fn fork_to_prompt_opens_a_truncated_copy_and_leaves_the_original_alone() {
-    let mut app = test_app();
-    seed_rewind_session(app.state.session_mut());
-    app.state.context_size = MEASURED_CONTEXT;
-    let original = app.state.session.id;
-
-    let fork = opened_fork(app.fork_to(rewind_to_second_turn()));
-    assert_eq!(
-        fork.messages().len(),
-        2,
-        "the copy ends right before the selected prompt",
-    );
-    assert_eq!(
-        fork.meta.input_draft.as_deref(),
-        Some("second prompt"),
-        "the dropped prompt rides along as the copy's draft",
-    );
-    assert!(
-        fork.meta.context_size < MEASURED_CONTEXT,
-        "the copy's gauge must drop the turns it left behind",
-    );
-    assert_eq!(app.state.session.id, original);
-    assert_eq!(
-        app.state.session.messages().len(),
-        5,
-        "the original keeps its transcript",
-    );
-    assert_eq!(app.state.context_size, MEASURED_CONTEXT);
-}
-
-const DROPPED_RECEIPT_ID: &str = "toolu_after_the_cut";
-
-/// The copy keeps only the receipts its history still holds: a lost notice
-/// for a call it never made would confuse its model.
-#[test]
-fn fork_to_prompt_keeps_only_the_pending_receipts_it_still_holds() {
-    let mut app = test_app();
-    seed_rewind_session(app.state.session_mut());
-    app.state
-        .session_mut()
-        .push_message(tool_use_msg(DROPPED_RECEIPT_ID));
-    let mailbox = hold_mailbox(&mut app);
-    mailbox.track(RECEIPT_TURN_ID);
-    mailbox.track(DROPPED_RECEIPT_ID);
-
-    let fork = opened_fork(app.fork_to(rewind_to_second_turn()));
-    assert_eq!(fork.meta.pending_background, [RECEIPT_TURN_ID]);
-    assert_eq!(
-        app.state.session.meta.pending_background,
-        [RECEIPT_TURN_ID, DROPPED_RECEIPT_ID],
-    );
-}
-
-const ONE_RESTART: &str = "the gesture must hand the loop exactly one restart";
-const RESTART_MATCHES_SESSION: &str =
-    "the respawned agent must run on the history the session now holds";
-const MIRROR_SURVIVED: &str = "a history the agent did not produce must drop the mirror with it";
-
-fn restart_history(actions: Vec<Action>) -> Vec<Message> {
-    let Ok([Action::RestartAgent(history)]) = <[Action; 1]>::try_from(actions) else {
-        panic!("{ONE_RESTART}");
-    };
-    history
-}
-
-/// A tab mid-conversation with the agent's mirror attached, the only state in
-/// which these gestures have anything to leak.
-fn live_conversation(app: &mut App) -> maki_agent::History {
-    let history = attach_live_history(
-        app,
-        vec![
-            Message::user(LIVE_AGENT_TEXT.into()),
-            tool_use_msg(SUB_TOOL_ID),
-            tool_result_msg(SUB_TOOL_ID, &tool_text(SUB_TOOL_ID)),
-        ],
-    );
-    app.checkpoint();
-    history
-}
-
-fn reset_gesture(app: &mut App) -> Vec<Message> {
-    restart_history(app.reset_session())
-}
-
-fn rewind_gesture(app: &mut App) -> Vec<Message> {
-    restart_history(app.rewind_to(RewindEntry {
-        turn_index: 1,
-        prompt_preview: LIVE_AGENT_TEXT.into(),
-        prompt_text: LIVE_AGENT_TEXT.into(),
-    }))
-}
-
-fn load_gesture(app: &mut App) -> Vec<Message> {
-    let mut stored = AppSession::new(TEST_MODEL_SPEC, TEST_CWD);
-    stored.push_message(Message::user(STORED_SESSION_TEXT.into()));
-    app.apply_loaded_session(OpenSession::claimed(stored, &app.storage), &test_model())
-}
-
-/// The three gestures that hand the agent a history it did not produce. Each
-/// restarts it on whatever the session holds right then, so the payload is the
-/// whole contract. Get it wrong and `/new` respawns the agent on the talk the
-/// user just walked away from, or a rewind brings back the messages it dropped.
-/// The mirror has to go in the same breath, or the next checkpoint hands the
-/// agent's stale copy back and writes it to disk.
-#[test_case(reset_gesture,  0, None                       ; "reset")]
-#[test_case(rewind_gesture, 1, Some(LIVE_AGENT_TEXT)      ; "rewind")]
-#[test_case(load_gesture,   1, Some(STORED_SESSION_TEXT)  ; "load")]
-fn restarting_the_agent_installs_a_local_history(
-    gesture: fn(&mut App) -> Vec<Message>,
-    kept: usize,
-    first_prompt: Option<&str>,
-) {
-    let (_tmp, _dir, _writer, mut app) = tempdir_app();
-    let _live = live_conversation(&mut app);
-    let before = app.state.session.messages().len();
-
-    let history = gesture(&mut app);
-
-    assert!(app.shared_history.is_none(), "{MIRROR_SURVIVED}");
-    assert_eq!(
-        serde_json::to_value(&history).unwrap(),
-        serde_json::to_value(app.state.session.messages()).unwrap(),
-        "{RESTART_MATCHES_SESSION}"
-    );
-    assert_eq!(history.len(), kept);
-    assert!(
-        kept < before,
-        "the gesture dropped nothing, so this proves nothing"
-    );
-    assert_eq!(history.first().and_then(|m| m.user_text()), first_prompt);
-}
-
 const RELOAD_ENDS_NOTHING: &str =
     "only a switch to another session ends the one that was on screen";
 
@@ -10886,63 +9121,13 @@ fn loading_ends_the_previous_session_only_when_the_id_changes(same: bool) {
         OpenSession::claimed(AppSession::new(TEST_MODEL_SPEC, TEST_CWD), &app.storage)
     };
 
-    app.apply_loaded_session(tab, &test_model());
+    app.apply_loaded_session(tab);
 
     assert_eq!(
         probe.try_recv_end_session(),
         (!same).then_some((previous, SessionEndReason::Load)),
         "{RELOAD_ENDS_NOTHING}"
     );
-}
-
-const LOADED_MODEL_IGNORED: &str =
-    "a load runs on the model the caller resolved, and records it on the session";
-
-/// Two traps in one switch. `install_local_history` has to drop the mirror
-/// handle, or the old agent's messages land under the freshly loaded id. And
-/// `revision` is `#[serde(skip)]`, so the loaded session starts back at zero and
-/// can collide with the revision already sent for the one it replaced, which
-/// only keying `last_sent` by id survives.
-#[test]
-fn load_session_persists_the_new_session_and_leaks_no_history_into_it() {
-    let (_tmp, dir, writer, mut app) = tempdir_app();
-    let mut stored = AppSession::new("test-model", "/tmp/test");
-    stored.push_message(Message::user(STORED_SESSION_TEXT.into()));
-    stored
-        .save(&SessionClaim::acquire(stored.id, &dir).unwrap(), &dir)
-        .unwrap();
-
-    let _live = attach_live_history(&mut app, vec![Message::user(LIVE_AGENT_TEXT.into())]);
-    app.input_box.set_input(UNSENT_DRAFT);
-    app.checkpoint();
-    let (live_id, sent_revision) = (app.state.session.id, app.state.session.revision());
-
-    let resolved = Model::from_spec(OPUS_SPEC).unwrap();
-    load_session(&mut app, stored.id, &resolved);
-    assert_eq!(app.state.session.id, stored.id);
-    assert_eq!(app.state.model.spec(), OPUS_SPEC, "{LOADED_MODEL_IGNORED}");
-    assert_eq!(app.state.session.model, OPUS_SPEC, "{LOADED_MODEL_IGNORED}");
-    // Walk the loaded session up to the revision already sent for the live one,
-    // so the checkpoint below lands on the exact collision.
-    let session = app.state.session_mut();
-    while session.revision() + 1 < sent_revision {
-        session.set_title(format!("{BUMP_TITLE}{}", session.revision()));
-    }
-    app.input_box.set_input(SWITCHED_DRAFT);
-    app.checkpoint();
-    assert_eq!(
-        app.state.session.revision(),
-        sent_revision,
-        "both sessions must sit at the same revision for this to test anything"
-    );
-
-    drain_writer(app, writer);
-    let loaded = AppSession::load(stored.id, &dir).unwrap();
-    assert_eq!(loaded.meta.input_draft.as_deref(), Some(SWITCHED_DRAFT));
-    assert_eq!(loaded.messages().len(), 1);
-    assert_eq!(loaded.messages()[0].user_text(), Some(STORED_SESSION_TEXT));
-    let previous = AppSession::load(live_id, &dir).unwrap();
-    assert_eq!(previous.messages()[0].user_text(), Some(LIVE_AGENT_TEXT));
 }
 
 #[test]
@@ -10959,129 +9144,6 @@ fn idle_checkpoint_changes_nothing() {
 
     assert_eq!(app.state.session.revision(), revision);
     assert_eq!(app.state.session.updated_at, updated_at);
-}
-
-/// Issue #675: a crash between a keystroke and submit threw the draft away,
-/// because nothing was written until the turn ended. Now the keys land once
-/// the soft delay is up, all in one write rather than one `fsync` each.
-#[test]
-fn draft_keystrokes_wait_and_land_in_one_write() {
-    let (_tmp, dir, writer, mut app) = tempdir_app();
-    let saved_stamp = type_draft_into_saved_session(&mut app);
-    assert_eq!(
-        app.last_sent.as_ref(),
-        Some(&saved_stamp),
-        "a keystroke on its own waits instead of costing a write",
-    );
-
-    app.checkpoint_with(Duration::ZERO);
-    assert_ne!(
-        app.last_sent.as_ref(),
-        Some(&saved_stamp),
-        "and lands once the delay is up"
-    );
-
-    let id = app.state.session.id;
-    drain_writer(app, writer);
-    let saved = AppSession::load(id, &dir).unwrap();
-    assert_eq!(saved.meta.input_draft.as_deref(), Some(TYPED_DRAFT));
-}
-
-#[test]
-fn a_content_change_writes_the_waiting_draft_with_it() {
-    let (_tmp, dir, writer, mut app) = tempdir_app();
-    type_draft_into_saved_session(&mut app);
-
-    app.state
-        .session_mut()
-        .push_message(Message::user(LIVE_AGENT_TEXT.into()));
-    app.checkpoint_with(SOFT_DELAY_HELD);
-
-    let id = app.state.session.id;
-    drain_writer(app, writer);
-    let saved = AppSession::load(id, &dir).unwrap();
-    assert_eq!(saved.messages().len(), 2, "content never waits");
-    assert_eq!(saved.meta.input_draft.as_deref(), Some(TYPED_DRAFT));
-}
-
-#[test]
-fn shutdown_writes_a_draft_that_is_still_waiting() {
-    let (_tmp, dir, writer, mut app) = tempdir_app();
-    type_draft_into_saved_session(&mut app);
-
-    app.checkpoint_now();
-
-    let id = app.state.session.id;
-    drain_writer(app, writer);
-    let saved = AppSession::load(id, &dir).unwrap();
-    assert_eq!(saved.meta.input_draft.as_deref(), Some(TYPED_DRAFT));
-}
-
-#[test]
-fn a_draft_in_plan_mode_is_not_saved_without_a_message() {
-    let (_tmp, dir, writer, mut app) = tempdir_app();
-    for c in TYPED_DRAFT.chars() {
-        app.update(Msg::Key(key(KeyCode::Char(c))));
-    }
-    app.update(Msg::Key(key(KeyCode::Tab)));
-    app.checkpoint_now();
-
-    drain_writer(app, writer);
-    assert!(AppSession::list_all(&dir).unwrap().is_empty());
-}
-
-#[test]
-fn rewinding_to_the_first_prompt_takes_the_session_off_disk() {
-    let (_tmp, dir, writer, mut app) = tempdir_app();
-    let _live = attach_live_history(&mut app, vec![Message::user(LIVE_AGENT_TEXT.into())]);
-    app.checkpoint();
-    let id = app.state.session.id;
-
-    app.rewind_to(RewindEntry {
-        turn_index: 0,
-        prompt_preview: LIVE_AGENT_TEXT.into(),
-        prompt_text: LIVE_AGENT_TEXT.into(),
-    });
-    app.checkpoint();
-
-    drain_writer(app, writer);
-    assert!(AppSession::load(id, &dir).is_err());
-}
-
-/// The second result goes through the append cursor the first one opened, so a
-/// stale cursor would quietly drop or duplicate it.
-#[test]
-fn two_tool_results_checkpointed_separately_both_reach_disk() {
-    let (_tmp, dir, writer, mut app) = tempdir_app();
-    app.state
-        .session_mut()
-        .push_message(Message::user("prompt".into()));
-    app.status = Status::Streaming;
-    app.run_id = 1;
-
-    for tool_id in TOOL_IDS {
-        app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
-            call: None,
-            id: tool_id.into(),
-            tool: "bash".into(),
-            output: Arc::new(ToolOutput::Plain(tool_text(tool_id).into())),
-            is_error: false,
-            annotation: None,
-            written_path: None,
-            backgrounded: false,
-        }))));
-        app.checkpoint();
-    }
-
-    let id = app.state.session.id;
-    drain_writer(app, writer);
-    let loaded = AppSession::load(id, &dir).unwrap();
-    for tool_id in TOOL_IDS {
-        match loaded.tool_outputs().get(tool_id).map(Arc::as_ref) {
-            Some(ToolOutput::Plain(out)) => assert_eq!(out.text, tool_text(tool_id)),
-            other => panic!("missing plain output for {tool_id}: {other:?}"),
-        }
-    }
 }
 
 /// The `Done` path clears `chat_index` right after pruning it, so the meta
@@ -11136,7 +9198,7 @@ fn question_about_a_gated_folder(project: &Path) -> TrustQuestion {
 /// just granted only loads on a fresh start.
 #[test]
 fn trust_command_records_the_folder_and_reloads() {
-    let (_state, storage, _writer, mut app) = tempdir_app();
+    let (_state, storage, mut app) = tempdir_app();
     let project = TempDir::new().unwrap();
     let question = question_about_a_gated_folder(project.path());
     app.trust_question = Some(question.clone());
@@ -11156,11 +9218,38 @@ fn trust_command_records_the_folder_and_reloads() {
     );
 }
 
+/// A client's tab store is scratch, so its `/trust` records the grant in
+/// the user's own store, where its next start reads it.
+#[test]
+fn trust_command_records_in_the_trust_store() {
+    let (_state, storage, mut app) = tempdir_app();
+    let user_state = TempDir::new().unwrap();
+    let user_store = StateDir::from_path(user_state.path().to_path_buf());
+    let project = TempDir::new().unwrap();
+    let question = question_about_a_gated_folder(project.path());
+    app.trust_question = Some(question.clone());
+    app.trust_store = user_store.clone();
+
+    app.execute_command(cmd(TRUST), 0);
+
+    assert!(
+        TrustedFolders::new(&user_store)
+            .contains(&question.folder)
+            .unwrap()
+    );
+    assert!(
+        !TrustedFolders::new(&storage)
+            .contains(&question.folder)
+            .unwrap()
+    );
+    assert_eq!(app.exit_request, ExitRequest::Reload);
+}
+
 /// Nothing to grant is not a reason to tear the session down: the user would
 /// lose the chat to a no-op.
 #[test]
 fn trust_command_without_a_question_flashes_and_stays() {
-    let (_state, _storage, _writer, mut app) = tempdir_app();
+    let (_state, _storage, mut app) = tempdir_app();
 
     let actions = app.execute_command(cmd(TRUST), 0);
 
@@ -11177,16 +9266,16 @@ fn run_builtin_file_picker_opens_modal() {
 }
 
 #[test]
-fn run_builtin_model_picker_opens_and_refreshes() {
-    let mut app = test_app();
+fn run_builtin_model_picker_opens_the_agents_menu() {
+    let (mut app, _) = remote_app_with_models();
     let actions = app.run_builtin(BuiltinAction::ModelPicker);
-    assert!(app.model_picker.is_open());
-    assert!(matches!(&actions[..], [Action::RefreshModels]));
+    assert!(app.remote_model_picker.is_open());
+    assert!(actions.is_empty());
 }
 
 #[test]
 fn ctrl_l_opens_model_picker() {
-    let mut app = test_app();
+    let (mut app, _) = remote_app_with_models();
     let key = KeyEvent {
         code: KeyCode::Char('l'),
         modifiers: KeyModifiers::CONTROL,
@@ -11194,7 +9283,802 @@ fn ctrl_l_opens_model_picker() {
         state: crossterm::event::KeyEventState::NONE,
     };
     app.update(Msg::Key(key));
-    assert!(app.model_picker.is_open());
+    assert!(app.remote_model_picker.is_open());
+}
+
+fn remote_app() -> App {
+    let mut app = test_app();
+    app.backend = AgentBackend::Remote {
+        native: false,
+        host: false,
+        images: false,
+        plan: true,
+        settings: true,
+        btw: true,
+        usage_ledger: true,
+        login: true,
+        plan_file: false,
+        reload: false,
+    };
+    app
+}
+
+/// What a refused remote action must leave exactly as it was.
+fn agent_state(app: &App) -> (Mode, String, MakiId, String, usize, Status) {
+    (
+        app.state.mode,
+        app.state.session.model.clone(),
+        app.state.session.id,
+        app.state.session.cwd.clone(),
+        app.queue.len(),
+        app.status.clone(),
+    )
+}
+
+#[test_case("/fork" ; "fork")]
+#[test_case("/model" ; "model")]
+#[test_case("/mcp" ; "mcp")]
+#[test_case("/cd /elsewhere" ; "cd")]
+#[test_case("/yolo" ; "yolo")]
+#[test_case("/fast" ; "fast")]
+#[test_case("/workflow" ; "workflow")]
+#[test_case("/reload" ; "reload")]
+#[test_case("/trust" ; "trust")]
+#[test_case("/packdel name" ; "packdel")]
+fn remote_agent_refuses_local_agent_commands(cmdline: &str) {
+    let mut app = remote_app();
+    let before = agent_state(&app);
+    let actions = app.execute_command(cmd(cmdline), 0);
+    assert!(actions.is_empty());
+    assert_eq!(app.status_bar.flash_text(), Some(UNAVAILABLE_REMOTE));
+    assert_eq!(agent_state(&app), before);
+}
+
+/// The agent owns its credentials, so `/login` runs its own login, and only
+/// when it offered one this client can run.
+#[test_case(true ; "offered")]
+#[test_case(false ; "not_offered")]
+fn login_on_a_remote_app_runs_the_agents_own(offered: bool) {
+    let mut app = remote_app();
+    app.backend = AgentBackend::Remote {
+        native: false,
+        host: false,
+        images: false,
+        plan: true,
+        settings: true,
+        btw: true,
+        usage_ledger: true,
+        login: offered,
+        plan_file: false,
+        reload: false,
+    };
+    let actions = app.execute_command(cmd("/login"), 0);
+    assert_eq!(matches!(&actions[..], [Action::RemoteLogin]), offered);
+    assert!(
+        !app.login_picker.is_open(),
+        "this machine's picker never opens"
+    );
+    assert_eq!(
+        app.status_bar.flash_text() == Some(UNAVAILABLE_REMOTE),
+        !offered
+    );
+}
+
+/// The agent answers `/btw` only under the btw extension.
+#[test_case(true ; "agreed")]
+#[test_case(false ; "not_agreed")]
+fn btw_on_a_remote_app_needs_the_extension(agreed: bool) {
+    let mut app = remote_app();
+    app.backend = AgentBackend::Remote {
+        native: false,
+        host: false,
+        images: false,
+        plan: true,
+        settings: true,
+        btw: agreed,
+        usage_ledger: true,
+        login: true,
+        plan_file: false,
+        reload: false,
+    };
+    let actions = app.execute_command(cmd(BTW_COMMAND), 0);
+    assert_eq!(
+        matches!(&actions[..], [Action::Btw(question)] if question == BTW_QUESTION),
+        agreed
+    );
+    assert_eq!(
+        app.status_bar.flash_text() == Some(UNAVAILABLE_REMOTE),
+        !agreed
+    );
+}
+
+/// Until the loop installs a `/new`, the client still names the old
+/// session.
+#[test]
+fn remote_btw_waits_for_a_new_session() {
+    let mut app = remote_app();
+    let (client_tx, _from_client) = flume::unbounded();
+    let (_to_client, client_rx) = flume::unbounded::<String>();
+    let (client, _events) = AcpClient::new(Link::new(client_tx, client_rx));
+    let binding = Arc::new(SessionBinding::default());
+    binding.request();
+    app.start_remote_btw(
+        BTW_QUESTION.into(),
+        RemoteSession {
+            rewind_tx: None,
+            client: Arc::new(client),
+            binding,
+        },
+    );
+    assert_eq!(app.status_bar.flash_text(), Some(SESSION_OPENING));
+}
+
+#[test]
+fn new_on_a_disconnected_app_is_unavailable() {
+    let mut app = remote_app();
+    app.connection_lost();
+    let actions = app.execute_command(cmd("/new"), 0);
+    assert!(actions.is_empty());
+    assert_eq!(app.status_bar.flash_text(), Some(UNAVAILABLE_REMOTE));
+}
+
+#[test_case(BuiltinAction::FilePicker ; "file_picker")]
+#[test_case(BuiltinAction::PlanToggle ; "plan_toggle")]
+#[test_case(BuiltinAction::PlanEditor ; "plan_editor")]
+#[test_case(BuiltinAction::ModelPicker ; "model_picker")]
+fn remote_agent_refuses_local_agent_actions(action: BuiltinAction) {
+    let mut app = remote_app();
+    let before = agent_state(&app);
+    assert!(app.run_builtin(action).is_empty());
+    assert_eq!(app.status_bar.flash_text(), Some(UNAVAILABLE_REMOTE));
+    assert_eq!(agent_state(&app), before);
+}
+
+/// An agent without the build and plan pair keeps its own modes.
+#[test]
+fn remote_agent_without_plan_modes_keeps_its_mode() {
+    let mut app = remote_app();
+    app.backend = AgentBackend::Remote {
+        native: false,
+        host: false,
+        images: false,
+        plan: false,
+        settings: true,
+        btw: true,
+        usage_ledger: true,
+        login: true,
+        plan_file: false,
+        reload: false,
+    };
+    let before = agent_state(&app);
+    app.toggle_mode();
+    assert_eq!(app.status_bar.flash_text(), Some(UNAVAILABLE_REMOTE));
+    assert_eq!(agent_state(&app), before);
+}
+
+/// Tab is the local intent, captured by the next prompt. The plan file is
+/// the agent's, so none is allocated here.
+#[test]
+fn remote_plan_mode_needs_no_local_plan_file() {
+    let mut app = remote_app();
+    app.toggle_mode();
+    assert_eq!(app.state.mode, Mode::Plan);
+    assert!(app.state.plan.path().is_none());
+    let input = app.build_agent_input(&queued_msg(QUEUED_REMOTE));
+    assert_eq!(input.mode, AgentMode::Plan(PathBuf::new()));
+    app.toggle_mode();
+    assert_eq!(app.state.mode, Mode::Build);
+}
+
+const QUEUED_REMOTE: &str = "queued for the remote agent";
+const DRAFT_REMOTE: &str = "still typing";
+
+fn remote_prompt(app: &mut App) {
+    app.permission_prompt.push_choices(
+        "remote-ask-0".into(),
+        maki_config::ToolKey::native("bash"),
+        vec!["bash: ls".into()],
+        permission_choices(),
+        None,
+    );
+}
+
+/// The link is gone mid-run. Unsent messages and their images come back
+/// into the input, and nothing more is sent.
+#[test]
+fn lost_connection_returns_unsent_input_and_refuses_prompts() {
+    let mut app = remote_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    app.exit_on_done = true;
+    let image = ImageSource::new(ImageMediaType::Png, Arc::from("aGVsbG8="));
+    app.queue_and_notify(QueuedMessage {
+        text: QUEUED_REMOTE.into(),
+        images: vec![image],
+    });
+    app.input_box.set_input(DRAFT_REMOTE);
+    remote_prompt(&mut app);
+
+    app.connection_lost();
+
+    assert_eq!(app.backend, AgentBackend::Disconnected);
+    assert!(!app.permission_prompt.is_open());
+    assert_eq!(app.queue.len(), 0);
+    assert_eq!(app.exit_request, ExitRequest::Error);
+    let draft = app
+        .input_box
+        .submit()
+        .expect("the input holds the unsent work");
+    assert_eq!(draft.text, format!("{QUEUED_REMOTE}\n{DRAFT_REMOTE}"));
+    assert_eq!(draft.images.len(), 1);
+
+    let actions = app.submit_or_queue(queued_msg(QUEUED_REMOTE));
+    assert!(actions.is_empty());
+    assert_eq!(app.status_bar.flash_text(), Some(CONNECTION_LOST));
+    assert_eq!(app.input_box.buffer.value(), QUEUED_REMOTE);
+}
+
+/// A failed `/new` reports itself with a notice, then the loop closes. The
+/// notice must leave the queue alone, or the lost connection would find
+/// nothing to hand back.
+#[test]
+fn a_notice_before_the_lost_connection_keeps_the_unsent_input() {
+    const FAILED_NOTICE: &str = "the agent did not open a new session";
+    let mut app = remote_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    let image = ImageSource::new(ImageMediaType::Png, Arc::from("aGVsbG8="));
+    app.queue_and_notify(QueuedMessage {
+        text: QUEUED_REMOTE.into(),
+        images: vec![image],
+    });
+
+    app.update(agent_msg(AgentEvent::Notice {
+        text: FAILED_NOTICE.into(),
+    }));
+    app.connection_lost();
+
+    let draft = app
+        .input_box
+        .submit()
+        .expect("the input holds the unsent work");
+    assert_eq!(draft.text.trim_end(), QUEUED_REMOTE);
+    assert_eq!(draft.images.len(), 1);
+}
+
+/// The remote loop has answered an open ask cancelled when its run ended,
+/// so the prompt must not stay up waiting for an answer nobody reads.
+#[test_case(done() ; "done")]
+#[test_case(AgentEvent::Error { message: "boom".into(), auth: false,
+    totals: maki_types::event::RunTotals::default(),
+} ; "error")]
+fn remote_run_end_closes_its_permission_prompts(end: AgentEvent) {
+    let mut app = remote_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    remote_prompt(&mut app);
+    app.update(agent_msg(end));
+    assert!(!app.permission_prompt.is_open());
+}
+
+const REMOTE_USED: u32 = 12_345;
+const REMOTE_WINDOW: u32 = 400_000;
+const REMOTE_COST: f64 = 0.0;
+const REMOTE_LIST_COST: f64 = 1.25;
+const REMOTE_SUBSIDY: &str = "Max plan";
+
+fn remote_usage() -> SessionUsage {
+    SessionUsage {
+        used: REMOTE_USED,
+        window: REMOTE_WINDOW,
+        cost: Some(REMOTE_COST),
+        list_cost: Some(REMOTE_LIST_COST),
+        subsidised_by: Some(REMOTE_SUBSIDY.into()),
+        ledger: None,
+
+        background_tasks: None,
+    }
+}
+
+fn watched_remote_app() -> (App, UsageSlot) {
+    let mut app = remote_app();
+    let slot = UsageSlot::default();
+    app.watch_remote_usage(Some(Arc::clone(&slot)));
+    (app, slot)
+}
+
+/// Session state: an error has no `Done` and Esc moves the run id, so the
+/// numbers land whatever run is current, and the status bar draws the
+/// subsidised list price as it does for a local session.
+#[test]
+fn remote_usage_applies_on_receipt() {
+    let (mut app, slot) = watched_remote_app();
+    app.run_id = 7;
+    slot.store(Some(Arc::new(remote_usage())));
+
+    assert_ne!(app.poll_remote_usage(), Dirty::NO);
+
+    assert_eq!(app.state.context_size, REMOTE_USED);
+    assert_eq!(app.state.context_window, REMOTE_WINDOW);
+    assert_eq!(app.state.cost, Some(REMOTE_COST));
+    assert_eq!(app.chats[MAIN_CHAT].cost, Some(REMOTE_COST));
+    assert_eq!(app.state.subsidised_list_cost, Some(REMOTE_LIST_COST));
+    assert_eq!(app.state.subsidised_by.as_deref(), Some(REMOTE_SUBSIDY));
+    assert_eq!(app.poll_remote_usage(), Dirty::NO, "drawn once");
+}
+
+#[test]
+fn host_usage_cost_is_visible_in_the_status_bar_and_usage_modal() {
+    const COST: f64 = 0.125;
+    const COST_TEXT: &str = "$0.125";
+    const TOTAL_ROW: &str = "cache write";
+    const MODAL_WIDTH: u16 = 200;
+    let (mut app, slot) = watched_remote_app();
+    slot.store(Some(Arc::new(SessionUsage {
+        cost: Some(COST),
+        list_cost: None,
+        subsidised_by: None,
+        ..remote_usage()
+    })));
+    let _ = app.poll_remote_usage();
+    assert!(rendered(&mut app).contains(COST_TEXT));
+    app.execute_command(cmd("/usage"), 0);
+    assert!(app.usage_modal.is_open());
+    let screen = buffer_text(&draw_sized(&mut app, MODAL_WIDTH, RENDERED_HEIGHT).1);
+    assert!(
+        screen
+            .lines()
+            .any(|line| line.contains(TOTAL_ROW) && line.contains(COST_TEXT)),
+        "{screen}"
+    );
+}
+
+/// The agent's ledger rides on its usage, so `/usage` on a remote tab reads
+/// the totals and rows the local modal reads.
+#[test]
+fn a_remote_ledger_fills_the_totals_and_rows() {
+    let (mut app, slot) = watched_remote_app();
+    let total = TokenUsage {
+        input: REMOTE_USED,
+        ..TokenUsage::default()
+    };
+    let rows = HashMap::from([(REMOTE_MODEL_A.to_owned(), total.billed(Some(REMOTE_COST)))]);
+    slot.store(Some(Arc::new(SessionUsage {
+        ledger: Some(SessionLedger {
+            total,
+            by_model: rows.clone(),
+            ..SessionLedger::default()
+        }),
+        ..remote_usage()
+    })));
+
+    assert_ne!(app.poll_remote_usage(), Dirty::NO);
+
+    assert_eq!(app.state.token_usage, total);
+    assert_eq!(app.state.session.usage_by_model(), &rows);
+}
+
+/// `/usage` asks the agent only under the usage ledger extension.
+#[test_case(true ; "agreed")]
+#[test_case(false ; "not_agreed")]
+fn usage_on_a_remote_app_needs_the_ledger(agreed: bool) {
+    let mut app = remote_app();
+    app.backend = AgentBackend::Remote {
+        native: false,
+        host: false,
+        images: false,
+        plan: true,
+        settings: true,
+        btw: true,
+        usage_ledger: agreed,
+        login: true,
+        plan_file: false,
+        reload: false,
+    };
+    let actions = app.execute_command(cmd("/usage"), 0);
+    assert_eq!(matches!(&actions[..], [Action::RefreshUsage]), agreed);
+    assert_eq!(app.usage_modal.is_open(), agreed);
+}
+
+/// Each quota fetch has its own slot, so an older answer, reordered or of
+/// another provider, never replaces the latest.
+#[test]
+fn an_older_quota_answer_lands_where_nobody_looks() {
+    const FIRST: &str = "first provider";
+    const LATEST: &str = "latest provider";
+    let mut app = test_app();
+    let older = app.fresh_usage_slot(FIRST.into());
+    app.fresh_usage_slot(LATEST.into());
+
+    older.store(Some(Arc::new(UsageFetch {
+        provider: FIRST.into(),
+        state: UsageFetchState::Unsupported,
+    })));
+
+    let drawn = app.usage_slot.load_full().unwrap();
+    assert_eq!(drawn.provider, LATEST);
+    assert!(matches!(drawn.state, UsageFetchState::Loading));
+}
+
+/// A snapshot the old session published but the App never drew stays in the
+/// old slot, so it cannot bring the old cost back after `/new`.
+#[test]
+fn an_old_sessions_undrawn_usage_does_not_come_back() {
+    let (mut app, old) = watched_remote_app();
+    old.store(Some(Arc::new(remote_usage())));
+    app.watch_remote_usage(Some(UsageSlot::default()));
+
+    assert_eq!(app.poll_remote_usage(), Dirty::NO);
+    assert_eq!(app.state.cost, None);
+}
+
+/// The session's numbers come from the slot, so a remote turn only brings
+/// its line; billing it too would count it twice.
+#[test]
+fn a_remote_turn_sets_its_line_and_bills_nothing() {
+    const TOOL_ID: &str = "remote_bash";
+    let mut app = remote_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    app.update(agent_msg(tool_start(TOOL_ID, "bash")));
+    app.update(agent_msg(turn_complete(SUB_TOKENS, "remote", SUB_COST)));
+    app.update(agent_msg(tool_results_submitted()));
+
+    assert_eq!(
+        app.chats[MAIN_CHAT].tool_turn_usage(TOOL_ID),
+        Some(SUB_TOKENS.format(SUB_COST).as_str())
+    );
+    assert_eq!(app.state.cost, None);
+    assert_eq!(app.state.token_usage, TokenUsage::default());
+}
+
+fn remote_settings_app(options: serde_json::Value, extension: bool) -> App {
+    let mut app = remote_app();
+    app.backend = AgentBackend::Remote {
+        native: false,
+        host: false,
+        images: false,
+        plan: true,
+        settings: extension,
+        btw: true,
+        usage_ledger: true,
+        login: true,
+        plan_file: false,
+        reload: false,
+    };
+    let options: Vec<SessionConfigOption> = serde_json::from_value(options).unwrap();
+    let settings = RemoteSettings::from_options(&options);
+    app.remote_settings = Some(settings);
+    app.seed_remote_settings();
+    app
+}
+
+fn remote_settings_options(fast: bool) -> serde_json::Value {
+    serde_json::json!([
+        {"id": "thinking", "name": "Thinking", "type": "select", "currentValue": "adaptive",
+         "options": [{"value": "off", "name": "off"}, {"value": "adaptive", "name": "high"}]},
+        {"id": "fast", "name": "Fast", "type": "boolean", "currentValue": fast},
+        {"id": "workflow", "name": "Workflow", "type": "boolean", "currentValue": false},
+        {"id": "yolo", "name": "Yolo", "type": "boolean", "currentValue": false},
+    ])
+}
+
+#[test]
+fn a_native_new_session_persists_only_an_explicit_yolo_change() {
+    let mut app = remote_settings_app(remote_settings_options(false), true);
+    if let AgentBackend::Remote { native, .. } = &mut app.backend {
+        *native = true;
+    }
+    assert_eq!(app.blank_session().session.meta.yolo, None);
+    app.execute_command(cmd("/yolo"), 0);
+    assert_eq!(app.blank_session().session.meta.yolo, Some(true));
+}
+
+/// The first prompt carries the agent's values, not the client's defaults,
+/// and the badge says what the agent's model makes of the intent.
+#[test]
+fn a_remote_tab_is_seeded_from_the_agent_before_any_prompt() {
+    let app = remote_settings_app(remote_settings_options(true), true);
+    let input = app.build_agent_input(&queued_msg(QUEUED_REMOTE));
+    assert!(input.fast);
+    assert_eq!(input.thinking, ThinkingConfig::Adaptive);
+    let indicators = app.remote_indicators();
+    assert_eq!(indicators.thinking.as_deref(), Some("high"));
+    assert!(indicators.fast);
+}
+
+#[test_case(true, serde_json::json!([]), "/yolo" ; "yolo_without_its_option")]
+#[test_case(false, remote_settings_options(false), "/fast" ; "fast_without_the_extension")]
+#[test_case(false, remote_settings_options(false), "/workflow" ; "workflow_without_the_extension")]
+fn a_remote_setting_the_agent_cannot_take_is_unavailable(
+    extension: bool,
+    options: serde_json::Value,
+    command: &str,
+) {
+    let mut app = remote_settings_app(options, extension);
+    let before = (app.state.fast, app.state.workflow, app.yolo.is_yolo());
+    app.execute_command(cmd(command), 0);
+    assert_eq!(app.status_bar.flash_text(), Some(UNAVAILABLE_REMOTE));
+    assert_eq!(
+        (app.state.fast, app.state.workflow, app.yolo.is_yolo()),
+        before
+    );
+}
+
+/// The loop puts a refused change back in the intent; the App adopts it and
+/// says why, whatever run is current.
+#[test]
+fn a_put_back_change_is_adopted_and_explained() {
+    const WHY: &str = "fast: not allowed";
+    let mut app = remote_settings_app(remote_settings_options(false), true);
+    app.execute_command(cmd("/fast"), 0);
+    assert!(app.state.fast);
+    let settings = app.remote_settings.clone().unwrap();
+    {
+        let mut core = settings.lock();
+        let change = core.next(&[Setting::Fast.key()], |_| true).unwrap();
+        core.start(0, change);
+        core.finish(0, Err(WHY.into()));
+        settings.refresh(&core);
+    }
+    settings.failure.store(Some(Arc::new(WHY.into())));
+    app.run_id += 1;
+
+    let _ = app.poll_remote_settings();
+
+    assert!(!app.state.fast);
+    assert_eq!(app.status_bar.flash_text(), Some(WHY));
+}
+
+const REMOTE_MODEL_A: &str = "vendor/model-a";
+const REMOTE_MODEL_B: &str = "vendor/model-b";
+
+fn remote_app_with_models() -> (App, RemoteSettings) {
+    let mut app = remote_app();
+    app.backend = AgentBackend::Remote {
+        native: false,
+        host: false,
+        images: false,
+        plan: true,
+        settings: true,
+        btw: true,
+        usage_ledger: true,
+        login: true,
+        plan_file: false,
+        reload: false,
+    };
+    let options: Vec<SessionConfigOption> = serde_json::from_value(serde_json::json!([{
+        "id": "model", "name": "Model", "type": "select", "category": "model",
+        "currentValue": REMOTE_MODEL_A,
+        "options": [
+            {"value": REMOTE_MODEL_A, "name": REMOTE_MODEL_A},
+            {"value": REMOTE_MODEL_B, "name": REMOTE_MODEL_B},
+        ],
+    }]))
+    .unwrap();
+    let models = RemoteSettings::from_options(&options);
+    app.remote_settings = Some(models.clone());
+    (app, models)
+}
+
+#[test_case(false, REMOTE_MODEL_A ; "confirmed_model")]
+#[test_case(true, REMOTE_MODEL_B ; "pending_pick")]
+fn a_native_new_session_keeps_the_agents_model(pick: bool, expected: &str) {
+    let (mut app, _) = remote_app_with_models();
+    if let AgentBackend::Remote { native, .. } = &mut app.backend {
+        *native = true;
+    }
+    if pick {
+        app.execute_command(cmd("/model"), 0);
+        app.update(Msg::Key(key(KeyCode::Down)));
+        app.update(Msg::Key(key(KeyCode::Enter)));
+    }
+    assert_eq!(app.blank_session().session.model, expected);
+}
+
+/// The agent's models are listed, and the local picker with its provider
+/// lookups and tiers never opens.
+#[test]
+fn remote_model_command_opens_the_agents_picker() {
+    let (mut app, _) = remote_app_with_models();
+    let actions = app.execute_command(cmd("/model"), 0);
+    assert!(actions.is_empty(), "no local discovery starts");
+    assert!(app.remote_model_picker.is_open());
+}
+
+#[test]
+fn remote_model_pick_waits_for_the_next_prompt() {
+    let (mut app, models) = remote_app_with_models();
+    let spec = app.state.session.model.clone();
+    app.execute_command(cmd("/model"), 0);
+    app.update(Msg::Key(key(KeyCode::Down)));
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert_eq!(
+        models.wanted().as_deref().map(|pick| pick.value.as_str()),
+        Some(REMOTE_MODEL_B)
+    );
+    assert_eq!(app.status_bar.flash_text(), Some(MODEL_NEXT_PROMPT));
+    assert_eq!(
+        app.state.session.model.clone(),
+        spec,
+        "the local model is untouched"
+    );
+}
+
+/// The loop publishes a new menu with nothing else happening. The idle tab
+/// must repaint, and show the agent's new model.
+#[test]
+fn published_remote_menu_repaints_and_names_the_model() {
+    let (mut app, models) = remote_app_with_models();
+    assert_eq!(app.tick(), Dirty::YES, "the first menu is drawn once");
+    assert_eq!(app.remote_model_name(), Some(REMOTE_MODEL_A));
+    let options: Vec<SessionConfigOption> = serde_json::from_value(serde_json::json!([{
+        "id": "model", "name": "Model", "type": "select", "category": "model",
+        "currentValue": REMOTE_MODEL_B,
+        "options": [{"value": REMOTE_MODEL_B, "name": REMOTE_MODEL_B}],
+    }]))
+    .unwrap();
+    models.publish(&options, 1);
+    assert_eq!(app.tick(), Dirty::YES);
+    assert_eq!(app.remote_model_name(), Some(REMOTE_MODEL_B));
+    assert_eq!(app.tick(), Dirty::NO, "an unchanged menu costs no frame");
+}
+
+const REMOTE_PLAN_TEXT: &str = "# Remote plan";
+const LOCAL_PLAN_TEXT: &str = "# Some local file";
+const PLAN_CALL: &str = "plan-call";
+
+fn plan_remote_app(plan: RemotePlan) -> App {
+    let mut app = remote_app();
+    app.backend = AgentBackend::Remote {
+        native: false,
+        host: false,
+        images: false,
+        plan: true,
+        settings: true,
+        btw: true,
+        usage_ledger: true,
+        login: true,
+        plan_file: true,
+        reload: false,
+    };
+    app.remote_plan = Some(plan);
+    app.state.mode = Mode::Plan;
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    app
+}
+
+fn plan_write_done(call: &str, path: &Path) -> Msg {
+    agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
+        call: None,
+        id: call.into(),
+        tool: "write".into(),
+        output: Arc::new(ToolOutput::Plain("wrote the plan".into())),
+        is_error: false,
+        annotation: None,
+        written_path: Some(path.display().to_string()),
+        data: None,
+
+        backgrounded: false,
+    })))
+}
+
+/// A client file at the agent's plan path, with other content, which a
+/// remote tab must never read.
+fn same_path_local_file() -> (TempDir, PathBuf) {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("plan.md");
+    fs::write(&path, LOCAL_PLAN_TEXT).unwrap();
+    (dir, path)
+}
+
+fn keep_write(plan: &RemotePlan, call: &str, path: &Path, text: &str) {
+    plan.writes.lock().unwrap().insert(
+        call.into(),
+        PlanWritten {
+            path: path.display().to_string(),
+            text: Some(text.into()),
+        },
+    );
+}
+
+#[test]
+fn a_remote_plan_write_opens_the_form_with_the_agents_text() {
+    let (_dir, path) = same_path_local_file();
+    let (plan, _seen) = remote_plan::test_support::answering(|_| Ok(serde_json::json!({})));
+    keep_write(&plan, PLAN_CALL, &path, REMOTE_PLAN_TEXT);
+    let mut app = plan_remote_app(plan);
+
+    app.update(plan_write_done(PLAN_CALL, &path));
+
+    assert!(app.plan_form.is_visible());
+    assert_eq!(app.state.plan, PlanState::Ready(path.clone()));
+    assert!(app.chats[MAIN_CHAT].last_message_is_plan());
+    assert_eq!(app.chats[MAIN_CHAT].last_message_text(), REMOTE_PLAN_TEXT);
+    assert_eq!(app.plan_snapshot()["content"], REMOTE_PLAN_TEXT);
+}
+
+/// Two writes can be in before the App handles the first.
+#[test]
+fn each_remote_plan_write_keeps_its_own_text() {
+    const LATER_CALL: &str = "later-call";
+    const LATER_TEXT: &str = "# Later plan";
+    let (_dir, path) = same_path_local_file();
+    let (plan, _seen) = remote_plan::test_support::answering(|_| Ok(serde_json::json!({})));
+    keep_write(&plan, PLAN_CALL, &path, REMOTE_PLAN_TEXT);
+    keep_write(&plan, LATER_CALL, &path, LATER_TEXT);
+    let mut app = plan_remote_app(plan);
+
+    app.update(plan_write_done(PLAN_CALL, &path));
+    assert_eq!(app.chats[MAIN_CHAT].last_message_text(), REMOTE_PLAN_TEXT);
+    app.update(plan_write_done(LATER_CALL, &path));
+    assert_eq!(app.chats[MAIN_CHAT].last_message_text(), LATER_TEXT);
+}
+
+/// The agent reads its own file to implement it, so a failed read only
+/// costs the chat its plan message.
+#[test_case(true ; "read")]
+#[test_case(false ; "failed_read")]
+fn implementing_a_remote_plan_draws_what_the_agent_reads(answers: bool) {
+    const DIRTY: &str = "\u{1b}[31m# Remote plan";
+    const REFUSED: &str = "the session has no plan file";
+    let (_dir, path) = same_path_local_file();
+    let (plan, _seen) = remote_plan::test_support::answering(move |_| match answers {
+        true => Ok(serde_json::json!({"path": "p", "text": DIRTY, "revision": "r"})),
+        false => {
+            Err(serde_json::json!({"code": -32602, "message": "Invalid params", "data": REFUSED}))
+        }
+    });
+    let mut app = plan_remote_app(plan);
+    app.status = Status::Idle;
+    app.state.plan = PlanState::Ready(path.clone());
+
+    app.implement_plan(false);
+
+    let chat = &app.chats[MAIN_CHAT];
+    let plan = (0..chat.message_count())
+        .filter_map(|index| chat.message_at(index))
+        .find(|message| message.plan_path.is_some());
+    assert_eq!(
+        plan.map(|message| message.text.as_str()),
+        answers.then_some(REMOTE_PLAN_TEXT)
+    );
+    if !answers {
+        assert_eq!(app.status_bar.flash_text(), Some(REFUSED));
+    }
+    assert_eq!(app.state.mode, Mode::Build);
+}
+
+#[test]
+fn the_plan_editor_edits_a_remote_plan_as_a_copy() {
+    let (plan, _seen) = remote_plan::test_support::answering(|_| Ok(serde_json::json!({})));
+    let mut app = plan_remote_app(plan);
+    app.status = Status::Idle;
+    let actions = app.update(Msg::Key(kb::OPEN_EDITOR.to_key_event()));
+    assert!(matches!(&actions[..], [Action::EditRemotePlan]));
+}
+
+#[test]
+fn an_old_task_queue_update_cannot_restore_popped_text() {
+    let mut app = app_with_subagent_id("task");
+    app.focus_task("task").unwrap();
+    app.update_task_queue(
+        "task",
+        maki_types::inbox::InboxSnapshot {
+            revision: 2,
+            texts: vec![PLAIN_LINE.into()],
+        },
+    );
+    app.update_task_queue(
+        "task",
+        maki_types::inbox::InboxSnapshot {
+            revision: 1,
+            texts: vec![TYPED_DRAFT.into(), PLAIN_LINE.into()],
+        },
+    );
+    assert_eq!(app.active_queue_len(), 1);
+    assert_eq!(app.active_queue_entries()[0].text, PLAIN_LINE);
 }
 
 pub(crate) const MOVED_ID: &str = "toolu_moved";
@@ -11216,16 +10100,14 @@ fn slow_tool_done(id: &str, backgrounded: bool) -> AgentEvent {
         annotation: None,
         written_path: None,
         backgrounded,
+        data: None,
     }))
 }
 
 /// A call of the running turn that streamed into {buf}, then moved.
 pub(crate) fn move_call(app: &mut App, id: &str, buf: &Arc<SharedBuf>) {
     app.update(agent_msg(tool_start(id, SLOW_TOOL)));
-    app.update(agent_msg(AgentEvent::LiveToolBuf {
-        id: id.into(),
-        body: Arc::clone(buf),
-    }));
+    app.main_chat().set_snapshot(id, buf.take());
     app.update(agent_msg(moved_done(id)));
 }
 
@@ -11411,10 +10293,9 @@ fn esc_says_background_tasks_keep_running() {
 #[test_case(Status::Idle,      Some(2) ; "idle_says_what_it_waits_on")]
 #[test_case(Status::Streaming, None    ; "streaming_queues")]
 fn the_main_input_tells_what_the_agent_waits_on(status: Status, waiting: Option<usize>) {
-    let mut app = test_app();
-    let mailbox = hold_mailbox(&mut app);
-    mailbox.track(MOVED_ID);
-    mailbox.track(LOST_ID);
+    let mut app = streaming_app();
+    move_call(&mut app, MOVED_ID, &Arc::new(SharedBuf::new()));
+    move_call(&mut app, SECOND_CALL_ID, &Arc::new(SharedBuf::new()));
     app.status = status;
 
     let shown = match app.input_placeholder() {
@@ -11445,7 +10326,6 @@ fn a_moved_calls_tab_offers_esc_and_stops_on_it() {
 #[test]
 fn a_notice_keeps_its_detail_live_and_on_restore() {
     let mut app = test_app();
-    app.start_mailbox_run(vec![labelled_notice(NOTICE_LINE)]);
     app.update(agent_msg_with_run_id(
         AgentEvent::ObservationLine {
             text: NOTICE_LINE.into(),
@@ -11459,8 +10339,9 @@ fn a_notice_keeps_its_detail_live_and_on_restore() {
         .message_at(chat.message_count() - 1)
         .and_then(|row| row.detail.clone());
 
-    let (restored, _) = crate::chat::history_to_display(
+    let restored = crate::chat::history_to_display(
         &[labelled_notice(NOTICE_LINE)],
+        &HashMap::new(),
         &HashMap::new(),
         &app.ui_config.tool_output_lines,
     );
@@ -11474,44 +10355,6 @@ fn a_notice_keeps_its_detail_live_and_on_restore() {
 }
 
 const RECEIPT_TURN_ID: &str = "tool-1";
-
-/// The seeded history names [`RECEIPT_TURN_ID`] in its first turn, so a
-/// rewind to that turn drops the receipt and one to the second keeps it. A
-/// dropped receipt is forgotten first, so no result can answer it.
-#[test_case(0, true  ; "dropping_the_receipt_stops_the_task")]
-#[test_case(2, false ; "keeping_the_receipt_keeps_the_task")]
-fn rewind_stops_the_tasks_whose_receipt_it_drops(turn_index: usize, stops: bool) {
-    let mut app = build_rewind_app();
-    let mailbox = hold_mailbox(&mut app);
-    app.status = Status::Streaming;
-    app.run_id = 1;
-    move_call(&mut app, RECEIPT_TURN_ID, &Arc::new(SharedBuf::new()));
-    mailbox.track(RECEIPT_TURN_ID);
-    end_turn(&mut app);
-
-    let actions = app.rewind_to(RewindEntry {
-        turn_index,
-        prompt_preview: String::new(),
-        prompt_text: String::new(),
-    });
-
-    let cancelled = actions.iter().any(|action| {
-        matches!(action, Action::CancelPluginTask { id, plugin }
-            if id == RECEIPT_TURN_ID && &**plugin == SLOW_TOOL)
-    });
-    assert_eq!(
-        cancelled, stops,
-        "the stop names the task's plugin, its tab is gone by then"
-    );
-    assert!(matches!(actions.last(), Some(Action::RestartAgent(_))));
-    assert_eq!(app.chat_of_task(RECEIPT_TURN_ID).is_ok(), !stops);
-    assert_eq!(
-        app.chats[MAIN_CHAT].has_background_badge(RECEIPT_TURN_ID),
-        !stops,
-        "a kept receipt row still leads to its running task"
-    );
-    assert_eq!(mailbox.unsettled().is_empty(), stops);
-}
 
 fn move_receipt_turn_call(app: &mut App, subagent: bool) {
     app.status = Status::Streaming;
@@ -11542,7 +10385,14 @@ fn rewind_keeps_a_stopped_task_whose_receipt_stays(subagent: bool) {
     move_receipt_turn_call(&mut app, subagent);
     app.stop_task(RECEIPT_TURN_ID).unwrap();
 
-    app.rewind_to(rewind_to_second_turn());
+    let entry = rewind_to_second_turn();
+    let mut snapshot = (*app.state.session).clone();
+    snapshot.meta.context_size = maki_types::session::truncate_to_turn(
+        &mut snapshot,
+        entry.turn_index,
+        app.state.context_size,
+    );
+    app.finish_remote_rewind(snapshot, entry);
 
     let idx = app
         .chat_of_task(RECEIPT_TURN_ID)
@@ -11559,8 +10409,8 @@ fn a_restored_receipt_nobody_answered_reads_lost() {
     let session = app.state.session_mut();
     session.meta.pending_background = vec![RECEIPT_TURN_ID.into()];
     session.set_subagents(vec![StoredSubagent {
-        parent_call: None,
         tool_use_id: RECEIPT_TURN_ID.into(),
+        parent_call: None,
         name: RESEARCH_NAME.into(),
         model: None,
         thinking: None,
@@ -11577,8 +10427,6 @@ fn a_restored_receipt_nobody_answered_reads_lost() {
     assert_eq!(chat.task_status(), TaskStatus::Error);
     assert_eq!(chat.last_message_text(), LOST_TEXT);
 }
-
-const MOVED_SUMMARY: &str = "Long background task";
 
 /// A stored session where `bash` call [`MOVED_ID`] got a result, a receipt
 /// when {receipt}, then {notice} (`failed`, `stopped`) answered it.
@@ -11602,13 +10450,7 @@ fn moved_call_history(receipt: bool, notice: Option<(bool, bool)>) -> Vec<Messag
         },
     ];
     if let Some((failed, stopped)) = notice {
-        let (text, display, end) = result_notice(
-            &TaskLabel::new("bash", Some(MOVED_SUMMARY)),
-            MOVED_ID,
-            failed,
-            stopped,
-            "output",
-        );
+        let (text, display, end) = result_notice(&(), MOVED_ID, failed, stopped, "output");
         let mut message = Message::observation(text);
         message.display_text = Some(display);
         message.settles = Some(TaskSettled {
@@ -11652,46 +10494,31 @@ fn a_restored_moved_row_tells_how_its_task_ended(
     assert_eq!(badge.map(|badge| badge.outcome), expected.map(Some));
 }
 
-/// A `/reload` hands the mailbox over with every result no run took yet, and
-/// the model reads that result next, so the row tells the same ending. Only a
-/// receipt with nothing queued reads lost.
-#[test_case(Some((false, false)), BackgroundOutcome::Done      ; "finished_before_the_reload")]
-#[test_case(Some((true,  true)),  BackgroundOutcome::Cancelled ; "stopped_before_the_reload")]
-#[test_case(None,                 BackgroundOutcome::Lost      ; "nothing_queued")]
-fn a_reloaded_moved_row_tells_the_ending_its_queued_result_gives(
-    notice: Option<(bool, bool)>,
-    expected: BackgroundOutcome,
-) {
+#[test]
+fn a_restored_pending_receipt_uses_the_stored_task_ending() {
     let mut app = test_app();
-    let mailbox = hold_mailbox(&mut app);
-    mailbox.track(MOVED_ID);
-    if let Some((failed, stopped)) = notice {
-        let (text, display, end) = result_notice(
-            &TaskLabel::new("bash", Some(MOVED_SUMMARY)),
-            MOVED_ID,
-            failed,
-            stopped,
-            "output",
-        );
-        let notice = BackgroundNotice {
-            text,
-            display: Some(&display),
-            wake: false,
-            end,
-        };
-        mailbox.settle(MOVED_ID, Some(notice));
-    }
     let session = app.state.session_mut();
     session.replace_messages(moved_call_history(true, None));
-    session.meta.pending_background = mailbox.unsettled();
+    session.meta.pending_background = vec![MOVED_ID.into()];
+    let mut ended = Message::observation(NOTICE_BODY.into());
+    ended.settles = Some(TaskSettled {
+        task: MOVED_ID.into(),
+        end: TaskEnd::Cancelled,
+    });
+    session.set_subagent_messages(MOVED_ID.into(), vec![ended]);
 
-    app.restore_resumed_session();
+    app.restore_display();
 
-    let badge = app.chats[MAIN_CHAT]
-        .tool_message(MOVED_ID)
-        .expect("the call's row")
-        .background;
-    assert_eq!(badge.and_then(|badge| badge.outcome), Some(expected));
+    assert_eq!(
+        app.chats[MAIN_CHAT]
+            .tool_message(MOVED_ID)
+            .unwrap()
+            .background
+            .as_ref()
+            .unwrap()
+            .outcome,
+        Some(BackgroundOutcome::Cancelled)
+    );
 }
 
 /// A finished tab has no input box, so Esc is the way back, and the tab
@@ -11768,6 +10595,7 @@ fn stopping_a_task_cancels_the_subagents_it_started() {
 }
 
 const NESTED_ID: &str = "toolu_batch_child";
+const SUB_TOOL_ID: &str = "sub_t1";
 const LATE_SUB_TOOL_ID: &str = "sub_t2";
 const NEXT_RUN_PROMPT: &str = "meanwhile";
 
@@ -11854,7 +10682,9 @@ fn an_adopted_subagents_events_outlive_its_run() {
 /// after the turn ended still gets its answer, and the main agent none.
 #[test]
 fn a_moved_subagent_asking_after_its_turn_ended_gets_its_answer() {
-    let (mut app, sub_rx, main_rx) = app_with_subagent_tx(TASK_ID);
+    let mut app = app_with_subagent_id(TASK_ID);
+    app.update(agent_msg(tool_start(TASK_ID, SLOW_TOOL)));
+    let sub_rx = answer_channel(&mut app);
     receive_receipt(&mut app);
     end_turn(&mut app);
 
@@ -11866,13 +10696,14 @@ fn a_moved_subagent_asking_after_its_turn_ended_gets_its_answer() {
             tool: ToolKey::native("bash"),
             scopes: vec!["ls".into()],
             reason: None,
+
+            choices: permission_choices(),
         },
     );
     assert!(app.permission_prompt.is_open());
-    app.update(Msg::Key(key(KeyCode::Char('y'))));
+    app.update(Msg::Key(key(KeyCode::Enter)));
 
     assert_eq!(sub_rx.try_recv().unwrap(), allow_once(FIRST_ASK));
-    assert!(main_rx.is_empty());
 }
 
 /// Cancelling the turn and the rewind picker both clear every queued ask, so
@@ -11880,7 +10711,9 @@ fn a_moved_subagent_asking_after_its_turn_ended_gets_its_answer() {
 /// on one: the prompt takes the keys first, Esc included.
 #[test]
 fn esc_cannot_cancel_the_turn_over_a_moved_subagents_ask() {
-    let (mut app, sub_rx, _main_rx) = app_with_subagent_tx(TASK_ID);
+    let mut app = app_with_subagent_id(TASK_ID);
+    app.update(agent_msg(tool_start(TASK_ID, SLOW_TOOL)));
+    let sub_rx = answer_channel(&mut app);
     receive_receipt(&mut app);
     moved_subagent_event(
         &mut app,
@@ -11890,6 +10723,8 @@ fn esc_cannot_cancel_the_turn_over_a_moved_subagents_ask() {
             tool: ToolKey::native("bash"),
             scopes: vec!["ls".into()],
             reason: None,
+
+            choices: permission_choices(),
         },
     );
 
@@ -11898,8 +10733,13 @@ fn esc_cannot_cancel_the_turn_over_a_moved_subagents_ask() {
 
     assert!(actions.is_empty());
     assert_eq!(app.status, Status::Streaming);
-    app.update(Msg::Key(key(KeyCode::Char('y'))));
-    assert_eq!(sub_rx.try_recv().unwrap(), allow_once(FIRST_ASK));
+    assert_eq!(
+        sub_rx.try_recv().unwrap(),
+        AnsweredRequest {
+            id: FIRST_ASK.into(),
+            answer: None
+        }
+    );
 }
 
 fn nested_first_event(app: &mut App) {
@@ -11996,23 +10836,15 @@ fn a_task_call_moved_before_its_subagent_spoke_gets_a_full_tab(
     let mut app = streaming_app();
     app.update(agent_msg(tool_start(MOVED_ID, SLOW_TOOL)));
     app.update(agent_msg(moved_done(MOVED_ID)));
-    let inbox = Arc::new(SubagentInbox::default());
-    let (answer_tx, _answer_rx) = flume::unbounded();
-    let mut info = subagent_info_with_tx(MOVED_ID, RESEARCH_NAME, Some(answer_tx));
+    let mut info = subagent_info(MOVED_ID, RESEARCH_NAME);
     info.model = Some(MOVED_MODEL.into());
     info.opts = Some(MOVED_OPTS);
-    info.inbox = Some(Arc::clone(&inbox));
 
     name_session(&mut app, info);
 
     assert_eq!(app.chats.len(), 2);
     let tab = &app.chats[1];
-    assert!(
-        tab.inbox
-            .as_ref()
-            .is_some_and(|tab_inbox| Arc::ptr_eq(tab_inbox, &inbox))
-    );
-    assert!(tab.answer_tx.is_some());
+
     assert_eq!(tab.model_id.as_deref(), Some(MOVED_MODEL));
     assert_eq!(tab.opts, Some(MOVED_OPTS));
     assert_eq!(tab.task_status(), TaskStatus::Working);
@@ -12022,10 +10854,7 @@ fn a_task_call_moved_before_its_subagent_spoke_gets_a_full_tab(
 fn running_call(app: &mut App) -> Option<Arc<SharedBuf>> {
     let buf = Arc::new(SharedBuf::new());
     app.update(agent_msg(tool_start(MOVED_ID, SLOW_TOOL)));
-    app.update(agent_msg(AgentEvent::LiveToolBuf {
-        id: MOVED_ID.into(),
-        body: Arc::clone(&buf),
-    }));
+    app.main_chat().set_snapshot(MOVED_ID, buf.take());
     Some(buf)
 }
 
@@ -12070,13 +10899,8 @@ fn a_receipt_landing_after_esc_still_opens_its_task(start: fn(&mut App) -> Optio
     assert_eq!(app.chats[tab].task_status(), TaskStatus::Working);
     assert_eq!(app.running_background_tasks().count(), 1);
     assert_eq!(moved_badge_outcome(&app), Some(None));
-    if let Some(buf) = buf {
+    if buf.is_some() {
         assert_eq!(app.chats[tab].in_progress_count(), 1);
-        assert!(
-            app.chats[tab]
-                .live_buf(MOVED_ID)
-                .is_some_and(|shared| Arc::ptr_eq(&shared, &buf))
-        );
     }
 
     deliver_moved_result(&mut app);
@@ -12118,13 +10942,8 @@ const SUB_MOVED_ID: &str = "toolu_sub_moved";
 #[test]
 fn a_call_moved_out_of_a_subagent_gets_its_own_task() {
     let mut app = app_with_subagent_call(TASK_ID);
-    let buf = Arc::new(SharedBuf::new());
     for event in [
         tool_start(SUB_MOVED_ID, SLOW_TOOL),
-        AgentEvent::LiveToolBuf {
-            id: SUB_MOVED_ID.into(),
-            body: Arc::clone(&buf),
-        },
         moved_done(SUB_MOVED_ID),
     ] {
         app.update(subagent_msg(event, TASK_ID, Some(RESEARCH_NAME)));
@@ -12134,11 +10953,7 @@ fn a_call_moved_out_of_a_subagent_gets_its_own_task() {
     let tab = app.chat_of_task(SUB_MOVED_ID).unwrap();
     assert_ne!(tab, subagent);
     assert_eq!(app.chats[tab].task_status(), TaskStatus::Working);
-    assert!(
-        app.chats[tab]
-            .live_buf(SUB_MOVED_ID)
-            .is_some_and(|shared| Arc::ptr_eq(&shared, &buf))
-    );
+
     assert!(app.chats[subagent].plugin.is_none());
     assert_eq!(app.chat_index.get(TASK_ID), Some(&subagent));
     assert_eq!(app.running_background_tasks().count(), 1);
@@ -12175,12 +10990,13 @@ fn a_call_moved_out_of_a_subagent_gets_its_own_task() {
 #[test_case(false, false, false ; "settled")]
 #[test_case(true,  true,  false ; "quit_by_hand")]
 fn exit_on_done_awaits_background_work(outstanding: bool, quit: bool, awaits: bool) {
-    let (mut app, mailbox) = exit_on_done_app(Some(BACKGROUND_WAIT));
+    let (mut app, _) = exit_on_done_app(Some(BACKGROUND_WAIT));
     if !outstanding {
-        mailbox.settle(MOVED_ID, None);
+        app.end_task(MOVED_ID, BackgroundOutcome::Done);
     }
     end_turn(&mut app);
     if quit {
+        app.update(Msg::Key(kb::QUIT.to_key_event()));
         app.update(Msg::Key(kb::QUIT.to_key_event()));
     }
 
@@ -12191,13 +11007,12 @@ fn exit_on_done_awaits_background_work(outstanding: bool, quit: bool, awaits: bo
 const BACKGROUND_WAIT: Duration = Duration::from_secs(600);
 
 /// An `--exit-on-done` app whose run holds a receipt for [`MOVED_ID`].
-fn exit_on_done_app(background_wait: Option<Duration>) -> (App, SessionMailbox) {
+fn exit_on_done_app(background_wait: Option<Duration>) -> (App, ()) {
     let mut app = streaming_app();
-    let mailbox = hold_mailbox(&mut app);
     app.exit_on_done = true;
     app.background_wait = background_wait;
-    mailbox.track(MOVED_ID);
-    (app, mailbox)
+    move_call(&mut app, MOVED_ID, &Arc::new(SharedBuf::new()));
+    (app, ())
 }
 
 /// A failed turn exits with its error: neither the wait nor a woken run may
@@ -12241,10 +11056,7 @@ fn a_final_result_that_beats_its_receipt_still_ends_the_task() {
     let mut app = streaming_app();
     let buf = Arc::new(SharedBuf::new());
     app.update(agent_msg(tool_start(MOVED_ID, SLOW_TOOL)));
-    app.update(agent_msg(AgentEvent::LiveToolBuf {
-        id: MOVED_ID.into(),
-        body: Arc::clone(&buf),
-    }));
+    app.main_chat().set_snapshot(MOVED_ID, buf.take());
     app.deliver(
         Envelope {
             event: slow_tool_done(MOVED_ID, false),
@@ -12294,6 +11106,14 @@ fn a_final_result_after_its_tab_was_deleted_is_dropped() {
             .and_then(|badge| badge.outcome),
         Some(BackgroundOutcome::Cancelled)
     );
+    assert!(
+        !app.state
+            .session
+            .subagents()
+            .iter()
+            .any(|task| task.tool_use_id == MOVED_ID)
+    );
+    assert!(!app.state.session.subagent_messages().contains_key(MOVED_ID));
 }
 
 /// A moved row whose tab was deleted has no task to open, so a click takes
@@ -12337,15 +11157,23 @@ fn clicking_a_moved_row_whose_tab_is_gone_takes_the_rows_own_click() {
 fn app_with_moved_subagent() -> (App, flume::Receiver<String>, flume::Receiver<String>) {
     let mut app = streaming_app();
     let (main_tx, main_rx) = flume::unbounded();
-    app.answer_tx = Some(main_tx);
+    let (sub_tx, sub_rx) = flume::unbounded();
+    let (mut plan, _) = remote_plan::test_support::answering(move |request| {
+        assert_eq!(request["params"]["operation"], "retry_auth");
+        if request["params"]["id"].is_null() {
+            main_tx.send(String::new()).unwrap();
+        } else {
+            assert_eq!(request["params"]["id"], MOVED_ID);
+            sub_tx.send(String::new()).unwrap();
+        }
+        Ok(json!(true))
+    });
+    plan.link.rewind_tx = Some(flume::unbounded().0);
+    app.remote_link = Some(plan.link);
     app.update(agent_msg(tool_start(MOVED_ID, SLOW_TOOL)));
     app.update(agent_msg(moved_done(MOVED_ID)));
-    let (answer_tx, answer_rx) = flume::unbounded();
-    speak_after_the_move(
-        &mut app,
-        subagent_info_with_tx(MOVED_ID, RESEARCH_NAME, Some(answer_tx)),
-    );
-    (app, answer_rx, main_rx)
+    speak_after_the_move(&mut app, subagent_info(MOVED_ID, RESEARCH_NAME));
+    (app, sub_rx, main_rx)
 }
 
 /// Every run that parked gets the retry: one left out would wait forever.
@@ -12383,34 +11211,35 @@ fn a_task_awaiting_auth_lets_the_main_chat_go_on() {
     assert!(!app.awaiting_input());
     assert_eq!(app.attention(), None);
 
-    let actions = type_and_submit(&mut app, QUEUED_PROMPT);
+    let actions = type_and_submit(&mut app, QUEUED_REMOTE);
 
     assert_eq!(sub_rx.try_recv(), Ok(String::new()));
-    assert!(matches!(&actions[..], [Action::SendMessage(s)] if s.message == QUEUED_PROMPT));
+    assert!(matches!(&actions[..], [Action::SendMessage(s)] if s.message == QUEUED_REMOTE));
 }
 
 /// A task that ended while parked, or whose run went on, has no retry left
 /// to wait for, and the next message reaches the main chat untouched.
 #[test_case(|app: &mut App| { app.stop_task(MOVED_ID).unwrap(); } ; "stopped")]
 #[test_case(|app: &mut App| moved_subagent_event(app, MOVED_ID, AgentEvent::StreamClosed) ; "session_closed")]
-#[test_case(|app: &mut App| moved_subagent_event(app, MOVED_ID, AgentEvent::TextDelta { text: TOOL_OUTPUT_LINE.into() }) ; "run_went_on")]
+#[test_case(|app: &mut App| moved_subagent_event(app, MOVED_ID, AgentEvent::TextDelta { text: PLAIN_LINE.into() }) ; "run_went_on")]
 fn a_task_auth_park_never_goes_stale(lift: fn(&mut App)) {
     let (mut app, sub_rx, _main_rx) = app_with_moved_subagent();
     end_turn(&mut app);
     moved_subagent_event(&mut app, MOVED_ID, AgentEvent::AuthRequired);
 
     lift(&mut app);
-    let actions = type_and_submit(&mut app, QUEUED_PROMPT);
+    let actions = type_and_submit(&mut app, QUEUED_REMOTE);
 
     assert!(sub_rx.is_empty());
-    assert!(matches!(&actions[..], [Action::SendMessage(s)] if s.message == QUEUED_PROMPT));
+    assert!(matches!(&actions[..], [Action::SendMessage(s)] if s.message == QUEUED_REMOTE));
 }
 
 /// An auth ask still in flight when its subagent ended has no run to retry,
 /// and the main run's channel is not its to borrow.
 #[test]
 fn a_finished_subagent_late_auth_ask_never_parks() {
-    let (mut app, sub_rx, main_rx) = app_with_subagent_tx("sub1");
+    let mut app = app_with_subagent_id("sub1");
+    let sub_rx = answer_channel(&mut app);
     app.stop_task("sub1").unwrap();
 
     app.update(subagent_msg(
@@ -12422,7 +11251,6 @@ fn a_finished_subagent_late_auth_ask_never_parks() {
     assert!(!app.chats[1].auth_parked);
     app.update(Msg::Key(key(KeyCode::Enter)));
     assert!(sub_rx.is_empty());
-    assert!(main_rx.is_empty());
 }
 
 /// A plugin's own session has nobody to ask, so its run fails instead of
@@ -12431,15 +11259,11 @@ fn a_finished_subagent_late_auth_ask_never_parks() {
 #[test]
 fn a_plugin_task_nobody_can_answer_gets_no_auth_retry() {
     let mut app = app_with_plugin_task();
-    let (main_tx, main_rx) = flume::unbounded();
-    app.answer_tx = Some(main_tx);
-
     plugin_event(&mut app, AgentEvent::AuthRequired);
 
     assert_eq!(app.chats[1].last_message_text(), AUTH_EXPIRED_MSG);
     assert!(!app.chats[1].auth_parked);
     app.update(Msg::Key(key(KeyCode::Enter)));
-    assert!(main_rx.is_empty());
 }
 
 /// A moved subagent's run can end while its call is out: a woken run follows,
@@ -12475,4 +11299,28 @@ fn a_session_opened_under_a_moved_call_works_once_it_runs() {
     );
 
     assert_eq!(app.chats[tab].task_status(), TaskStatus::Working);
+}
+
+const NOTICE_LINE: &str = "Background call ended";
+const NOTICE_BODY: &str = "Call detail";
+fn labelled_notice(text: &str) -> Message {
+    let mut message = Message::observation(NOTICE_BODY.into());
+    message.display_text = Some(text.into());
+    message
+}
+fn result_notice(
+    _: &(),
+    id: &str,
+    failed: bool,
+    stopped: bool,
+    output: &str,
+) -> (String, String, TaskEnd) {
+    let end = if stopped {
+        TaskEnd::Cancelled
+    } else if failed {
+        TaskEnd::Failed
+    } else {
+        TaskEnd::Finished
+    };
+    (output.into(), format!("{id} ended\n\n{output}"), end)
 }

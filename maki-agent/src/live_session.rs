@@ -1,4 +1,5 @@
 use std::collections::{HashMap, VecDeque};
+use std::path::Path;
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError, Weak};
 
 use arc_swap::ArcSwap;
@@ -12,7 +13,7 @@ use crate::agent::default_instruction_files;
 use crate::cancel::CancelToken;
 use crate::mcp::McpSession;
 use crate::permissions::PermissionManager;
-use crate::tools::registry::HeaderFuture;
+use crate::tools::registry::BoxFuture;
 use crate::tools::{BackgroundFor, FileAccess, ToolContext, ToolRegistry, interpreter_ctx};
 use crate::{AgentConfig, AgentMode, EventSender, ModelSlot, ToolOutputLines};
 
@@ -42,6 +43,7 @@ struct LiveSession {
     seed: Mutex<Weak<AgentSeed>>,
     /// Fires on every change a [`SessionMailbox::next_wake`] waiter waits for.
     changed: Event,
+    events: Mutex<Option<EventSender>>,
 }
 
 /// Besides the notices, it tracks every background receipt the model holds
@@ -81,7 +83,10 @@ impl TaskLabel {
     /// Names receipt `id` after its call in `history`. A plugin tool's header
     /// comes from the Lua thread, so it may still be on its way. Then it is
     /// handed back to wait for.
-    fn of_receipt(history: &[Message], id: &str) -> (Self, Option<HeaderFuture>) {
+    fn of_receipt(
+        history: &[Message],
+        id: &str,
+    ) -> (Self, Option<BoxFuture<'static, Option<String>>>) {
         let call = history
             .iter()
             .flat_map(Message::tool_uses)
@@ -89,10 +94,13 @@ impl TaskLabel {
         let Some((_, tool, input)) = call else {
             return (Self::new(LOST_TOOL, None), None);
         };
-        match ToolRegistry::global().start_header(tool, input) {
-            Some(HeaderFuture::Ready(header)) => (Self::new(tool, Some(&header.text())), None),
-            late => (Self::new(tool, None), late),
-        }
+        let summary = ToolRegistry::global()
+            .get(tool)
+            .and_then(|entry| entry.tool.parse(input).ok())
+            .map(|invocation| -> BoxFuture<'static, Option<String>> {
+                Box::pin(async move { invocation.start_summary().await })
+            });
+        (Self::new(tool, None), summary)
     }
 }
 
@@ -278,16 +286,19 @@ pub struct AgentSeed {
     /// at the built-in list and is swapped in by the owning loop's
     /// instruction reload.
     pub instruction_files: ArcSwap<Vec<String>>,
+    /// The session's working directory now: where the chat is when the seed
+    /// is made, moved by `/cd` and by each run, so background work runs
+    /// where the chat does.
+    working_dir: Mutex<Arc<Path>>,
     pub mcp: Option<McpSession>,
     pub timeouts: Timeouts,
     pub file_access: Arc<FileAccess>,
     pub model_policy: Arc<ModelPolicy>,
     /// The chat's thinking and whether it plans, as the user has them right
-    /// now. The UI keeps them fresh even before the first message, so
-    /// background work never thinks harder than the user asked. We keep a bool
-    /// and not the mode on purpose. Handed to a background run, the mode would
-    /// bring the plan prompt along, plus a free pass to write the plan file.
-    chat_settings: Mutex<(RequestOptions, bool)>,
+    /// now. The host keeps these fresh before the first message and uses them
+    /// for notified turns. Background sessions always run in build mode and
+    /// check `background_write_block` before changing files.
+    chat_settings: Mutex<(RequestOptions, AgentMode)>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -306,6 +317,29 @@ fn notice_label(text: &str) -> Option<String> {
 }
 
 impl SessionMailbox {
+    pub fn has_events(session: MakiId) -> bool {
+        lock(&LIVE_SESSIONS)
+            .get(&session)
+            .and_then(Weak::upgrade)
+            .is_some_and(|live| lock(&live.events).is_some())
+    }
+
+    pub fn publish_events(&self, events: EventSender) {
+        *lock(&self.live.events) = Some(events);
+    }
+
+    pub fn task_event(session: MakiId, plugin: Arc<str>, envelope: crate::Envelope) {
+        let live = lock(&LIVE_SESSIONS).get(&session).and_then(Weak::upgrade);
+        if let Some(live) = live
+            && let Some(events) = lock(&live.events).as_ref()
+        {
+            events.try_send(crate::AgentEvent::PluginTask {
+                plugin,
+                envelope: Box::new(envelope),
+            });
+        }
+    }
+
     pub fn register(session_id: MakiId) -> Self {
         let mut sessions = lock(&LIVE_SESSIONS);
         if let Some(live) = sessions.get(&session_id).and_then(Weak::upgrade) {
@@ -346,6 +380,16 @@ impl SessionMailbox {
 
     pub fn drain(&self) -> Vec<Message> {
         lock(&self.live.mailbox).take()
+    }
+
+    pub async fn wait_for_wake(&self) {
+        loop {
+            let notified = self.live.changed.listen();
+            if lock(&self.live.mailbox).wake {
+                return;
+            }
+            notified.await;
+        }
     }
 
     pub fn claim_wake(&self) -> Vec<Message> {
@@ -450,7 +494,7 @@ impl SessionMailbox {
         for (id, tool, header) in late {
             let mailbox = self.clone();
             tokio::spawn(async move {
-                let label = TaskLabel::new(&tool, Some(&header.await.text()));
+                let label = TaskLabel::new(&tool, header.await.as_deref());
                 mailbox.change(|state| state.relabel_lost(&id, &label));
             });
         }
@@ -470,7 +514,7 @@ impl SessionMailbox {
     /// is outstanding. `None` once nothing is out and nothing woke: quiet
     /// notices stay queued for whatever run comes next.
     pub async fn next_wake(&self) -> Option<Vec<Message>> {
-        self.wait_for_wake(false).await
+        self.wait_until_settled(false).await
     }
 
     /// [`Self::next_wake`] for an agent whose caller waits on its answer.
@@ -478,10 +522,10 @@ impl SessionMailbox {
     /// like the cut output of a call the user stopped, so that is its last
     /// wake.
     pub async fn next_wake_before_answer(&self) -> Option<Vec<Message>> {
-        self.wait_for_wake(true).await
+        self.wait_until_settled(true).await
     }
 
-    async fn wait_for_wake(&self, take_quiet: bool) -> Option<Vec<Message>> {
+    async fn wait_until_settled(&self, take_quiet: bool) -> Option<Vec<Message>> {
         loop {
             let listener = self.live.changed.listen();
             {
@@ -512,7 +556,7 @@ impl SessionMailbox {
     pub fn publish_seed(&self, mut seed: AgentSeed) -> Arc<AgentSeed> {
         let mut published = lock(&self.live.seed);
         if let Some(previous) = published.upgrade() {
-            *lock(&seed.chat_settings) = *lock(&previous.chat_settings);
+            *lock(&seed.chat_settings) = lock(&previous.chat_settings).clone();
             seed.file_access = previous.file_access.sharing_locks();
         }
         let seed = Arc::new(seed);
@@ -550,6 +594,7 @@ impl AgentSeed {
         config: AgentConfig,
         tool_output_lines: ToolOutputLines,
         permissions: Arc<PermissionManager>,
+        working_dir: Arc<Path>,
         mcp: Option<McpSession>,
         timeouts: Timeouts,
         model_policy: Arc<ModelPolicy>,
@@ -559,6 +604,7 @@ impl AgentSeed {
             model_slot,
             config,
             tool_output_lines,
+            working_dir: Mutex::new(working_dir),
             permissions,
             mcp,
             timeouts,
@@ -577,11 +623,26 @@ impl AgentSeed {
     }
 
     pub fn set_chat_settings(&self, opts: RequestOptions, mode: &AgentMode) {
-        *lock(&self.chat_settings) = (opts, mode.plan_path().is_some());
+        *lock(&self.chat_settings) = (opts, mode.clone());
     }
 
     pub fn chat_opts(&self) -> RequestOptions {
         lock(&self.chat_settings).0
+    }
+
+    pub fn chat_mode(&self) -> AgentMode {
+        lock(&self.chat_settings).1.clone()
+    }
+
+    pub fn set_working_dir(&self, dir: &Path) {
+        let mut working_dir = lock(&self.working_dir);
+        if **working_dir != *dir {
+            *working_dir = Arc::from(dir);
+        }
+    }
+
+    pub fn working_dir(&self) -> Arc<Path> {
+        Arc::clone(&lock(&self.working_dir))
     }
 
     /// Why background work for `chat` may not change a file right now.
@@ -594,7 +655,7 @@ impl AgentSeed {
         let Some(seed) = Self::live(chat) else {
             return Some(MailboxError(chat).to_string());
         };
-        let (_, planning) = *lock(&seed.chat_settings);
+        let planning = lock(&seed.chat_settings).1.plan_path().is_some();
         planning.then(|| BACKGROUND_PLAN_WRITE_DENIED.to_owned())
     }
 
@@ -616,6 +677,7 @@ impl AgentSeed {
             opts: self.chat_opts(),
             model_policy: Arc::clone(&self.model_policy),
             instruction_files: self.instruction_files.load_full(),
+            working_dir: self.working_dir(),
             ..interpreter_ctx(
                 &AgentMode::Build,
                 &EventSender::new(sink, UNATTENDED_RUN_ID),

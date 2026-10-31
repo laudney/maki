@@ -17,7 +17,7 @@ use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 use std::thread;
 
 use flume::{Receiver, Sender};
-use maki_agent::UiWaker;
+use maki_types::snapshot::UiWaker;
 
 const PARSE_THREAD: &str = "input-parse";
 

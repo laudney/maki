@@ -1,0 +1,47 @@
+[package]
+name = "maki-lua-ui"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+test-support = ["maki-lua-core/test-support"]
+
+[dependencies]
+unicode-width = { workspace = true }
+maki-markdown = { workspace = true }
+maki-highlight = { workspace = true }
+arc-swap = { workspace = true }
+crossterm = { workspace = true }
+flume = { workspace = true }
+futures = { workspace = true }
+futures-lite = { workspace = true }
+include_dir = { workspace = true }
+maki-config = { workspace = true }
+maki-lua-core = { workspace = true }
+maki-lua-macro = { workspace = true }
+maki-storage = { workspace = true }
+maki-types = { workspace = true }
+mlua = { workspace = true }
+regex = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+strum = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tree-sitter = { workspace = true }
+tree-sitter-lua = { workspace = true }
+
+[dev-dependencies]
+fastrand = { workspace = true }
+maki-config = { workspace = true, features = ["test-util"] }
+maki-lua-core = { workspace = true, features = ["test-support"] }
+tempfile = { workspace = true }
+test-case = { workspace = true }
+
+[lints]
+workspace = true

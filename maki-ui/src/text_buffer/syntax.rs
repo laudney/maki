@@ -19,7 +19,7 @@ use std::ops::{Range, RangeInclusive};
 use std::sync::Arc;
 
 use flume::{Receiver, TryRecvError};
-use maki_lua::{SyntaxDoc, SyntaxEdit, SyntaxIndex, SyntaxInput};
+use maki_lua_ui::{SyntaxDoc, SyntaxEdit, SyntaxIndex, SyntaxInput};
 
 use super::Change;
 use super::marks::{Placed, remap};
@@ -238,8 +238,8 @@ fn map_back<'a>(
 mod tests {
     use std::sync::Arc;
 
-    use maki_agent::SpanStyle;
-    use maki_lua::{SyntaxInput, SyntaxRule};
+    use maki_lua_ui::{SyntaxInput, SyntaxRule};
+    use maki_types::snapshot::SpanStyle;
     use test_case::test_case;
 
     use super::{State, SyntaxMarks, SyntaxRules};

@@ -782,7 +782,7 @@ case("a_walk_that_lands_for_a_closed_popup_repaints_nothing", function()
   eq(h.subscriptions, 1)
 end)
 
--- `init.lua` is wiring; every decision it makes lives in `events.lua`, which
+-- `ui.lua` is wiring; every decision it makes lives in `events.lua`, which
 -- is what these exercise.
 
 case("events_ignore_this_plugins_own_edit", function()

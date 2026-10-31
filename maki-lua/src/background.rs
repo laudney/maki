@@ -24,7 +24,6 @@ use serde::Serialize;
 use tokio::time::{Instant, timeout_at};
 
 use crate::api::session::not_live;
-use crate::api::util::command::UiAction;
 
 pub(crate) const NONE_RUNNING: &str = "none running";
 pub(crate) const NO_RUNNING_TASK: &str = "no running background task";
@@ -191,20 +190,14 @@ pub(crate) struct BackgroundInfo {
 pub(crate) struct MovedEnd {
     registry: BackgroundTasks,
     id: String,
-    ui: Option<flume::Sender<UiAction>>,
     landed: bool,
 }
 
 impl MovedEnd {
-    pub(crate) fn new(
-        registry: BackgroundTasks,
-        id: String,
-        ui: Option<flume::Sender<UiAction>>,
-    ) -> Self {
+    pub(crate) fn new(registry: BackgroundTasks, id: String) -> Self {
         Self {
             registry,
             id,
-            ui,
             landed: false,
         }
     }
@@ -213,20 +206,23 @@ impl MovedEnd {
     /// tab. Only the one that settles the receipt tells it, so it hears once.
     pub(crate) fn land(mut self, done: Option<ToolDoneEvent>) {
         self.landed = true;
-        let ui = self.ui.take();
         let Some(done) = done else {
-            if let Some(session) = self.registry.lose(&self.id)
-                && let Some(ui) = ui
+            let target = self.registry.target(&self.id);
+            if self.registry.lose(&self.id).is_some()
+                && let Some((session, plugin)) = target
             {
-                let _ = ui.try_send(UiAction::PluginTaskEnded {
+                task_event(
                     session,
-                    id: self.id.clone(),
-                    end: TaskEnd::Lost,
-                });
+                    plugin,
+                    AgentEvent::TaskEnded {
+                        id: self.id.clone(),
+                        end: TaskEnd::Lost,
+                    },
+                );
             }
             return;
         };
-        self.registry.deliver(&self.id, done, ui);
+        self.registry.deliver(&self.id, done);
     }
 }
 
@@ -263,6 +259,18 @@ fn no_running_task_err(id: &str, running: &[String]) -> String {
         format!("{RUNNING_LIST} {}", running.join(", "))
     };
     format!("{NO_RUNNING_TASK} {id}; {running}")
+}
+
+fn task_event(session: MakiId, plugin: Arc<str>, event: AgentEvent) {
+    SessionMailbox::task_event(
+        session,
+        plugin,
+        Envelope {
+            event,
+            subagent: None,
+            run_id: TASK_EVENT_RUN_ID,
+        },
+    );
 }
 
 impl BackgroundTasks {
@@ -389,12 +397,7 @@ impl BackgroundTasks {
     /// `task_stop` that is waiting takes the output instead of the run
     /// getting a notice. Needs no Lua host, so it can land after the host
     /// died.
-    pub(crate) fn deliver(
-        &self,
-        id: &str,
-        done: ToolDoneEvent,
-        ui: Option<flume::Sender<UiAction>>,
-    ) {
+    pub(crate) fn deliver(&self, id: &str, done: ToolDoneEvent) {
         let Some(task) = self.take(id) else {
             tracing::debug!(id, "final reply of a background task that already settled");
             return;
@@ -416,31 +419,29 @@ impl BackgroundTasks {
                 );
             }
         }
-        if let Some(ui) = ui {
-            // A killed process usually exits with an error, so the tab hears
-            // of the stop first and ends cancelled, not failed.
-            if task.stop.get() != Stop::None {
-                let _ = ui.try_send(UiAction::PluginTaskEnded {
-                    session: task.session,
+        if task.stop.get() != Stop::None {
+            task_event(
+                task.session,
+                Arc::clone(&task.info.plugin),
+                AgentEvent::TaskEnded {
                     id: id.to_owned(),
                     end: TaskEnd::Cancelled,
-                });
-            }
-            for event in [
-                AgentEvent::ToolDone(Box::new(done)),
-                AgentEvent::StreamClosed,
-            ] {
-                let _ = ui.try_send(UiAction::PluginTaskEvent {
-                    session: task.session,
-                    plugin: Arc::clone(&task.info.plugin),
-                    envelope: Box::new(Envelope {
-                        event,
-                        subagent: None,
-                        run_id: TASK_EVENT_RUN_ID,
-                    }),
-                });
-            }
+                },
+            );
         }
+        for event in [
+            AgentEvent::ToolDone(Box::new(done)),
+            AgentEvent::StreamClosed,
+        ] {
+            task_event(task.session, Arc::clone(&task.info.plugin), event);
+        }
+    }
+
+    fn target(&self, id: &str) -> Option<(MakiId, Arc<str>)> {
+        self.locked()
+            .iter()
+            .find(|entry| entry.info.id == id)
+            .map(|entry| (entry.session, Arc::clone(&entry.info.plugin)))
     }
 
     /// Marks the final reply of moved call `id` as existing, so a host dying
@@ -607,7 +608,26 @@ pub(crate) mod tests {
     use test_case::test_case;
 
     use super::*;
-    use crate::runtime::{TaskCell, TaskScope, lock_cell};
+    use crate::domain::Domain;
+    use crate::domains::test_support::domains;
+
+    use crate::runtime::{TaskCell, TaskScope, install_task_domain, lock_cell};
+
+    fn watch_tasks(session: MakiId) -> flume::Receiver<Envelope> {
+        let (tx, rx) = flume::unbounded();
+        SessionMailbox::open(session)
+            .unwrap()
+            .publish_events(maki_agent::EventSender::new(tx, 0));
+        rx
+    }
+
+    fn task_payload(envelope: Envelope) -> AgentEvent {
+        let AgentEvent::PluginTask { plugin, envelope } = envelope.event else {
+            panic!("{NOT_A_TASK_EVENT}");
+        };
+        assert_eq!(&*plugin, PLUGIN);
+        envelope.event
+    }
 
     const PLUGIN: &str = "monitor";
     const TOOL: &str = "bash";
@@ -682,10 +702,12 @@ pub(crate) mod tests {
     #[test]
     fn task_end_retires_task_scope_and_plugin_unload_retires_the_rest() {
         let lua = Lua::new();
+        let domains: Arc<dyn Domain> = domains().into();
+        install_task_domain(&lua, &domains);
         let registry = BackgroundTasks::of(&lua);
         let session = MakiId::generate();
         let _live = live(session);
-        let scope = TaskScope::new(&lua, TaskCell::new(CancelToken::none(), None, None));
+        let scope = TaskScope::new(&lua, TaskCell::new(CancelToken::none(), None));
         let task = lock_cell(scope.handle()).id;
         let (opened, token) = entry(session, Some(task));
         let (kept, kept_token) = entry(session, None);
@@ -748,6 +770,7 @@ pub(crate) mod tests {
             written_path: None,
             call: None,
             backgrounded: false,
+            data: None,
         }
     }
 
@@ -829,7 +852,7 @@ pub(crate) mod tests {
             assert!(registry.contains(CALL_ID), "{KEPT_UNTIL_DELIVER}");
         }
 
-        registry.deliver(CALL_ID, done(OUTPUT, is_error), None);
+        registry.deliver(CALL_ID, done(OUTPUT, is_error));
 
         let woken = mailbox.claim_wake();
         let notices = if wakes {
@@ -861,25 +884,11 @@ pub(crate) mod tests {
         let session = MakiId::generate();
         let _live = live(session);
         let (registry, ..) = registry_with_call(session);
-        let (tx, rx) = flume::unbounded();
+        let rx = watch_tasks(session);
 
-        registry.deliver(CALL_ID, done(OUTPUT, false), Some(tx));
+        registry.deliver(CALL_ID, done(OUTPUT, false));
 
-        let events: Vec<_> = rx
-            .try_iter()
-            .map(|action| {
-                let UiAction::PluginTaskEvent {
-                    session: chat,
-                    plugin,
-                    envelope,
-                } = action
-                else {
-                    panic!("{NOT_A_TASK_EVENT}");
-                };
-                assert_eq!((chat, &*plugin), (session, PLUGIN));
-                envelope.event
-            })
-            .collect();
+        let events: Vec<_> = rx.try_iter().map(task_payload).collect();
         assert_eq!(events.len(), 2);
         assert!(matches!(&events[0], AgentEvent::ToolDone(done) if done.id == CALL_ID));
         assert!(matches!(events[1], AgentEvent::StreamClosed));
@@ -891,19 +900,19 @@ pub(crate) mod tests {
         let session = MakiId::generate();
         let _live = live(session);
         let (registry, ..) = registry_with_call(session);
-        let (tx, rx) = flume::unbounded();
+        let rx = watch_tasks(session);
         registry.stop(CALL_ID, stop);
 
-        registry.deliver(CALL_ID, done(OUTPUT, true), Some(tx));
+        registry.deliver(CALL_ID, done(OUTPUT, true));
 
-        let first = rx.try_recv().expect("the tab hears of the stop");
+        let first = task_payload(rx.try_recv().expect("the tab hears of the stop"));
         assert!(matches!(
             first,
-            UiAction::PluginTaskEnded { session: chat, id, end: TaskEnd::Cancelled } if chat == session && id == CALL_ID
+            AgentEvent::TaskEnded { id, end: TaskEnd::Cancelled } if id == CALL_ID
         ));
         assert!(matches!(
-            rx.try_recv(),
-            Ok(UiAction::PluginTaskEvent { envelope, .. }) if matches!(envelope.event, AgentEvent::ToolDone(_))
+            rx.try_recv().map(task_payload),
+            Ok(AgentEvent::ToolDone(_))
         ));
     }
 
@@ -915,7 +924,7 @@ pub(crate) mod tests {
 
         let (stopped, ()) = tokio::join!(
             registry.stop_by_model(Some(session), CALL_ID, FOREVER),
-            async { registry.deliver(CALL_ID, done(OUTPUT, true), None) },
+            async { registry.deliver(CALL_ID, done(OUTPUT, true)) },
         );
 
         assert_eq!(stopped.map(|stop| stop.output), Ok(Some(OUTPUT.to_owned())));
@@ -939,7 +948,7 @@ pub(crate) mod tests {
         assert_eq!(stopped.map(|stop| stop.output), Ok(None));
         assert!(registry.contains(CALL_ID));
 
-        registry.deliver(CALL_ID, done(OUTPUT, true), None);
+        registry.deliver(CALL_ID, done(OUTPUT, true));
 
         assert!(mailbox.claim_wake().is_empty());
         let notices = mailbox.drain();
@@ -954,7 +963,7 @@ pub(crate) mod tests {
         let (registry, ..) = registry_with_call(session);
         drop(registry.begin_model_stop(Some(session), CALL_ID).unwrap());
 
-        registry.deliver(CALL_ID, done(OUTPUT, false), None);
+        registry.deliver(CALL_ID, done(OUTPUT, false));
 
         assert_eq!(mailbox.drain().len(), 1);
     }
@@ -1034,7 +1043,7 @@ pub(crate) mod tests {
         let session = MakiId::generate();
         let (mailbox, _seed) = live(session);
         let (registry, token, mark) = registry_with_call(session);
-        let (tx, rx) = flume::unbounded();
+        let rx = watch_tasks(session);
 
         match retire {
             Retire::Session => registry.end_session(session),
@@ -1045,14 +1054,15 @@ pub(crate) mod tests {
         assert_eq!(mark.get(), Stop::User);
         assert!(registry.contains(CALL_ID), "{KEPT_UNTIL_DELIVER}");
 
-        registry.deliver(CALL_ID, done(OUTPUT, true), Some(tx));
+        registry.deliver(CALL_ID, done(OUTPUT, true));
 
         assert!(!registry.contains(CALL_ID));
         assert!(mailbox.claim_wake().is_empty());
         assert_eq!(mailbox.drain().len(), 1);
         let tab_events = rx
             .try_iter()
-            .filter(|action| matches!(action, UiAction::PluginTaskEvent { .. }))
+            .map(task_payload)
+            .filter(|event| !matches!(event, AgentEvent::TaskEnded { .. }))
             .count();
         assert_eq!(tab_events, 2, "{TAB_CLOSED}");
     }
@@ -1097,7 +1107,7 @@ pub(crate) mod tests {
         assert!(registry.contains(CALL_ID));
         assert_eq!(mailbox.outstanding(), 1);
 
-        registry.deliver(CALL_ID, done(OUTPUT, false), None);
+        registry.deliver(CALL_ID, done(OUTPUT, false));
 
         assert!(!registry.contains(CALL_ID));
         assert!(delivered_output(&mailbox));
@@ -1124,7 +1134,7 @@ pub(crate) mod tests {
         let session = MakiId::generate();
         let (mailbox, _seed) = live(session);
         let (registry, token, _) = registry_with_call(session);
-        let end = MovedEnd::new(registry.clone(), CALL_ID.to_owned(), None);
+        let end = MovedEnd::new(registry.clone(), CALL_ID.to_owned());
         let finish = move || match ending {
             Ending::Delivered => end.land(Some(done(OUTPUT, false))),
             Ending::Lost => end.land(None),
@@ -1159,18 +1169,17 @@ pub(crate) mod tests {
         let session = MakiId::generate();
         let _live = live(session);
         let (registry, ..) = registry_with_call(session);
-        let (tx, rx) = flume::unbounded();
+        let rx = watch_tasks(session);
         if !settles_it {
             registry.lose_all();
         }
 
-        MovedEnd::new(registry, CALL_ID.to_owned(), Some(tx)).land(None);
+        MovedEnd::new(registry, CALL_ID.to_owned()).land(None);
 
-        let told = rx.try_iter().any(|action| {
+        let told = rx.try_iter().map(task_payload).any(|action| {
             matches!(
                 action,
-                UiAction::PluginTaskEnded { session: chat, id, end: TaskEnd::Lost }
-                    if chat == session && id == CALL_ID
+                AgentEvent::TaskEnded { id, end: TaskEnd::Lost } if id == CALL_ID
             )
         });
         assert_eq!(told, settles_it);

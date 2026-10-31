@@ -12,7 +12,7 @@ use maki_agent::permissions::PermissionManager;
 use maki_agent::tools::ToolRegistry;
 use maki_agent::{AgentEvent, CancelToken, PermissionsConfig, SessionMailbox, ToolDoneEvent};
 use maki_config::ProjectConfig;
-use maki_lua::{MoveOutcome, Permission, PluginHost, PluginPermissions, UiAction};
+use maki_lua::{MoveOutcome, Permission, PluginHost, PluginPermissions};
 use maki_providers::ContentBlock;
 use maki_storage::id::MakiId;
 use serde_json::{Value, json};
@@ -105,14 +105,11 @@ maki.api.register_tool({
 struct Host {
     reg: Arc<ToolRegistry>,
     host: PluginHost,
-    ui: flume::Receiver<UiAction>,
 }
 
 impl Host {
     fn attached(reg: Arc<ToolRegistry>, host: PluginHost) -> Self {
-        host.ui_attachment().attach();
-        let ui = host.ui_action_rx();
-        Self { reg, host, ui }
+        Self { reg, host }
     }
 
     /// The real task plugin with `background` exposed.
@@ -149,15 +146,15 @@ impl Host {
     }
 
     /// The final reply of the moved call, as its task tab gets it.
-    fn task_done(&self) -> ToolDoneEvent {
-        self.task_dones(&[CALL_ID]).remove(0)
+    fn task_done(&self, chat: &Chat) -> ToolDoneEvent {
+        self.task_dones(chat, &[CALL_ID]).remove(0)
     }
 
     /// The final replies of {ids}, in that order, whichever ends first.
-    fn task_dones(&self, ids: &[&str]) -> Vec<ToolDoneEvent> {
+    fn task_dones(&self, chat: &Chat, ids: &[&str]) -> Vec<ToolDoneEvent> {
         let mut found: Vec<Option<ToolDoneEvent>> = ids.iter().map(|_| None).collect();
         while found.iter().any(Option::is_none) {
-            let envelope = next_task_event(&self.ui);
+            let envelope = next_task_event(&chat.events);
             if let (AgentEvent::ToolDone(done), None) = (envelope.event, envelope.subagent)
                 && let Some(slot) = ids.iter().position(|id| *id == done.id)
             {
@@ -168,9 +165,9 @@ impl Host {
     }
 
     /// Waits for the moved subagent to ask the user, failing if it ends first.
-    fn wait_permission_request(&self) {
+    fn wait_permission_request(&self, chat: &Chat) {
         loop {
-            let envelope = next_task_event(&self.ui);
+            let envelope = next_task_event(&chat.events);
             match (envelope.event, envelope.subagent) {
                 (AgentEvent::PermissionRequest { .. }, _) => return,
                 (AgentEvent::ToolDone(done), None) if done.id == CALL_ID => {
@@ -246,7 +243,10 @@ fn a_background_task_returns_a_receipt_and_its_reply_arrives_as_the_notice() {
 
     parked.wait_started();
     parked.release.send(()).unwrap();
-    assert_eq!(done_text(&host.task_done()), (RESULT.to_owned(), false));
+    assert_eq!(
+        done_text(&host.task_done(&chat)),
+        (RESULT.to_owned(), false)
+    );
     let notices = chat.mailbox.drain();
     assert_eq!(notices.len(), 1);
     let notice = notices[0].first_text_content().unwrap();
@@ -289,7 +289,7 @@ fn a_background_task_waiting_for_a_slot_returns_its_receipt_at_once() {
 
     parked.release.send(()).unwrap();
     parked.release.send(()).unwrap();
-    for done in host.task_dones(&[CALL_ID, SECOND_CALL_ID]) {
+    for done in host.task_dones(&chat, &[CALL_ID, SECOND_CALL_ID]) {
         assert_eq!(done_text(&done), (RESULT.to_owned(), false));
     }
 }
@@ -327,9 +327,9 @@ fn a_background_subagent_asks_for_permission_instead_of_being_denied() {
 
     assert!(exec(&reg, TASK_TOOL, task_input(), &ctx).backgrounded);
 
-    host.wait_permission_request();
-    host.host.event_handle().cancel_plugin_session(CALL_ID);
-    host.task_done();
+    host.wait_permission_request(&chat);
+    host.host.agent_handle().cancel_plugin_session(CALL_ID);
+    host.task_done(&chat);
 }
 
 /// Moving itself makes the result wake the chat, the price of
@@ -350,7 +350,7 @@ fn ctx_background_needs_the_agent_permission(agent: bool) {
     if agent {
         assert!(reply.starts_with(MOVER_RECEIPT), "{reply}");
         assert_eq!(
-            done_text(&host.task_done()),
+            done_text(&host.task_done(&chat)),
             (MOVER_FINAL.to_owned(), false)
         );
     } else {
@@ -461,7 +461,10 @@ fn a_message_reaches_a_running_background_task_at_its_next_turn() {
         "{interrupt}"
     );
     parked.release.send(()).unwrap();
-    assert_eq!(done_text(&host.task_done()), (RESULT.to_owned(), false));
+    assert_eq!(
+        done_text(&host.task_done(&chat)),
+        (RESULT.to_owned(), false)
+    );
     assert_refused(&host, chat.id, CALL_ID);
 }
 
@@ -491,7 +494,7 @@ fn a_message_to_a_task_waiting_for_a_slot_rides_with_its_first_prompt() {
     parked.release.send(()).unwrap();
     let turns: Vec<_> = parked.user_turns.drain().collect();
     assert_eq!(turns, [vec![PROMPT], vec![MESSAGE, PROMPT]]);
-    host.task_dones(&[CALL_ID, SECOND_CALL_ID]);
+    host.task_dones(&chat, &[CALL_ID, SECOND_CALL_ID]);
 }
 
 /// A user stop does not wait for the task to end, and the message must not
@@ -508,9 +511,9 @@ fn a_message_is_refused_by_a_task_the_user_just_stopped() {
     assert!(exec(&host.reg, TASK_TOOL, task_input(), &ctx).backgrounded);
     parked.wait_started();
 
-    host.host.event_handle().cancel_plugin_session(CALL_ID);
+    host.host.agent_handle().cancel_plugin_session(CALL_ID);
     assert_refused(&host, chat.id, CALL_ID);
-    host.task_done();
+    host.task_done(&chat);
 }
 
 /// Only the chat that started a task reaches it.
@@ -558,7 +561,7 @@ fn a_task_moved_without_allow_background_has_no_message_tool_and_still_reports()
     });
     parked.wait_started();
     assert_eq!(
-        request_move(&host.host.event_handle(), CALL_ID),
+        request_move(&host.host.agent_handle(), CALL_ID),
         MoveOutcome::Moved
     );
     let result = call.join().expect("task call");
@@ -566,5 +569,8 @@ fn a_task_moved_without_allow_background_has_no_message_tool_and_still_reports()
     assert!(done_text(&result).0.starts_with(MOVED_RECEIPT));
 
     parked.release.send(()).unwrap();
-    assert_eq!(done_text(&host.task_done()), (RESULT.to_owned(), false));
+    assert_eq!(
+        done_text(&host.task_done(&chat)),
+        (RESULT.to_owned(), false)
+    );
 }

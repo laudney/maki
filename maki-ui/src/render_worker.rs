@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::components::code_view::{self, RenderLimits};
-use maki_agent::{ToolInput, ToolOutput};
+use maki_types::tool::{ToolInput, ToolOutput};
 use ratatui::text::Line;
 
 pub struct RenderResult {

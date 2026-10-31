@@ -3,9 +3,9 @@ use super::{BackgroundBadge, BackgroundOutcome, DisplayMessage, ToolStatus};
 use super::code_view;
 use crate::animation::{spinner_frame, spinner_str};
 use crate::theme;
-use code_view::RenderLimits;
-use code_view::SectionFlags;
+use code_view::{RenderLimits, SectionFlags};
 use maki_config::{ClockFormat, ToolOutputLines};
+use maki_wire::sanitize::sanitize_display;
 
 use std::borrow::Cow;
 use std::fmt::Write;
@@ -19,10 +19,9 @@ use jiff::Timestamp;
 use jiff::tz::TimeZone;
 
 use crate::markdown::{should_truncate, text_to_lines, truncate_output, truncation_notice};
-use maki_agent::tools::is_timeout_annotation;
-use maki_agent::{
-    BufferSnapshot, InstructionBlock, SnapshotSpan, SpanColor, SpanStyle, ToolInput, ToolOutput,
-};
+use maki_types::snapshot::{BufferSnapshot, SnapshotSpan, SpanColor, SpanStyle};
+use maki_types::tool::is_timeout_annotation;
+use maki_types::tool::{InstructionBlock, ToolInput, ToolOutput};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
@@ -980,6 +979,16 @@ fn plain_output_text(output: &ToolOutput) -> Option<&str> {
     }
 }
 
+/// Strips what a terminal would act on rather than show from every span.
+/// Only a span that holds any is copied.
+pub(crate) fn sanitize_lines(lines: &mut [Line<'static>]) {
+    for span in lines.iter_mut().flat_map(|line| line.spans.iter_mut()) {
+        if let Cow::Owned(clean) = sanitize_display(&span.content) {
+            span.content = Cow::Owned(clean);
+        }
+    }
+}
+
 pub fn truncate_to_header(text: &mut String) {
     let end = text.find('\n').unwrap_or(text.len());
     text.truncate(end);
@@ -1051,9 +1060,10 @@ mod tests {
     const TOL: ToolOutputLines = ToolOutputLines::DEFAULT;
     use crate::components::{DisplayRole, ToolRole};
     use crate::markdown::TRUNCATION_PREFIX;
-    use maki_agent::tools::{BASH_TOOL_NAME, READ_TOOL_NAME, TASK_TOOL_NAME};
-    use maki_agent::types::{DefaultColor, InlineStyle};
-    use maki_agent::{SnapshotLine, SnapshotSpan, TextOutput, ToolInput, ToolOutput};
+    use maki_types::snapshot::{DefaultColor, InlineStyle};
+    use maki_types::snapshot::{SnapshotLine, SnapshotSpan};
+    use maki_types::tool::{BASH_TOOL_NAME, READ_TOOL_NAME, TASK_TOOL_NAME};
+    use maki_types::tool::{TextOutput, ToolInput, ToolOutput};
     use test_case::test_case;
 
     fn test_rctx(width: u16) -> RenderCtx<'static> {

@@ -7,63 +7,51 @@ use std::time::Duration;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use flume::Sender;
-use maki_agent::agent::tool_dispatch::routed_view;
 use maki_agent::permissions::is_universal_scope;
 use maki_agent::prompt::{PromptId, Slot, SlotKind, ValidNames};
 use maki_agent::tools::Tool;
 use maki_agent::tools::registry::{RegisteredTool, ToolRegistry};
 use maki_agent::tools::schema::{ParamSchema, to_json_schema, try_from_json, validate};
 use maki_agent::tools::{
-    BoxFuture, DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, MovedCall, ParseError,
-    PermissionScopes, ToolAudience, ToolContext, ToolExecResult, ToolFilter, ToolInvocation,
-    ToolReach, is_tool_enabled, timeout_annotation,
+    BoxFuture, DescriptionContext, ExecFuture, MovedCall, ParseError, PermissionScopes,
+    ToolAudience, ToolContext, ToolExecResult, ToolFilter, ToolInvocation, ToolReach,
+    is_tool_enabled, timeout_annotation,
 };
-use maki_agent::{
-    AgentEvent, BufferSnapshot, CallScope, ImageMediaType, ImageSource, SharedBuf, TextOutput,
-    ToolOutput,
-};
-use maki_config::{Effect, PermissionRule, ToolKey, ToolOutputLines};
+use maki_agent::{CallScope, ImageMediaType, ImageSource, TextOutput, ToolOutput};
+use maki_config::{Effect, PermissionRule, ToolKey};
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{
-    Function, Lua, LuaSerdeExt, LuaString, MultiValue, RegistryKey, Result as LuaResult, Table,
+    Function, Lua, LuaSerdeExt, LuaString, RegistryKey, Result as LuaResult, Table,
     Value as LuaValue,
 };
 use serde_json::{Value, json};
 use tokio::time::sleep;
 
 use crate::api::image::LuaImage;
-use crate::api::options::{PluginOpts, register_options__doc, register_options__register};
-use crate::api::ui::buf::{BufHandle, line_to_lua};
-use crate::api::util::command::{
-    CommandEntry, CommandHandlerMap, LuaCommandWriter, UiAction, publish_command_snapshot,
-    ui_roundtrip,
+use crate::api::util::convert::{TableExt, json_to_lua};
+use crate::api::util::ctx::LuaCtx;
+use crate::domains::agent::{
+    CallTool, ComputePermissionScopes, ComputeSummary, Describe, HintContent, PromptHintCallbacks,
+    PromptHintRegistration, PromptTarget,
 };
-use crate::api::util::convert::{TableExt, json_to_lua, lua_to_json};
-use crate::api::util::ctx::{LuaCtx, RestoreCtx};
-use crate::api::util::pair::{Pair, try_pair};
 use crate::plugin_permissions::{
-    MANIFEST_FILE, Permission, PluginPermissions, PluginReach, require,
+    MANIFEST_FILE, Permission, PluginPermissions, PluginReach, permission_keys, require,
 };
-use crate::runtime::{
-    HintContent, Lineage, LiveCtx, PromptHintCallbacks, PromptHintRegistration, PromptTarget,
-    Request,
-};
+use crate::runtime::Request;
 
 const TOOL_NAME_MAX: usize = 64;
 const TOOL_HANDLER_RETURN_ERR: &str =
     "tool handler must return string or {output=string, is_error?=bool}";
 const TIMEOUT_PARSE_ERR: &str = "register_tool: 'timeout' must be a positive number, 0, or false";
-const NARGS_ERR: &str = r#"register_command: 'nargs' must be 0, 1, "?", "*", or "+""#;
 const PERMISSION_RULE_KEYS: &[&str] = &["tool", "scope", "effect"];
 const MAX_HINT_CONTENT_SIZE: usize = 1024 * 1024;
 const DESCRIBE_TIMEOUT: Duration = Duration::from_secs(3);
-const PLAIN_HEADER_STYLE: &str = "tool";
 
+/// Lives on the Lua runtime thread only. Sending a `Describe` request from
+/// that same thread would self-deadlock, so we resolve in-thread instead.
 type DescribeFn = Box<dyn Fn(&str, &str, &Value) -> Option<String>>;
 
 thread_local! {
-    /// Lives on the Lua runtime thread only. Calling `Request::Describe` from
-    /// that same thread would self-deadlock, so we resolve in-thread instead.
     static LOCAL_DESCRIBE: RefCell<Option<DescribeFn>> = const { RefCell::new(None) };
 }
 
@@ -73,21 +61,6 @@ pub(crate) fn set_local_describe(f: impl Fn(&str, &str, &Value) -> Option<String
 
 fn local_describe(plugin: &str, tool: &str, dctx: &Value) -> Option<Option<String>> {
     LOCAL_DESCRIBE.with(|c| c.borrow().as_ref().map(|f| f(plugin, tool, dctx)))
-}
-
-type ToolHandles = (Option<Function>, Option<Function>);
-type ToolHandlesFn = Box<dyn Fn(&str) -> Option<ToolHandles>>;
-
-thread_local! {
-    static LOCAL_TOOL_HANDLES: RefCell<Option<ToolHandlesFn>> = const { RefCell::new(None) };
-}
-
-pub(crate) fn set_local_tool_handles(f: impl Fn(&str) -> Option<ToolHandles> + 'static) {
-    LOCAL_TOOL_HANDLES.with(|c| *c.borrow_mut() = Some(Box::new(f)));
-}
-
-fn local_tool_handles(tool: &str) -> Option<ToolHandles> {
-    LOCAL_TOOL_HANDLES.with(|c| c.borrow().as_ref().and_then(|f| f(tool)))
 }
 
 fn dctx_json(ctx: &DescriptionContext) -> Value {
@@ -188,15 +161,13 @@ pub(crate) struct PendingTool {
     pub(crate) audience: ToolAudience,
     pub(crate) kind: Option<Arc<str>>,
     pub(crate) handler_key: RegistryKey,
-    pub(crate) header_key: Option<RegistryKey>,
-    pub(crate) restore_key: Option<RegistryKey>,
-    pub(crate) start_key: Option<RegistryKey>,
     pub(crate) permission: Option<ToolPermission<PermissionScopeSpec>>,
     pub(crate) mutable_path_field: Option<Arc<str>>,
     pub(crate) timeout: Option<Duration>,
     pub(crate) start_annotation: Option<StartAnnotation>,
     pub(crate) examples: Option<Value>,
     pub(crate) describe_key: Option<RegistryKey>,
+    pub(crate) summary_key: Option<RegistryKey>,
     pub(crate) background_only: BackgroundOnly,
 }
 
@@ -206,10 +177,8 @@ impl PendingTool {
     pub(crate) fn registry_keys(self) -> impl Iterator<Item = RegistryKey> {
         [
             Some(self.handler_key),
-            self.header_key,
-            self.restore_key,
-            self.start_key,
             self.describe_key,
+            self.summary_key,
             self.permission.and_then(|p| p.scopes?.callback_key()),
         ]
         .into_iter()
@@ -243,14 +212,13 @@ pub(crate) struct LuaTool {
     pub(crate) kind: Option<Arc<str>>,
     pub(crate) tx: Sender<Request>,
     pub(crate) plugin: Arc<str>,
-    pub(crate) has_header_fn: bool,
-    pub(crate) has_start_fn: bool,
     pub(crate) permission: Option<ToolPermission<PermissionScopeKind>>,
     pub(crate) mutable_path_field: Option<Arc<str>>,
     pub(crate) timeout: Option<Duration>,
     pub(crate) start_annotation: Option<StartAnnotation>,
     pub(crate) examples: Option<Value>,
     pub(crate) has_describe_fn: bool,
+    pub(crate) has_summary_fn: bool,
     pub(crate) background_only: BackgroundOnly,
 }
 
@@ -273,12 +241,12 @@ impl Tool for LuaTool {
         let (reply_tx, reply_rx) = flume::bounded(1);
         let sent = self
             .tx
-            .send(Request::Describe {
+            .send(Request::domain(Describe {
                 plugin: Arc::clone(&self.plugin),
                 tool: Arc::clone(&self.name),
                 dctx,
                 reply: reply_tx,
-            })
+            }))
             .is_ok();
         if sent {
             match reply_rx.recv_timeout(DESCRIBE_TIMEOUT) {
@@ -349,8 +317,7 @@ impl Tool for LuaTool {
         Ok(Box::new(LuaToolInvocation {
             tool: Arc::clone(&self.name),
             plugin: Arc::clone(&self.plugin),
-            has_header_fn: self.has_header_fn,
-            has_start_fn: self.has_start_fn,
+            has_summary_fn: self.has_summary_fn,
             input: validated,
             tx: self.tx.clone(),
             permission_state,
@@ -369,8 +336,7 @@ enum PermissionState {
 struct LuaToolInvocation {
     tool: Arc<str>,
     plugin: Arc<str>,
-    has_header_fn: bool,
-    has_start_fn: bool,
+    has_summary_fn: bool,
     input: Value,
     tx: Sender<Request>,
     permission_state: PermissionState,
@@ -380,36 +346,42 @@ struct LuaToolInvocation {
 }
 
 impl ToolInvocation for LuaToolInvocation {
-    fn start_header(&self) -> HeaderFuture {
-        if !self.has_header_fn {
-            return HeaderFuture::Ready(HeaderResult::plain(self.tool.to_string()));
+    fn start_summary(&self) -> BoxFuture<'_, Option<String>> {
+        if !self.has_summary_fn {
+            return Box::pin(std::future::ready(None));
         }
-        let (reply_tx, reply_rx) = flume::bounded::<HeaderResult>(1);
-        let tool = Arc::clone(&self.tool);
-        let plugin = Arc::clone(&self.plugin);
-        let input = self.input.clone();
+        let (reply_tx, reply_rx) = flume::bounded(1);
+        let request = Request::domain(ComputeSummary {
+            plugin: Arc::clone(&self.plugin),
+            tool: Arc::clone(&self.tool),
+            input: self.input.clone(),
+            reply: reply_tx,
+        });
         let tx = self.tx.clone();
-        let fallback = tool.to_string();
-        HeaderFuture::Pending {
-            fallback: fallback.clone(),
-            fut: Box::pin(async move {
-                let sent = tx
-                    .send_async(Request::ComputeHeader {
-                        plugin: Arc::clone(&plugin),
-                        tool: Arc::clone(&tool),
-                        input,
-                        reply: reply_tx,
-                    })
-                    .await;
-                if sent.is_err() {
-                    return HeaderResult::plain(fallback);
-                }
-                reply_rx
-                    .recv_async()
-                    .await
-                    .unwrap_or_else(|_| HeaderResult::plain(fallback))
-            }),
-        }
+        Box::pin(async move {
+            if let Err(e) = tx.send_async(request).await {
+                tracing::warn!(
+                    plugin = %self.plugin,
+                    tool = %self.tool,
+                    error = %e,
+                    "summary request not sent; falling back to the tool name"
+                );
+                return None;
+            }
+            reply_rx.recv_async().await.unwrap_or_else(|e| {
+                tracing::warn!(
+                    plugin = %self.plugin,
+                    tool = %self.tool,
+                    error = %e,
+                    "summary reply lost; falling back to the tool name"
+                );
+                None
+            })
+        })
+    }
+
+    fn validated_input(&self) -> Option<&Value> {
+        Some(&self.input)
     }
 
     fn start_annotation(&self) -> Option<String> {
@@ -432,62 +404,51 @@ impl ToolInvocation for LuaToolInvocation {
         }
     }
 
-    fn start<'a>(&'a self, ctx: &'a ToolContext) -> BoxFuture<'a, ()> {
-        let id = ctx.tool_use_id.as_ref().filter(|_| self.has_start_fn);
-        let Some(id) = id else {
-            return Box::pin(std::future::ready(()));
-        };
-        let (reply_tx, reply_rx) = flume::bounded::<()>(1);
-        let req = Request::StartTool {
-            plugin: Arc::clone(&self.plugin),
-            tool: Arc::clone(&self.tool),
-            input: self.input.clone(),
-            live: LiveCtx {
-                event_tx: ctx.event_tx.clone(),
-                tool_use_id: id.clone(),
-            },
-            ctx: Box::new(LuaCtx::start(ctx)),
-            reply: reply_tx,
-            nested: crate::runtime::under_inflight_slot(),
-        };
-        let tx = self.tx.clone();
+    fn permission_scopes(&self, ctx: &ToolContext) -> BoxFuture<'_, Option<PermissionScopes>> {
+        let path = self
+            .mutable_path()
+            .map(|path| (path, ctx.resolve_path(path)));
+        let working_dir = Arc::clone(&ctx.working_dir);
         Box::pin(async move {
-            if tx.send_async(req).await.is_ok() {
-                let _ = reply_rx.recv_async().await;
-            }
-        })
-    }
-
-    fn permission_scopes(&self) -> BoxFuture<'_, Option<PermissionScopes>> {
-        match &self.permission_state {
-            PermissionState::Ready(v) => Box::pin(std::future::ready(v.clone())),
-            PermissionState::NeedsCompute => {
-                let (reply_tx, reply_rx) = flume::bounded(1);
-                let tx = self.tx.clone();
-                let plugin = Arc::clone(&self.plugin);
-                let tool = Arc::clone(&self.tool);
-                let input = self.input.clone();
-                let fallback = input.to_string();
-                Box::pin(async move {
-                    if tx
-                        .send_async(Request::ComputePermissionScopes {
-                            plugin,
-                            tool,
+            let mut scopes = match &self.permission_state {
+                PermissionState::Ready(value) => value.clone(),
+                PermissionState::NeedsCompute => {
+                    let (reply_tx, reply_rx) = flume::bounded(1);
+                    let input = self.input.clone();
+                    let fallback = input.to_string();
+                    if self
+                        .tx
+                        .send_async(Request::domain(ComputePermissionScopes {
+                            working_dir,
+                            plugin: Arc::clone(&self.plugin),
+                            tool: Arc::clone(&self.tool),
                             input,
                             reply: reply_tx,
-                        })
+                        }))
                         .await
                         .is_err()
                     {
                         return Some(PermissionScopes::force_prompt(fallback));
                     }
-                    match reply_rx.recv_async().await {
-                        Ok(Some(scopes)) => Some(scopes),
-                        _ => Some(PermissionScopes::force_prompt(fallback)),
+                    Some(
+                        reply_rx
+                            .recv_async()
+                            .await
+                            .ok()
+                            .flatten()
+                            .unwrap_or_else(|| PermissionScopes::force_prompt(fallback)),
+                    )
+                }
+            }?;
+            if let Some((path, absolute)) = path {
+                for scope in &mut scopes.scopes {
+                    if Path::new(scope) == path {
+                        *scope = absolute.to_string_lossy().into_owned();
                     }
-                })
+                }
             }
-        }
+            Some(scopes)
+        })
     }
 
     fn mutable_path(&self) -> Option<&Path> {
@@ -520,23 +481,18 @@ impl ToolInvocation for LuaToolInvocation {
             };
 
             let (reply_tx, reply_rx) = flume::bounded::<ToolCallReply>(1);
-            let live = ctx.tool_use_id.clone().map(|id| LiveCtx {
-                event_tx: ctx.event_tx.clone(),
-                tool_use_id: id,
-            });
             let lua_ctx = LuaCtx::handler(ctx);
 
             if tx
-                .send_async(Request::CallTool {
+                .send_async(Request::domain(CallTool {
                     plugin: Arc::clone(&plugin),
                     tool: Arc::clone(&tool),
                     input,
                     ctx: Box::new(lua_ctx),
                     deadline: deadline_at,
                     reply: reply_tx,
-                    live,
                     nested,
-                })
+                }))
                 .await
                 .is_err()
             {
@@ -563,40 +519,12 @@ impl ToolInvocation for LuaToolInvocation {
                 ))
                 .into(),
                 Some(Err(_)) => Err("lua thread disconnected".to_string()).into(),
-                Some(Ok(mut reply)) => {
-                    if let Some(ref id) = ctx.tool_use_id {
-                        if let Some(live_buf) = reply.live_buf.take() {
-                            crate::runtime::send_render_event(
-                                &ctx.event_tx,
-                                id,
-                                "live_buf",
-                                AgentEvent::LiveToolBuf {
-                                    id: id.clone(),
-                                    body: live_buf,
-                                },
-                            );
-                        }
-                        crate::runtime::RestoreReply {
-                            body: reply.snapshot.take(),
-                            header: reply.header.take(),
-                        }
-                        .emit(id, None, &ctx.event_tx);
-                    }
-                    reply.into_exec_result()
-                }
+                Some(Ok(reply)) => reply.into_exec_result(),
             }
         })
     }
 }
 
-/// Ends the wait after {timeout}, unless {call} moved to the background
-/// first. A moved call, and every call nested in it, runs until its work ends
-/// or someone stops it.
-///
-/// A move and the timeout can land at the same moment. For the model call
-/// itself ({own_call}) the timeout ends the call through the same trigger a
-/// move claims, so only one wins: the receipt is the reply, or the move finds
-/// the call already ended.
 async fn backstop(timeout: Duration, call: Option<&CallScope>, own_call: bool) {
     let Some(call) = call else {
         sleep(timeout).await;
@@ -757,6 +685,16 @@ fn register_prompt(
 /// "full" when code such as `code_execution` made the call. Apply output limits
 /// only in compact mode.
 ///
+/// `ctx:stream(text)` appends live text to the running call and
+/// `ctx:set_state(value)` replaces its live state. Both publish progress
+/// that a frontend can show while the handler runs. The handler's returned
+/// output and `state` replace both when it finishes, and the streamed text
+/// is never stored. In a call made by another tool both do nothing.
+///
+/// `ctx:place()` returns the session's directories as `{ cwd, home }`, the
+/// ones a renderer's ctx carries, to shorten paths as the session sees them.
+/// They are the session's working directory and the agent's home.
+///
 /// @param spec table Tool specification:
 ///   name            (string)   Required. ASCII identifier, up to 64 chars ([a-zA-Z_][a-zA-Z0-9_]*).
 ///   description     (string)   Required. Non-empty description shown to the model.
@@ -765,8 +703,6 @@ fn register_prompt(
 ///                              Must return a string or a table with any of these fields:
 ///                                llm_output  (string)  Result text for the model or the calling code.
 ///                                is_error    (boolean) When true, the result is treated as an error.
-///                                body        (BufHandle) Rich rendered body shown in the UI.
-///                                header      (BufHandle) One-line header shown before the body.
 ///                                format      (string)  "plain" (default) or "markdown".
 ///                                annotation  (string)  Short label shown next to the tool call.
 ///                                written_path (string) Path of a file written by the tool.
@@ -774,20 +710,17 @@ fn register_prompt(
 ///                                diff_before (string)  Before text of the diff.
 ///                                diff_after  (string)  After text of the diff.
 ///                                image       (maki.image.Image|table) An Image, or { media_type: string, data: string } base64 image.
-///                                state       (any)     Serializable state forwarded to restore.
+///                                state       (any)     Serializable state sent to the UI renderer.
 ///   audiences       (string[]) Which model audiences see the tool. Values: "main", "sub", "all". Default: all audiences.
 ///   kind            (string)   Optional grouping label (e.g. "filesystem").
 ///   timeout         (number)   Execution timeout in seconds. 0 or false disables. Default: inherits agent deadline.
-///   header          (function) Optional. Called before execution, returns a string or BufHandle for the one-line header.
-///   restore         (function) Optional. Called to re-render a previous tool result. Receives `(tool_name, input, output, ctx)`.
-///   start           (function) Optional. Called when the tool call starts, before the handler runs.
 ///   describe        (function) Optional. Returns a custom description string for the current context.
+///   summary         (function) Optional. Called with `(input)` on the agent, returns the plain-text title of the call. Default: the tool name.
 ///   examples        (table)    Optional. Array of example input objects for documentation.
 ///   permission_scopes (string|function) Field name in schema (string) or `function(input)` returning a list of path scopes that need write permission. Declaring it is what puts the tool in front of the permission prompt, and it requires `permission`.
 ///   permission      (string)   The capability the tool reaches: "fs_read", "fs_write", "net", "run", or "env". Your plugin must hold it, and so must any plugin that pre-approves the tool, hooks it, or hands it to a session. Without `permission_scopes` the tool never prompts, the right declaration for read-only tools. A tool declaring neither costs those plugins every permission.
 ///   mutable_path    (string)   Schema field name (type: string) for the primary path the tool writes. Required with `permission = "fs_write"`. Declaring it is what gets the tool, from the dispatcher and never from the handler: serialization of concurrent calls on that file, the stale-read rejection, the plan-mode block, and the permission boundary check.
 ///   start_annotation (string|table) Schema field used to annotate the start header with a count (string) or timeout (`{ field, kind="timeout" }`).
-///   needs_background (boolean) Offer the tool only to a model that can move a call to the background itself: the main agent of a session where background tasks are on. Default: false. A schema property can set the same key to hide just that (optional) parameter. The choice is made when the session's tool list is built, and a call that names a hidden parameter still validates.
 /// @return
 /// @example
 /// maki.api.register_tool({
@@ -985,104 +918,6 @@ fn allow_is_delegated(
         ))
 }
 
-/// Register a slash-command that appears in the user input bar.
-///
-/// Slash commands let the user trigger plugin actions by typing `/name` in the
-/// input. Use them for interactive workflows that do not need the model, like
-/// browsing memory files or toggling settings.
-///
-/// @param spec table Command specification:
-///   name        (string)   Required. The command name (e.g. "/hello"; a leading
-///                            slash is added when missing).
-///   description (string)   Optional. Short description shown in the command palette.
-///   nargs       (integer|string) Optional. How many arguments the command
-///                          takes, spelled like nvim's nargs: 0 (default),
-///                          1, "?" (zero or one), "*" (any number), or "+"
-///                          (one or more). An argument is a whitespace
-///                          separated word. Type more than allowed and the
-///                          command quietly stops matching: the input goes
-///                          to the model as a normal message. Only the upper
-///                          bound is checked, so with "+" you still need to
-///                          handle an empty `opts.args` yourself.
-///   handler     (function) Required. Called when the user runs the command,
-///                          with one opts table: `opts.args` is the raw
-///                          argument string (whitespace kept, may be empty)
-///                          and `opts.fargs` is the same split into words.
-/// @return
-/// @example
-/// maki.api.register_command({
-///   name = "/hello",
-///   description = "Say hello",
-///   handler = function()
-///     maki.ui.flash("Hello from my plugin!")
-///   end,
-/// })
-#[lua_fn]
-fn register_command(
-    lua: &Lua,
-    #[ctx] plugin: Arc<str>,
-    #[ctx] reach: PluginReach,
-    spec: Table,
-) -> LuaResult<()> {
-    register_command_from_lua(lua, &spec, plugin, reach)
-}
-
-/// Runs a slash command by name, exactly as typing it in the input would.
-/// Works for built-ins, custom `/project:` and `/user:` commands, MCP
-/// prompts, and commands other plugins registered.
-///
-/// Use it to alias a command you like under a name you prefer, instead of
-/// reimplementing what it does. See `maki.ui.action` for the same idea
-/// applied to keybound UI actions.
-///
-/// Pass the whole command line, arguments included: `"/cd ~/src"`. The
-/// leading slash is optional. Names match exactly apart from case, so a typo
-/// reports an error instead of running the closest command, and a cycle of
-/// aliases stops with one too.
-///
-/// This returns as soon as the command has been dispatched, not when it
-/// finishes, so aliasing something long-running like `/compact` does not
-/// block your handler.
-///
-/// A command outside the calling plugin's grants returns an error, and a few
-/// only run when you type them. [Commands](/docs/commands/#plugin-access)
-/// lists what each one needs.
-///
-/// @param cmdline string Command line, e.g. `"/new"` or `"/cd ~/src"`.
-/// @return (boolean|nil, string|nil) `true` once dispatched, or nil and an error message for an unknown or denied command.
-/// @example
-/// -- /resume as an alias for the built-in session picker:
-/// maki.api.register_command({
-///   name = "/resume",
-///   description = "Alias for /sessions",
-///   handler = function()
-///     local ok, err = maki.api.run_command("/sessions")
-///     if not ok then
-///       maki.ui.flash("could not run /sessions: " .. err)
-///     end
-///   end,
-/// })
-#[lua_fn]
-async fn run_command(
-    lua: Lua,
-    #[ctx] tx: Option<flume::Sender<UiAction>>,
-    #[ctx] caller: PluginReach,
-    cmdline: String,
-) -> LuaResult<Pair<bool>> {
-    let depth = Lineage::current(&lua).command_depth.saturating_add(1);
-    let reply = try_pair!(
-        ui_roundtrip(tx.as_ref(), |reply_tx| UiAction::RunCommand {
-            cmdline,
-            depth,
-            caller: caller.now(&lua),
-            reply_tx,
-        })
-        .await
-    );
-    try_pair!(reply);
-    Ok((Some(true), None))
-}
-
 /// Add a piece of text to an aggregate prompt slot. Multiple plugins can each
 /// contribute to the same slot, and all contributions are concatenated.
 ///
@@ -1219,22 +1054,10 @@ fn get_tools(lua: &Lua, opts: Option<Table>) -> LuaResult<Table> {
 }
 
 /// Look up a single tool by name. Returns its metadata table or nil if the
-/// tool does not exist. For Lua-registered tools the returned table also
-/// includes `header` and `restore` handle functions (wrapped so they never
-/// throw).
-///
-/// `tool_search` and MCP tools (`server__tool` names) never enter the
-/// registry. For them the table holds only `name`, `header`, and the
-/// `format` ("plain" or "markdown") of the standalone call, enough for a
-/// composing tool like batch to draw a child the same way. Any
-/// `server__tool` shaped name resolves whether or not a server offers it,
-/// so this is not an existence check for MCP tools.
-///
-/// `background_params` lists the parameters marked `needs_background`,
-/// which only a session that can move calls to the background sees.
+/// tool does not exist.
 ///
 /// @param name string Exact tool name.
-/// @return (table|nil) Tool entry with fields { name, schema, audiences, kind?, background_params?, header?, restore?, format? }, or nil if not found.
+/// @return (table|nil) Tool entry with fields { name, schema, audiences, kind?, background_params }, or nil if not found.
 /// @example
 /// local t = maki.api.get_tool("bash")
 /// if t then
@@ -1247,17 +1070,9 @@ fn get_tool(lua: &Lua, name: String) -> LuaResult<LuaValue> {
         .map(|r| Arc::clone(&r))
         .ok_or_else(|| mlua::Error::runtime("get_tool: tool registry not available"))?;
     let Some(entry) = registry.get(&name) else {
-        return routed_tool_entry(lua, name);
+        return Ok(LuaValue::Nil);
     };
     let t = tool_entry_to_lua(lua, &entry)?;
-    if let Some((header, restore)) = local_tool_handles(&name) {
-        if let Some(f) = header {
-            t.set("header", wrap_header(lua, name.clone(), f)?)?;
-        }
-        if let Some(f) = restore {
-            t.set("restore", wrap_restore(lua, name, f)?)?;
-        }
-    }
     Ok(LuaValue::Table(t))
 }
 
@@ -1272,27 +1087,37 @@ lua_table! {
     /// maki.api.register_tool({ name = "greet", ... })
     /// maki.api.register_prompt_hint({ slot = "tool_usage", content = "..." })
     /// ```
-    extend "maki.api" => pub(crate) fn add_tool_fns(pending: PendingTools, pending_rules: PendingRules, reach: PluginReach, plugin: Arc<str>, opts: PluginOpts), DOCS [
-        register_tool(pending, reach), register_permission_rule(pending_rules, reach), register_command(plugin, reach),
-        register_prompt_hint(plugin), register_options(plugin, opts), set_prompt(plugin),
-        get_tools, get_tool,
-        manual run_command,
+    extend "maki.api" => fn add_tool_fns(pending: PendingTools, pending_rules: PendingRules, reach: PluginReach), DOCS [
+        register_tool(pending, reach), register_permission_rule(pending_rules, reach),
     ]
 }
 
-pub(crate) fn create_api_table(
+lua_table! {
+    extend "maki.api" => fn add_prompt_hint_fns(plugin: Arc<str>), PROMPT_HINT_DOCS [
+        register_prompt_hint(plugin),
+    ]
+}
+
+lua_table! {
+    extend "maki.api" => fn add_prompt_fns(plugin: Arc<str>), PROMPT_DOCS [
+        set_prompt(plugin), get_tools, get_tool,
+    ]
+}
+
+/// The agent's part of `maki.api`. Its docs are [`DOCS`],
+/// [`PROMPT_HINT_DOCS`] and [`PROMPT_DOCS`], split around the UI's and the
+/// core's so the reference keeps its order.
+pub(crate) fn add_agent_fns(
+    t: &Table,
     lua: &Lua,
     pending: PendingTools,
     pending_rules: PendingRules,
     reach: PluginReach,
     plugin: Arc<str>,
-    opts: PluginOpts,
-    ui_action_tx: Option<flume::Sender<UiAction>>,
-) -> LuaResult<Table> {
-    let t = lua.create_table()?;
-    run_command__register(&t, lua, ui_action_tx, reach.clone())?;
-    add_tool_fns(&t, lua, pending, pending_rules, reach, plugin, opts)?;
-    Ok(t)
+) -> LuaResult<()> {
+    add_tool_fns(t, lua, pending, pending_rules, reach)?;
+    add_prompt_hint_fns(t, lua, Arc::clone(&plugin))?;
+    add_prompt_fns(t, lua, plugin)
 }
 
 pub(crate) fn audiences_to_lua(lua: &Lua, audience: ToolAudience) -> LuaResult<Table> {
@@ -1305,50 +1130,20 @@ pub(crate) fn audiences_to_lua(lua: &Lua, audience: ToolAudience) -> LuaResult<T
     Ok(out)
 }
 
-fn routed_tool_entry(lua: &Lua, name: String) -> LuaResult<LuaValue> {
-    let Some(view) = routed_view(&name, &Value::Null) else {
-        return Ok(LuaValue::Nil);
-    };
-    let t = lua.create_table()?;
-    t.set("name", name.as_str())?;
-    t.set(
-        "format",
-        if view.markdown {
-            LUA_FORMAT_MARKDOWN
-        } else {
-            LUA_FORMAT_PLAIN
-        },
-    )?;
-    let summary = {
-        let name = name.clone();
-        lua.create_function(move |lua, input: LuaValue| {
-            let input = lua_to_json(lua, &input)?;
-            Ok(routed_view(&name, &input).map(|view| view.summary))
-        })?
-    };
-    t.set("header", wrap_header(lua, name, summary)?)?;
-    Ok(LuaValue::Table(t))
-}
-
 fn tool_entry_to_lua(lua: &Lua, entry: &RegisteredTool) -> LuaResult<Table> {
     let t = lua.create_table()?;
-    let schema = entry.tool.schema();
     t.set("name", entry.name())?;
-    t.set("schema", json_to_lua(lua, &schema)?)?;
+    t.set("schema", json_to_lua(lua, &entry.tool.schema())?)?;
     t.set("audiences", audiences_to_lua(lua, entry.tool.audience())?)?;
+    let schema = entry.tool.schema();
+    let params = background_params(&schema, entry.tool.offered_schema(false));
+    t.set("background_params", lua.create_sequence_from(params)?)?;
     if let Some(kind) = entry.tool.tool_kind() {
         t.set("kind", kind)?;
-    }
-    let background_params = background_params(&schema, entry.tool.offered_schema(false));
-    if !background_params.is_empty() {
-        t.set("background_params", background_params)?;
     }
     Ok(t)
 }
 
-/// The parameters `schema` has and `offered`, the schema a session without
-/// background moves gets, leaves out. A tool that such a session never sees
-/// has none, since the whole tool is the condition.
 fn background_params(schema: &Value, offered: Option<Value>) -> Vec<String> {
     let properties = |schema: &Value| schema.get("properties").and_then(Value::as_object).cloned();
     let (Some(all), Some(offered)) = (properties(schema), offered.as_ref().and_then(properties))
@@ -1359,118 +1154,6 @@ fn background_params(schema: &Value, offered: Option<Value>) -> Vec<String> {
         .filter(|name| !offered.contains_key(*name))
         .cloned()
         .collect()
-}
-
-/// Async so wrapped fns can yield (e.g. bash restore highlights inline).
-fn wrap_nothrow(
-    lua: &Lua,
-    tool: String,
-    handle: &'static str,
-    f: Function,
-    norm: fn(&Lua, LuaValue) -> LuaResult<LuaValue>,
-) -> LuaResult<Function> {
-    lua.create_async_function(move |lua, args: MultiValue| {
-        let (f, tool) = (f.clone(), tool.clone());
-        async move {
-            match f.call_async::<LuaValue>(args).await {
-                Ok(v) => norm(&lua, v),
-                Err(e) => {
-                    tracing::warn!(tool, handle, error = %e, "get_tool handle failed");
-                    Ok(LuaValue::Nil)
-                }
-            }
-        }
-    })
-}
-
-/// Normalizes a header fn to one spans line or nil: a plain string gets
-/// the standalone header style, a buf return contributes its first line.
-fn wrap_header(lua: &Lua, tool: String, f: Function) -> LuaResult<Function> {
-    wrap_nothrow(lua, tool, "header", f, |lua, v| match v {
-        LuaValue::String(s) => {
-            let span = lua.create_table()?;
-            span.raw_set(1, s)?;
-            span.raw_set(2, PLAIN_HEADER_STYLE)?;
-            let line = lua.create_table()?;
-            line.raw_set(1, span)?;
-            Ok(LuaValue::Table(line))
-        }
-        LuaValue::UserData(ud) => {
-            let Ok(h) = ud.borrow::<BufHandle>() else {
-                return Ok(LuaValue::Nil);
-            };
-            match h.buf.read().first() {
-                Some(line) => Ok(LuaValue::Table(line_to_lua(lua, line)?)),
-                None => Ok(LuaValue::Nil),
-            }
-        }
-        _ => Ok(LuaValue::Nil),
-    })
-}
-
-/// Normalizes a restore fn to its body buf or nil (whether it returned
-/// the buf directly or a `{ body = buf }` reply), so callers composing
-/// another tool's rendering need no pcall of their own. The ctx arg may be
-/// a real `LuaCtx` or a plain `{ tool_output_lines =, state =, session_id =,
-/// task_id =, reason = }` table (how batch drives child restores); either way
-/// the fn sees a restore `LuaCtx`.
-fn wrap_restore(lua: &Lua, tool: String, f: Function) -> LuaResult<Function> {
-    let prepped = lua.create_async_function(move |lua, mut args: MultiValue| {
-        let f = f.clone();
-        async move {
-            let ctx = normalize_restore_ctx(&lua, args.get(3))?;
-            while args.len() < 4 {
-                args.push_back(LuaValue::Nil);
-            }
-            args[3] = ctx;
-            f.call_async::<MultiValue>(args).await
-        }
-    })?;
-    wrap_nothrow(lua, tool, "restore", prepped, |_lua, v| {
-        Ok(match &v {
-            LuaValue::UserData(ud) if ud.is::<BufHandle>() => v,
-            LuaValue::Table(t) => t
-                .get::<mlua::AnyUserData>("body")
-                .ok()
-                .filter(|ud| ud.is::<BufHandle>())
-                .map(LuaValue::UserData)
-                .unwrap_or(LuaValue::Nil),
-            _ => LuaValue::Nil,
-        })
-    })
-}
-
-fn normalize_restore_ctx(lua: &Lua, v: Option<&LuaValue>) -> LuaResult<LuaValue> {
-    if let Some(LuaValue::UserData(ud)) = v
-        && ud.is::<LuaCtx>()
-    {
-        return Ok(LuaValue::UserData(ud.clone()));
-    }
-    let ctx = match v {
-        Some(LuaValue::Table(t)) => {
-            let string = |key| t.opt::<String>(key).ok().flatten();
-            RestoreCtx {
-                tool_output_lines: t
-                    .get::<LuaValue>("tool_output_lines")
-                    .ok()
-                    .and_then(|v| lua.from_value::<ToolOutputLines>(v).ok())
-                    .unwrap_or_default(),
-                state: t
-                    .get::<LuaValue>("state")
-                    .ok()
-                    .and_then(|v| lua_to_json(lua, &v).ok())
-                    .filter(|v| !v.is_null()),
-                session_id: string("session_id").and_then(|s| s.parse().ok()),
-                task_id: string("task_id").map(Arc::from),
-                reason: string("reason")
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or_default(),
-            }
-        }
-        _ => RestoreCtx::default(),
-    };
-    let ud = lua.create_userdata(LuaCtx::restore(ctx))?;
-    Ok(LuaValue::UserData(ud))
 }
 
 fn is_valid_tool_name(name: &str) -> bool {
@@ -1576,14 +1259,6 @@ fn parse_start_annotation(spec: &Table, schema: &Value) -> LuaResult<Option<Star
             "register_tool: 'start_annotation' must be a string field name or a table",
         )),
     }
-}
-
-pub(crate) fn permission_keys() -> String {
-    Permission::ALL
-        .iter()
-        .map(|p| p.manifest_key())
-        .collect::<Vec<_>>()
-        .join(", ")
 }
 
 /// Reads both keys together, so the pair enters the runtime whole and only
@@ -1694,29 +1369,21 @@ fn register_tool_from_lua(
              schema field that holds the path it writes"
         )));
     }
-
-    let header_fn: Option<Function> = spec.opt("header").ok().flatten();
-    let restore_fn: Option<Function> = spec.opt("restore").ok().flatten();
-    let start_fn: Option<Function> = spec.opt("start").ok().flatten();
     let kind: Option<Arc<str>> = spec
         .get::<String>("kind")
         .ok()
         .map(|s| Arc::from(s.as_str()));
     let audience = parse_audience(audiences, ToolAudience::default())?;
-    let background_only = BackgroundOnly::from_spec(spec, &schema_val)?;
     let timeout = parse_timeout(spec)?;
     let start_annotation = parse_start_annotation(spec, &schema_val)?;
+    let background_only = BackgroundOnly::from_spec(spec, &schema_val)?;
     let handler_key: RegistryKey = lua.create_registry_value(handler)?;
-    let header_key = header_fn
-        .map(|f| lua.create_registry_value(f))
-        .transpose()?;
-    let restore_key = restore_fn
-        .map(|f| lua.create_registry_value(f))
-        .transpose()?;
-    let start_key = start_fn.map(|f| lua.create_registry_value(f)).transpose()?;
 
     let describe_fn: Option<Function> = spec.opt("describe").ok().flatten();
     let describe_key = describe_fn
+        .map(|f| lua.create_registry_value(f))
+        .transpose()?;
+    let summary_key = spec_opt::<Function>(spec, "summary", "a function")?
         .map(|f| lua.create_registry_value(f))
         .transpose()?;
 
@@ -1738,85 +1405,15 @@ fn register_tool_from_lua(
             audience,
             kind,
             handler_key,
-            header_key,
-            restore_key,
-            start_key,
             permission,
             mutable_path_field,
             timeout,
             start_annotation,
             examples,
             describe_key,
+            summary_key,
             background_only,
         });
-
-    Ok(())
-}
-
-/// Matching only needs an upper bound, so "+" and "*" both become MAX;
-/// minimums ("+" vs "*") are left for handlers to enforce.
-fn parse_nargs(spec: &Table) -> LuaResult<usize> {
-    match spec.get::<LuaValue>("nargs")? {
-        LuaValue::Nil | LuaValue::Integer(0) | LuaValue::Number(0.0) => Ok(0),
-        LuaValue::Integer(1) | LuaValue::Number(1.0) => Ok(1),
-        LuaValue::String(s) => match s.to_string_lossy().as_ref() {
-            "?" => Ok(1),
-            "*" | "+" => Ok(usize::MAX),
-            _ => Err(mlua::Error::runtime(NARGS_ERR)),
-        },
-        _ => Err(mlua::Error::runtime(NARGS_ERR)),
-    }
-}
-
-fn register_command_from_lua(
-    lua: &Lua,
-    spec: &Table,
-    plugin: Arc<str>,
-    reach: PluginReach,
-) -> LuaResult<()> {
-    let mut name: String = spec
-        .get("name")
-        .map_err(|_| mlua::Error::runtime("register_command: missing 'name'"))?;
-    if name.is_empty() {
-        return Err(mlua::Error::runtime(
-            "register_command: name must be non-empty",
-        ));
-    }
-    if !name.starts_with('/') {
-        name.insert(0, '/');
-    }
-    let description: String = spec.get("description").unwrap_or_default();
-    let max_args = parse_nargs(spec)?;
-    let handler: Function = spec
-        .get("handler")
-        .map_err(|_| mlua::Error::runtime("register_command: missing 'handler'"))?;
-
-    let handler_key = lua.create_registry_value(handler)?;
-    let name: Arc<str> = Arc::from(name.as_str());
-    let description: Arc<str> = Arc::from(description.as_str());
-
-    {
-        let mut map = lua
-            .app_data_mut::<CommandHandlerMap>()
-            .ok_or_else(|| mlua::Error::runtime("register_command: not initialized"))?;
-        map.entry(Arc::clone(&plugin)).or_default().insert(
-            Arc::clone(&name),
-            CommandEntry {
-                handler: handler_key,
-                description,
-                reach,
-                max_args,
-            },
-        );
-    }
-
-    let map = lua
-        .app_data_ref::<CommandHandlerMap>()
-        .ok_or_else(|| mlua::Error::runtime("register_command: not initialized"))?;
-    let writer = lua
-        .app_data_ref::<LuaCommandWriter>()
-        .ok_or_else(|| mlua::Error::runtime("register_command: not initialized"))?;
-    publish_command_snapshot(&map, &writer);
 
     Ok(())
 }
@@ -1841,9 +1438,6 @@ pub(crate) struct DiffPayload {
 
 pub(crate) struct ToolCallReply {
     pub result: ToolCallResult,
-    pub snapshot: Option<BufferSnapshot>,
-    pub header: Option<BufferSnapshot>,
-    pub live_buf: Option<Arc<SharedBuf>>,
     pub format: LuaOutputFormat,
     pub annotation: Option<String>,
     pub written_path: Option<String>,
@@ -1853,8 +1447,6 @@ pub(crate) struct ToolCallReply {
     /// return. It becomes `ToolOutput::Image` with `llm_output` as caption.
     pub image: Option<ImageSource>,
     pub state: Option<Value>,
-    /// Set when `result` is the receipt of a call that moved to the
-    /// background.
     pub moved: Option<MovedCall>,
 }
 
@@ -1869,7 +1461,6 @@ impl ToolCallReply {
             image,
             state,
             moved,
-            ..
         } = self;
         let output = result.map(|s| {
             if let Some(source) = image {
@@ -1882,10 +1473,7 @@ impl ToolCallReply {
                     after: diff.after,
                 }
             } else {
-                let inner = TextOutput {
-                    state,
-                    ..TextOutput::from(s)
-                };
+                let inner = TextOutput::from(s);
                 match format {
                     LuaOutputFormat::Markdown => ToolOutput::Markdown(inner),
                     LuaOutputFormat::Plain => ToolOutput::Plain(inner),
@@ -1896,6 +1484,7 @@ impl ToolCallReply {
             output,
             annotation,
             written_path,
+            state,
             moved,
         }
     }
@@ -1905,11 +1494,6 @@ impl ToolCallReply {
         let LuaValue::Table(t) = val else {
             return Self::plain(result);
         };
-        let (snapshot, live_buf) = Self::extract_body_handle(t);
-        let header = t
-            .get::<LuaValue>("header")
-            .ok()
-            .and_then(|v| Self::extract_snapshot(&v));
         let format = extract_format(t);
         let annotation = t.get::<String>("annotation").ok();
         let written_path = t.get::<String>("written_path").ok();
@@ -1935,9 +1519,6 @@ impl ToolCallReply {
         };
         Self {
             result,
-            snapshot,
-            header,
-            live_buf,
             format,
             annotation,
             written_path,
@@ -1948,29 +1529,9 @@ impl ToolCallReply {
         }
     }
 
-    fn extract_body_handle(t: &mlua::Table) -> (Option<BufferSnapshot>, Option<Arc<SharedBuf>>) {
-        t.get::<LuaValue>("body")
-            .ok()
-            .and_then(|v| {
-                let ud = v.as_userdata()?;
-                let h = ud.borrow::<BufHandle>().ok()?;
-                Some((Some(h.buf.take()), Some(Arc::clone(&h.buf))))
-            })
-            .unwrap_or((None, None))
-    }
-
-    fn extract_snapshot(val: &LuaValue) -> Option<BufferSnapshot> {
-        let ud = val.as_userdata()?;
-        let h = ud.borrow::<BufHandle>().ok()?;
-        Some(h.buf.take())
-    }
-
     pub fn plain(result: ToolCallResult) -> Self {
         Self {
             result,
-            snapshot: None,
-            header: None,
-            live_buf: None,
             format: LuaOutputFormat::default(),
             annotation: None,
             written_path: None,
@@ -2065,24 +1626,10 @@ pub(crate) fn coerce_tool_result(result: &LuaValue) -> ToolCallResult {
 
 #[cfg(test)]
 mod tests {
+    use maki_agent::AgentMode;
+    use maki_agent::tools::test_support::stub_ctx;
+
     use super::*;
-    use crate::runtime::test_support::{call_scope, moved_home};
-    use crate::runtime::wake_or_fail;
-    use tokio::task::yield_now;
-
-    const BACKGROUND_PARAM: &str = "background";
-
-    #[test_case::test_case(Some(serde_json::json!({ "properties": { "command": {} } })), &[BACKGROUND_PARAM] ; "a_hidden_param")]
-    #[test_case::test_case(Some(serde_json::json!({ "properties": { "command": {}, "background": {} } })), &[] ; "offered_everywhere")]
-    #[test_case::test_case(None, &[] ; "a_background_only_tool")]
-    fn background_params_are_those_offered_only_for_the_background(
-        offered: Option<Value>,
-        expected: &[&str],
-    ) {
-        let schema = serde_json::json!({ "properties": { "command": {}, "background": {} } });
-
-        assert_eq!(background_params(&schema, offered), expected);
-    }
 
     #[test_case::test_case("echo", true ; "simple_name")]
     #[test_case::test_case("tool123", true ; "trailing_digits")]
@@ -2164,14 +1711,13 @@ mod tests {
         LuaToolInvocation {
             tool: Arc::from("test_tool"),
             plugin: Arc::from("test"),
-            has_header_fn: false,
             input,
             tx,
             permission_state: PermissionState::Ready(None),
             mutable_path_field: None,
             timeout: Some(Duration::from_secs(60)),
             start_annotation: None,
-            has_start_fn: false,
+            has_summary_fn: false,
         }
     }
 
@@ -2183,6 +1729,21 @@ mod tests {
             ..invocation(input)
         };
         assert_eq!(inv.start_annotation(), expected);
+    }
+
+    #[test]
+    fn start_summary_is_none_when_the_runtime_is_gone() {
+        let (tx, rx) = flume::bounded(0);
+        drop(rx);
+        let inv = LuaToolInvocation {
+            has_summary_fn: true,
+            tx,
+            ..invocation(serde_json::json!({}))
+        };
+        assert_eq!(
+            crate::test_support::runtime().block_on(inv.start_summary()),
+            None
+        );
     }
 
     #[test]
@@ -2220,7 +1781,6 @@ mod tests {
             kind: None,
             tx,
             plugin: Arc::from("test"),
-            has_header_fn: false,
             permission: scopes.map(|scopes| ToolPermission {
                 permission: Permission::FsWrite,
                 scopes: Some(scopes),
@@ -2228,20 +1788,21 @@ mod tests {
             mutable_path_field: None,
             timeout: Some(Duration::from_secs(60)),
             start_annotation: None,
-            has_start_fn: false,
             examples: None,
             has_describe_fn: false,
+            has_summary_fn: false,
             background_only: BackgroundOnly::default(),
         }
     }
 
-    #[tokio::test]
-    async fn permission_scope_extracted_at_parse_time() {
+    #[test]
+    fn permission_scope_extracted_at_parse_time() {
         let tool = make_lua_tool(Some(PermissionScopeKind::Field(Arc::from("url"))));
         let inv = tool
             .parse(&serde_json::json!({"url": "https://example.com"}))
             .unwrap();
-        let scopes = inv.permission_scopes().await;
+        let scopes = crate::test_support::runtime()
+            .block_on(inv.permission_scopes(&stub_ctx(&AgentMode::Build)));
         assert_eq!(
             scopes.unwrap().scopes,
             vec!["https://example.com".to_string()]
@@ -2250,23 +1811,28 @@ mod tests {
 
     #[test_case::test_case("format" ; "absent_field")]
     #[test_case::test_case("count" ; "non_string_field")]
-    #[tokio::test]
-    async fn permission_scope_field_invalid_forces_prompt(field: &str) {
+    fn permission_scope_field_invalid_forces_prompt(field: &str) {
         let input = serde_json::json!({"url": "https://example.com", "count": 42});
         let inv = make_lua_tool(Some(PermissionScopeKind::Field(Arc::from(field))))
             .parse(&input)
             .unwrap();
-        let scopes = inv.permission_scopes().await.expect("should fail closed");
+        let scopes = crate::test_support::runtime()
+            .block_on(inv.permission_scopes(&stub_ctx(&AgentMode::Build)))
+            .expect("should fail closed");
         assert!(scopes.force_prompt);
         assert_eq!(scopes.scopes, vec![input.to_string()]);
     }
 
-    #[tokio::test]
-    async fn permission_scope_none_when_unconfigured() {
+    #[test]
+    fn permission_scope_none_when_unconfigured() {
         let unconfigured = make_lua_tool(None)
             .parse(&serde_json::json!({"url": "https://example.com"}))
             .unwrap();
-        assert!(unconfigured.permission_scopes().await.is_none());
+        assert!(
+            crate::test_support::runtime()
+                .block_on(unconfigured.permission_scopes(&stub_ctx(&AgentMode::Build)))
+                .is_none()
+        );
     }
 
     #[test]
@@ -2319,24 +1885,25 @@ mod tests {
         assert_eq!(extract_format(&t), LuaOutputFormat::Plain);
     }
 
-    #[tokio::test]
-    async fn needs_compute_fallback_on_failure() {
+    #[test]
+    fn needs_compute_fallback_on_failure() {
         // Closed channel → fallback to force_prompt
         let (tx, rx) = flume::bounded(0);
         drop(rx);
         let inv = LuaToolInvocation {
             tool: Arc::from("bash"),
             plugin: Arc::from("test"),
-            has_header_fn: false,
             input: serde_json::json!({"command": "ls"}),
             tx,
             permission_state: PermissionState::NeedsCompute,
             mutable_path_field: None,
             timeout: None,
             start_annotation: None,
-            has_start_fn: false,
+            has_summary_fn: false,
         };
-        let scopes = inv.permission_scopes().await.expect("should fallback");
+        let scopes = crate::test_support::runtime()
+            .block_on(inv.permission_scopes(&stub_ctx(&AgentMode::Build)))
+            .expect("should fallback");
         assert!(scopes.force_prompt);
         assert!(!scopes.scopes.is_empty());
 
@@ -2345,48 +1912,53 @@ mod tests {
         let inv2 = LuaToolInvocation {
             tool: Arc::from("bash"),
             plugin: Arc::from("test"),
-            has_header_fn: false,
             input: serde_json::json!({"command": "echo hi"}),
             tx: tx2,
             permission_state: PermissionState::NeedsCompute,
             mutable_path_field: None,
             timeout: None,
             start_annotation: None,
-            has_start_fn: false,
+            has_summary_fn: false,
         };
         std::thread::spawn(move || {
-            if let Ok(Request::ComputePermissionScopes { reply, .. }) = rx2.recv() {
+            if let Some(ComputePermissionScopes { reply, .. }) =
+                rx2.recv().ok().and_then(Request::into_domain)
+            {
                 let _ = reply.send(None);
             }
         });
-        let scopes2 = inv2.permission_scopes().await.expect("should fallback");
+        let scopes2 = crate::test_support::runtime()
+            .block_on(inv2.permission_scopes(&stub_ctx(&AgentMode::Build)))
+            .expect("should fallback");
         assert!(scopes2.force_prompt);
     }
 
-    #[tokio::test]
-    async fn needs_compute_returns_callback_result() {
+    #[test]
+    fn needs_compute_returns_callback_result() {
         let (tx, rx) = flume::bounded(1);
         let inv = LuaToolInvocation {
             tool: Arc::from("bash"),
             plugin: Arc::from("test"),
-            has_header_fn: false,
             input: serde_json::json!({"command": "cargo test"}),
             tx,
             permission_state: PermissionState::NeedsCompute,
             mutable_path_field: None,
             timeout: None,
             start_annotation: None,
-            has_start_fn: false,
+            has_summary_fn: false,
         };
         std::thread::spawn(move || {
-            if let Ok(Request::ComputePermissionScopes { reply, .. }) = rx.recv() {
+            if let Some(ComputePermissionScopes { reply, .. }) =
+                rx.recv().ok().and_then(Request::into_domain)
+            {
                 let _ = reply.send(Some(PermissionScopes {
                     scopes: vec!["cargo".into(), "test".into()],
                     force_prompt: false,
                 }));
             }
         });
-        let result = inv.permission_scopes().await;
+        let result = crate::test_support::runtime()
+            .block_on(inv.permission_scopes(&stub_ctx(&AgentMode::Build)));
         let scopes = result.unwrap();
         assert_eq!(scopes.scopes, vec!["cargo", "test"]);
         assert!(!scopes.force_prompt);
@@ -2558,44 +2130,5 @@ mod tests {
             ..invocation(input)
         };
         assert_eq!(inv.start_annotation(), expected.map(String::from));
-    }
-
-    #[tokio::test]
-    async fn start_without_tool_use_id_is_noop() {
-        let inv = LuaToolInvocation {
-            has_start_fn: true,
-            ..invocation(serde_json::json!({"code": "x"}))
-        };
-        let ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
-        inv.start(&ctx).await;
-    }
-
-    /// Once the timeout ended the model call, a move landing late finds
-    /// nothing to move, so the two never both answer it.
-    #[test_case::test_case(true ; "own_call")]
-    #[test_case::test_case(false ; "nested_call")]
-    #[tokio::test]
-    async fn the_backstop_fires_for_a_call_still_in_the_foreground(own_call: bool) {
-        let (call, _run, _task) = call_scope(false);
-        wake_or_fail(backstop(Duration::ZERO, Some(&*call), own_call)).await;
-        assert_eq!(call.cancel().is_cancelled(), own_call);
-        assert_eq!(call.move_to(moved_home()).is_err(), own_call);
-    }
-
-    /// A bash nested in a moved batch would otherwise die at its own timeout.
-    #[test_case::test_case(true ; "own_call")]
-    #[test_case::test_case(false ; "nested_call")]
-    #[tokio::test]
-    async fn the_backstop_never_fires_once_the_call_moved(own_call: bool) {
-        let (call, _run, _task) = call_scope(true);
-        let fired = wake_or_fail(async {
-            tokio::select! {
-                biased;
-                () = backstop(Duration::ZERO, Some(&*call), own_call) => true,
-                () = yield_now() => false,
-            }
-        })
-        .await;
-        assert!(!fired);
     }
 }

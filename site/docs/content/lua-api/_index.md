@@ -145,7 +145,7 @@ The rules:
 | [`maki.session`](#maki-session) | Host session primitives. |
 | [`maki.Timer`](#maki-Timer) | Handle returned by `maki.defer_fn`. |
 | [`maki.task`](#maki-task) | The subagents of the focused session and their transcripts. |
-| [`maki.text`](#maki-text) | Text utilities: format conversion and the fuzzy matcher the built-in |
+| [`maki.text`](#maki-text) | Text utilities: format conversion, the fuzzy matcher the built-in |
 | [`maki.treesitter`](#maki-treesitter) | Tree-sitter parsing and query API. |
 | [`maki.treesitter.language`](#maki-treesitter-language) | Language registry for tree-sitter grammars. |
 | [`maki.treesitter.query`](#maki-treesitter-query) | Query compilation and lookup. |
@@ -395,8 +395,8 @@ print(maki.json.encode(t)) -- {"a":null}
 
 Declare global packages and inspect package state.
 
-`add` is available only in the global `init.lua`. `get` is read-only
-and is available in project config and packages.
+`add` is available only in the global `init.lua` and `ui.lua`. `get`
+is read-only and is available in project config and packages.
 
 ---
 
@@ -406,7 +406,10 @@ and is available in project config and packages.
 maki.pack.add({specs}, {opts?})
 ```
 
-Declare global packages after the global `init.lua` finishes.
+Declare global packages after the global `init.lua` or `ui.lua`
+finishes. A declaration in `init.lua` sets the load policy of the
+package's agent component, one in `ui.lua` its UI component's, and both
+must name the same source.
 
 **Parameters:**
 
@@ -475,6 +478,16 @@ string or a table with richer output fields.
 "full" when code such as `code_execution` made the call. Apply output limits
 only in compact mode.
 
+`ctx:stream(text)` appends live text to the running call and
+`ctx:set_state(value)` replaces its live state. Both publish progress
+that a frontend can show while the handler runs. The handler's returned
+output and `state` replace both when it finishes, and the streamed text
+is never stored. In a call made by another tool both do nothing.
+
+`ctx:place()` returns the session's directories as `{ cwd, home }`, the
+ones a renderer's ctx carries, to shorten paths as the session sees them.
+They are the session's working directory and the agent's home.
+
 **Parameters:**
 
 - `{spec}` (`table`) Tool specification:
@@ -485,8 +498,6 @@ only in compact mode.
     Must return a string or a table with any of these fields:
     - `llm_output` (`string`) Result text for the model or the calling code.
     - `is_error` (`boolean`) When true, the result is treated as an error.
-    - `body` (`BufHandle`) Rich rendered body shown in the UI.
-    - `header` (`BufHandle`) One-line header shown before the body.
     - `format` (`string`) "plain" (default) or "markdown".
     - `annotation` (`string`) Short label shown next to the tool call.
     - `written_path` (`string`) Path of a file written by the tool.
@@ -494,20 +505,17 @@ only in compact mode.
     - `diff_before` (`string`) Before text of the diff.
     - `diff_after` (`string`) After text of the diff.
     - `image` (`maki.image.Image|table`) An Image, or { media_type: string, data: string } base64 image.
-    - `state` (`any`) Serializable state forwarded to restore.
+    - `state` (`any`) Serializable state sent to the UI renderer.
   - `audiences` (`string[]`) Which model audiences see the tool. Values: "main", "sub", "all". Default: all audiences.
   - `kind` (`string`) Optional grouping label (e.g. "filesystem").
   - `timeout` (`number`) Execution timeout in seconds. 0 or false disables. Default: inherits agent deadline.
-  - `header` (`function`) Optional. Called before execution, returns a string or BufHandle for the one-line header.
-  - `restore` (`function`) Optional. Called to re-render a previous tool result. Receives `(tool_name, input, output, ctx)`.
-  - `start` (`function`) Optional. Called when the tool call starts, before the handler runs.
   - `describe` (`function`) Optional. Returns a custom description string for the current context.
+  - `summary` (`function`) Optional. Called with `(input)` on the agent, returns the plain-text title of the call. Default: the tool name.
   - `examples` (`table`) Optional. Array of example input objects for documentation.
   - `permission_scopes` (`string|function`) Field name in schema (string) or `function(input)` returning a list of path scopes that need write permission. Declaring it is what puts the tool in front of the permission prompt, and it requires `permission`.
   - `permission` (`string`) The capability the tool reaches: "fs_read", "fs_write", "net", "run", or "env". Your plugin must hold it, and so must any plugin that pre-approves the tool, hooks it, or hands it to a session. Without `permission_scopes` the tool never prompts, the right declaration for read-only tools. A tool declaring neither costs those plugins every permission.
   - `mutable_path` (`string`) Schema field name (type: string) for the primary path the tool writes. Required with `permission = "fs_write"`. Declaring it is what gets the tool, from the dispatcher and never from the handler: serialization of concurrent calls on that file, the stale-read rejection, the plan-mode block, and the permission boundary check.
   - `start_annotation` (`string|table`) Schema field used to annotate the start header with a count (string) or timeout (`{ field, kind="timeout" }`).
-  - `needs_background` (`boolean`) Offer the tool only to a model that can move a call to the background itself: the main agent of a session where background tasks are on. Default: false. A schema property can set the same key to hide just that (optional) parameter. The choice is made when the session's tool list is built, and a call that names a hidden parameter still validates.
 
 **Example:**
 
@@ -788,25 +796,13 @@ maki.api.get_tool({name})
 ```
 
 Look up a single tool by name. Returns its metadata table or nil if the
-tool does not exist. For Lua-registered tools the returned table also
-includes `header` and `restore` handle functions (wrapped so they never
-throw).
-
-`tool_search` and MCP tools (`server__tool` names) never enter the
-registry. For them the table holds only `name`, `header`, and the
-`format` ("plain" or "markdown") of the standalone call, enough for a
-composing tool like batch to draw a child the same way. Any
-`server__tool` shaped name resolves whether or not a server offers it,
-so this is not an existence check for MCP tools.
-
-`background_params` lists the parameters marked `needs_background`,
-which only a session that can move calls to the background sees.
+tool does not exist.
 
 **Parameters:**
 
 - `{name}` (`string`) Exact tool name.
 
-**Returns:** (`table|nil`) Tool entry with fields { name, schema, audiences, kind?, background_params?, header?, restore?, format? }, or nil if not found.
+**Returns:** (`table|nil`) Tool entry with fields { name, schema, audiences, kind?, background_params }, or nil if not found.
 
 **Example:**
 
@@ -1305,7 +1301,8 @@ Plan-mode surface for plugins.
 
 Read the plan, and shape the plan form by layering the two slots maki
 fires around it. Plan state is per session, so every call takes an
-optional `session` and defaults to the focused tab.
+optional `session` and defaults to the focused tab. Under
+`maki connect`, `read` reads the connected agent's plan.
 
 `ui.plan_form.actions` is the menu. The default answers with the
 built-in rows, each `{ id, label, desc, action }`, and a layer
@@ -1630,8 +1627,24 @@ maki.agent.call_tool({ctx}, {name}, {input}, {opts?})
 Run a tool by name and wait for the result. This is how you call built-in
 tools (like `read`, `bash`, `glob`) from Lua without going through the LLM.
 
-Live events (streaming output, annotations, cumulative usage) are delivered
-through optional callbacks while the tool runs.
+Live events (streaming output, annotations, cumulative usage, progress) are
+delivered through optional callbacks while the tool runs.
+
+A call reads as the `data` a renderer draws it from (see
+`maki.ui.register_renderer`): `tool`, `version`, `input` (the input it ran
+with, after input hooks), `output` (the `ToolOutput` in its JSON form, such
+as `{ Plain = { text = "..." } }`), `state`, `status` (`"running"`,
+`"done"`, `"error"` or `"cancelled"`), `summary`, `annotations`,
+`rewritten` (true when an output hook changed its output) and `children`.
+Each of `children` is a call it made in turn, with `usage` and `index`,
+its 1-based invocation index.
+
+An `on_progress` update names the call that changed by `path`: empty for
+this call, `{ i }` for the call it made at invocation index `i`, and so on
+down. It carries `append`, the text that call streamed, or `state`, its new
+live state (`maki.NIL` for null), or `child`, its whole record as a call
+of `children` reads. A record comes at the call's start, with the input it
+runs with, and again on each change, its end included.
 
 **Parameters:**
 
@@ -1644,8 +1657,6 @@ through optional callbacks while the tool runs.
     "compact" returns what the model would get, with output limits and
     RTK rewriting. Permissions and hooks apply in both modes, and hooks
     see the mode as `ctx.output_mode`.
-  - `on_live_buf` (`function?`) called with a `BufHandle` for each live buffer
-    the tool publishes. Must not yield.
   - `on_annotation` (`function?`) called with an annotation string for each
     annotation event. Must not yield. A call a `permission.prompt` layer
     allowed arrives as `"allowed by <plugin>"`. Without this callback that
@@ -1659,7 +1670,8 @@ through optional callbacks while the tool runs.
     a subagent, which `/tasks` then lists as a task of its own. Must not
     yield.
 
-**Returns:** (`string?`, `string?`) Tool output text, or `(nil, err)` on failure.
+**Returns:** (`string?`, `string?`, `table?`) Tool output text, or `(nil, err)` on
+  failure, then the call once it ran, its `status` `"done"` or `"error"`.
   Instruction files the child picks up (a subdirectory `AGENTS.md`) are
   not in the text: they land on the calling tool's own result.
 
@@ -2534,7 +2546,9 @@ Requires the `run` [plugin permission](#plugin-permissions).
 - `{cmd}` (`string|table`) Shell command, or an argv table like
   `{ "tail", "-F", path }`.
 - `{opts?}` (`table?`) Optional settings:
-  - `cwd` (`string?`) working directory (tilde is expanded).
+  - `cwd` (`string?`) working directory, relative to the calling session.
+    Defaults to that session's directory, or the process directory outside
+    a tool call. Tilde is expanded.
   - `env` (`table?`) extra environment variables, `{ VAR = "value" }`.
   - `on_stdout` (`function?`) called with `(job_id, line, "stdout", bytes)`
     for each stdout line, the stream name third as in Neovim (which
@@ -2544,8 +2558,8 @@ Requires the `run` [plugin permission](#plugin-permissions).
   - `on_stderr` (`function?`) called with `(job_id, line, "stderr", bytes)`
     for each stderr line.
   - `on_exit` (`function?`) called with `(job_id, code)` when the process finishes.
-  - `stdout` (`string|false?`) append stdout to this path, or `false` to
-    discard it.
+  - `stdout` (`string|false?`) append stdout to this path, relative to the
+    calling session, or `false` to discard it.
   - `stderr` (`string|false?`) same for stderr; both may name one path.
   - `scope` (`string|table?`) job lifetime. `"task"` (default) ends the job
     with the current call. `"plugin"` keeps it alive until the plugin
@@ -2902,7 +2916,8 @@ end)
 File-system utilities, modelled after `vim.fs` and `vim.uv`.
 
 Fallible operations return `(value, err)` pairs and never throw.
-Paths support `~/` expansion. Relative paths resolve from the current working directory.
+Paths support `~/` expansion. During tool calls, relative paths use
+the calling session's directory. Other code uses the process directory.
 
 ```lua
 local text, err = maki.fs.read("init.lua")
@@ -4361,8 +4376,14 @@ maki.log.error("failed to connect to API")
 
 The model behind the focused session. Good for a keybind that flips
 between your two go-to models, or lifts thinking for one hard question.
-Without an interactive UI every function returns
+Without an interactive UI, `get`, `available` and `set` return
 `nil, "no interactive UI attached"`.
+
+Under `maki connect` the connected agent answers `get`, `available`
+and `set`. `set` changes thinking and fast mode and returns the state
+once the agent confirms it. A model spec returns an error there, so
+switch models with `/model`. `info` and `tier` return
+`nil, "no local agent attached"`.
 
 ---
 
@@ -5088,6 +5109,11 @@ Without a UI, most functions return `nil, "no interactive UI attached"`.
 `prompt` or `focus` still work. ACP has no focused session, so there
 `current` fails and `read`, `export` and `messages` need `session`.
 
+Under `maki connect` the connected agent answers. `list` returns its
+sessions for the workspace, `live` and `current` the connected one,
+and `read`, `prompt`, `set_mode` and `focus` take only that session.
+The other functions return an error.
+
 ---
 
 ### `maki.session.list()` {#maki-session-list}
@@ -5580,7 +5606,8 @@ h:stop()
 The subagents of the focused session and their transcripts. Tasks are
 spawned by the `task` tool and addressed by an id that survives a reload.
 Without an interactive UI every function returns
-`nil, "no interactive UI attached"`.
+`nil, "no interactive UI attached"`. The agent-only `stop(ctx, id)`
+form is also available without a UI.
 
 ---
 
@@ -5718,12 +5745,13 @@ local stopped, err = maki.task.stop(ctx, input.id)
 
 ## maki.text {#maki-text}
 
-Text utilities: format conversion and the fuzzy matcher the built-in
-pickers use.
+Text utilities: format conversion, the fuzzy matcher the built-in
+pickers use, and the formatting helpers the agent and the UI share.
 
 ```lua
 local md = maki.text.html_to_markdown(html)
 local hits = maki.text.fuzzy_list("mrs", names, { limit = 10 })
+local took = maki.text.humantime(90)
 ```
 
 ---
@@ -5826,6 +5854,103 @@ Needs no plugin permission.
 for _, m in ipairs(maki.text.fuzzy_list(query, names, { limit = 10 })) do
   print(m.text, m.score)
 end
+```
+
+---
+
+### `maki.text.humantime()` {#maki-text-humantime}
+
+```lua
+maki.text.humantime({secs})
+```
+
+Formats a number of seconds into a short, human-friendly string.
+Useful for displaying elapsed time in status messages.
+
+**Parameters:**
+
+- `{secs}` (`integer`) Duration in seconds.
+
+**Returns:** (`string`) Human-readable duration, e.g. "1m30s".
+
+**Example:**
+
+```lua
+maki.text.humantime(90)   -- "1m30s"
+maki.text.humantime(3661) -- "1h1m1s"
+```
+
+---
+
+### `maki.text.display_width()` {#maki-text-display_width}
+
+```lua
+maki.text.display_width({text})
+```
+
+Returns the display width of a string in terminal cells, matching
+how `ratatui` measures text.
+
+**Parameters:**
+
+- `{text}` (`string`) The text to measure.
+
+**Returns:** (`integer`) Number of display cells the text occupies.
+
+**Example:**
+
+```lua
+local w = maki.text.display_width("hello")
+```
+
+---
+
+### `maki.text.truncate_text()` {#maki-text-truncate_text}
+
+```lua
+maki.text.truncate_text({text}, {max_width})
+```
+
+Splits a string at a display-cell boundary.
+
+**Parameters:**
+
+- `{text}` (`string`) The text to split.
+- `{max_width}` (`integer`) Maximum display cells for the head.
+
+**Returns:** (`table`) `{head = string, tail = string}`.
+
+**Example:**
+
+```lua
+local t = maki.text.truncate_text("hello world", 5)
+-- t.head == "hello", t.tail == " world"
+```
+
+---
+
+### `maki.text.diff()` {#maki-text-diff}
+
+```lua
+maki.text.diff({before}, {after})
+```
+
+Computes changed line groups from the before and after file contents.
+Each group has `before_start`, `after_start`, and `lines`. A line is
+`{ Unchanged = text }`, `{ Added = spans }`, or `{ Removed = spans }`.
+Each span has `text` and `emphasized` fields.
+
+**Parameters:**
+
+- `{before}` (`string`) Original file contents.
+- `{after}` (`string`) Changed file contents.
+
+**Returns:** (`table[]`) Diff hunks with three lines of surrounding context.
+
+**Example:**
+
+```lua
+local hunks = maki.text.diff("old\n", "new\n")
 ```
 
 
@@ -7161,33 +7286,19 @@ not saved.
 ### `maki.ui.buf()` {#maki-ui-buf}
 
 ```lua
-maki.ui.buf({opts?})
+maki.ui.buf()
 ```
 
-Creates a new buffer for building UI content. The first buffer
-created in a task becomes the "live" buffer, streamed to the UI while
-the tool runs, which is what the tool's own output pane wants. A
-float that opens during a tool call would take that spot away, so
-create its buffer with `{ scratch = true }`. It matches nvim's
-`nvim_create_buf(false, true)`. A buffer belongs to the task that
-made it, so this throws at a plugin's top level.
-
-**Parameters:**
-
-- `{opts?}` (`table?`) Optional. `scratch` (boolean) keeps the buffer out of the live slot, default false.
+Creates a buffer for a tool renderer or plugin window. It belongs to
+the task that made it, so this throws at a plugin's top level.
 
 **Returns:** ([`Buf`](#maki-ui-Buf)) Buffer handle.
 
 **Example:**
 
 ```lua
--- The tool's output pane:
 local out = maki.ui.buf()
 out:line("hello world")
-
--- A float raised during a tool call needs its own buffer:
-local toast = maki.ui.buf({ scratch = true })
-toast:line("copied!")
 ```
 
 ---
@@ -7325,21 +7436,13 @@ end
 maki.ui.humantime({secs})
 ```
 
-Formats a number of seconds into a short, human-friendly string.
-Useful for displaying elapsed time in status messages.
+The same function as `maki.text.humantime`, which new code should use.
 
 **Parameters:**
 
 - `{secs}` (`integer`) Duration in seconds.
 
 **Returns:** (`string`) Human-readable duration, e.g. "1m30s".
-
-**Example:**
-
-```lua
-maki.ui.humantime(90)   -- "1m30s"
-maki.ui.humantime(3661) -- "1h1m1s"
-```
 
 ---
 
@@ -7369,20 +7472,13 @@ local half_width = math.floor(size.cols / 2)
 maki.ui.display_width({text})
 ```
 
-Returns the display width of a string in terminal cells, matching
-how `ratatui` measures text.
+The same function as `maki.text.display_width`, which new code should use.
 
 **Parameters:**
 
 - `{text}` (`string`) The text to measure.
 
 **Returns:** (`integer`) Number of display cells the text occupies.
-
-**Example:**
-
-```lua
-local w = maki.ui.display_width("hello")
-```
 
 ---
 
@@ -7392,7 +7488,7 @@ local w = maki.ui.display_width("hello")
 maki.ui.truncate_text({text}, {max_width})
 ```
 
-Splits a string at a display-cell boundary.
+The same function as `maki.text.truncate_text`, which new code should use.
 
 **Parameters:**
 
@@ -7400,13 +7496,6 @@ Splits a string at a display-cell boundary.
 - `{max_width}` (`integer`) Maximum display cells for the head.
 
 **Returns:** (`table`) `{head = string, tail = string}`.
-
-**Example:**
-
-```lua
-local t = maki.ui.truncate_text("hello world", 5)
--- t.head == "hello", t.tail == " world"
-```
 
 ---
 
@@ -8006,6 +8095,147 @@ maki.keymap.set("i", "<CR>", function(ev)
 end)
 ```
 
+---
+
+### `maki.ui.register_renderer()` {#maki-ui-register_renderer}
+
+```lua
+maki.ui.register_renderer({tool}, {spec})
+```
+
+Registers a renderer that draws calls of {tool} from their data, in the
+UI runtime. The data is the same for a live call, a loaded session and a
+remote agent, so a renderer never reads the agent's files or the drawing
+process's directory: it draws from `data` and `ctx` alone.
+
+A call without stored tool data, or whose renderer raises, draws with
+the default renderer.
+
+The renderers a plugin registers go when it reloads or unloads. When two
+plugins register the same tool, the later registration draws it, and the
+earlier one draws again once the later plugin unloads.
+
+A renderer keeps its view state, such as which part is expanded, on the
+`data` table. A click calls `click` with that same table, and `click`
+only changes the state there: what it returns is ignored. The UI then
+draws the call again with `header` and `body` from that table. A call
+drawn long ago, or before a reload, is drawn once to set its state up,
+then given its earlier clicks again in order, each followed by a draw, so
+a click ends the same either way. The UI draws a call that way whenever
+its data, the theme or the routing changes, so the clicks keep the state
+they made. The clicks of one call run one at a time. Work that `header`,
+`body` or `click` starts with `maki.async.run` finishes before the UI
+shows the result.
+
+`header` and `body` take `(data, ctx)`. The fields of `data`:
+
+- `tool` (string) and `version` (integer) name the call's data.
+- `input` (table) is the input the call ran with.
+- `output` (table|nil) is the finished call's `ToolOutput` in its JSON form, such as `{ Plain = { text = "..." } }`.
+- `state` (any) is the handler's state, its latest live state while it runs.
+- `stream` (string|nil) is the text the handler streamed with `ctx:stream` while it runs.
+- `status` (string) is `"running"`, `"done"`, `"error"` or `"cancelled"`.
+- `summary` (string) and `annotations` (string[]) are the call's title and its annotations in order.
+- `children` (table[]) holds the calls it made through `maki.agent.call_tool`, each with these fields, `usage` (string|nil) and `index` (integer). The list is in invocation order but leaves out a call that has sent nothing yet, so `index` is the call's 1-based invocation index, which pairs `children[k]` with `input.tool_calls[children[k].index]` for a tool such as `batch`.
+- `rewritten` (boolean) is true when a `tool.<name>.output` layer changed the call's output. Its `state` is gone then, and the call draws with the default renderer, so a renderer only sees it as a child.
+
+The fields of `ctx`:
+
+- `cwd` (string) is the session's working directory.
+- `home` (string|nil) is the agent's home directory.
+- `tool_output_lines` (table) holds the UI's line limits per tool kind.
+- `width` (integer) is the number of columns to draw in.
+- `reason` (string) is `"live"` for a running or just finished call, `"load"` for a session being loaded and `"rerender"` for a call drawn again.
+
+**Parameters:**
+
+- `{tool}` (`string`) Tool name.
+- `{spec}` (`table`) Renderer:
+  - `header` (`function`) Optional. `header(data, ctx)` returns the header line as a string, or a buffer.
+  - `body` (`function`) Optional. `body(data, ctx)` returns a buffer, or nil for no body.
+  - `click` (`function`) Optional. `click(data, ctx, row)` changes the state on `data` for a click on line `row` of the body, 1-based, or 0 outside it.
+
+  One of `header` and `body` is required. Throws on any other field.
+
+
+**Example:**
+
+```lua
+maki.ui.register_renderer("greet", {
+  header = function(data) return "greet " .. data.input.name end,
+  body = function(data, ctx)
+    local buf = maki.ui.buf()
+    buf:line(data.state and data.state.greeting or "")
+    return buf
+  end,
+})
+```
+
+---
+
+### `maki.ui.renderer()` {#maki-ui-renderer}
+
+```lua
+maki.ui.renderer({tool})
+```
+
+The renderer that draws {tool}, for a renderer that draws
+another tool's data, such as a child call. Each call of a returned
+function draws with the renderer registered then, so a table kept across
+a reload or a takeover draws with the current one. When no renderer is
+registered, or `data.rewritten` is true, the default draws: its `header`
+returns `data.summary`, its `body` returns nil and its `click` does
+nothing, and so does a part the registered renderer leaves out.
+
+`click(data, ctx, row)` gives the click to the renderer's `click`, which
+changes the state on `data`, and returns nothing: draw `header` and `body`
+from `data` again to show what it changed.
+
+No function raises: an error is logged and returns nil.
+
+**Parameters:**
+
+- `{tool}` (`string`) Tool name, such as a child's `tool`.
+
+**Returns:** (`table`) `{ header = function(data, ctx), body = function(data, ctx), click = function(data, ctx, row) }`.
+
+**Example:**
+
+```lua
+for _, child in ipairs(data.children) do
+  local draw = maki.ui.renderer(child.tool)
+  local header = draw.header(child, ctx)
+  if type(header) == "string" then buf:line(header) end
+end
+```
+
+---
+
+### `maki.ui.has_renderer()` {#maki-ui-has_renderer}
+
+```lua
+maki.ui.has_renderer({tool})
+```
+
+Whether {tool} has a registered renderer now, so
+`maki.ui.renderer(tool)` draws with it rather than with the
+default. A call whose `data.rewritten` is true still draws with the
+default.
+
+**Parameters:**
+
+- `{tool}` (`string`) Tool name.
+
+**Returns:** (`boolean`)
+
+**Example:**
+
+```lua
+if maki.ui.has_renderer(child.tool) then
+  local header = maki.ui.renderer(child.tool).header(child, ctx)
+end
+```
+
 
 ## maki.ui.Win {#maki-ui-Win}
 
@@ -8466,7 +8696,8 @@ local home = maki.uv.os_homedir()
 maki.uv.cwd()
 ```
 
-Return the current working directory as an absolute path. Like `vim.uv.cwd`.
+Return the calling session's working directory during tool calls, or
+the process directory outside a call. Like `vim.uv.cwd`.
 
 Requires the `fs_read` [plugin permission](#plugin-permissions).
 
@@ -8621,10 +8852,78 @@ return M
 
 ```lua
 -- Shared directory listing for index and list plugins, so every caller
--- shows a directory the same way. Listing also loads the directory's
--- instruction files onto the call.
+-- lists a directory the same way. Listing also loads the directory's
+-- instruction files onto the call. `maki.dir_listing_view` shows it.
+
+local M = {}
+
 function M.list(path, ctx)
+  local entries, err = maki.fs.dir(path)
+  if not entries then
+    return nil, err
+  end
+
+  local dirs = {}
+  local files = {}
+  for _, entry in ipairs(entries) do
+    local name, typ = entry[1], entry[2]
+    if typ == "directory" then
+      dirs[#dirs + 1] = name .. "/"
+    elseif not ctx:is_instruction_file(name) then
+      files[#files + 1] = name
+    end
+  end
+  table.sort(dirs)
+  table.sort(files)
+  for _, f in ipairs(files) do
+    dirs[#dirs + 1] = f
+  end
+
+  ctx:load_instructions(path)
+
+  return {
+    names = dirs,
+    text = table.concat(dirs, "\n"),
+    count = #dirs,
+  }
+end
+
+return M
+```
+
+### `require("maki.dir_listing_view")`
+
+```lua
+-- Shared view of a `maki.dir_listing` listing, so every caller shows a
+-- directory the same way.
+
+local ToolView = require("maki.tool_view")
+
+local DEFAULT_MAX_LINES = 10
+
+local M = {}
+
+local function view_opts(tool_output_lines)
+  return { max_lines = (tool_output_lines and tool_output_lines.read) or DEFAULT_MAX_LINES, keep = "head" }
+end
+
+-- The view for a handler or a `restore`, which a click toggles.
 function M.view(text, ctx)
+  return ToolView.restore(text, view_opts(ctx:tool_output_lines()))
+end
+
+-- The same view for a renderer and its `ctx`, collapsed or {expanded}.
+function M.draw(text, ctx, expanded)
+  return ToolView.draw(text, view_opts(ctx.tool_output_lines), expanded)
+end
+
+return M
+```
+
+### `require("maki.execution_view")`
+
+```lua
+function M.draw(data, ctx, language)
 ```
 
 ### `require("maki.fuzzy_replace")`
@@ -8694,6 +8993,7 @@ ListPicker.clamp_parts = clamp_parts
 -- Shared per-tool output limit options, so the tools that support them
 -- cannot drift apart.
 M.DEFAULT_MAX_LINE_BYTES = DEFAULT_MAX_LINE_BYTES
+M.STATE_TEXT_MAX_BYTES = STATE_TEXT_MAX_BYTES
 M.FULL_OUTPUT_MAX_BYTES = FULL_OUTPUT_MAX_BYTES
 M.FULL_OUTPUT_MAX_LINES = FULL_OUTPUT_MAX_LINES
 
@@ -8739,6 +9039,9 @@ function Collector:result()
 --- half of every limit. A nil limit is unlimited. The marker between the two
 --- notes how many lines and bytes it dropped.
 function M.cut_middle(text, max_lines, max_bytes)
+
+-- Display text is bounded independently of the model's full-output mode.
+function M.live_collector(ctx, state)
 ```
 
 ### `require("maki.partial")`
@@ -8746,13 +9049,50 @@ function M.cut_middle(text, max_lines, max_bytes)
 ```lua
 -- When a tool is cut short, it still hands back what it printed. The marker
 -- tells the model that output is real but unfinished. One home for the
--- wording and the painting, so every tool says it the same way.
+-- wording, so every tool says it the same way.
 
---- Close {view} on the marker and build the tool reply. {out} is everything
---- the tool streamed, already truncated; empty means the view still shows a
---- placeholder to drop. {reason} is a cancel-hook reason ("cancelled" |
---- "timeout" | "stopped"). {started_at} is the `os.time()` the tool began at.
-function M.cut(view, out, reason, timeout_secs, started_at)
+--- The marker that closes {out}, everything the tool streamed, already
+--- truncated. {reason} is a cancel-hook reason ("cancelled" | "timeout" | "stopped").
+--- {started_at} is the `os.time()` the tool began at.
+function M.marker(out, reason, timeout_secs, started_at)
+
+--- The tool reply that hands the model {out} closed on {marker}.
+function M.reply(out, marker)
+```
+
+### `require("maki.path_text")`
+
+```lua
+-- Paths as text against a place given in full, so it reads no directory
+-- and needs no permission. A renderer passes its `ctx.cwd` and `ctx.home`.
+
+local M = {}
+
+local function normalize_sep(s)
+  return s:gsub("\\", "/")
+end
+
+-- {path} relative to {cwd}, else under {home} as `~/...`. Either can be nil.
+function M.shorten(path, cwd, home)
+  local p = normalize_sep(path)
+  if cwd then
+    cwd = normalize_sep(cwd)
+    if p:sub(1, #cwd + 1) == cwd .. "/" then
+      local rel = p:sub(#cwd + 2)
+      return rel == "" and "." or rel
+    end
+  end
+  if home then
+    home = normalize_sep(home)
+    if p:sub(1, #home + 1) == home .. "/" then
+      local rel = p:sub(#home + 2)
+      return rel == "" and "~" or "~/" .. rel
+    end
+  end
+  return path
+end
+
+return M
 ```
 
 ### `require("maki.provider_parse")`
@@ -8806,29 +9146,13 @@ return scroll
 ### `require("maki.shorten_path")`
 
 ```lua
-local function normalize_sep(s)
-  return s:gsub("\\", "/")
-end
+local path_text = require("maki.path_text")
 
+-- `path` against the drawing process's own directories. A renderer uses
+-- `maki.path_text` with its ctx instead, so it shortens against the session
+-- the call ran in.
 local function shorten_path(path)
-  local p = normalize_sep(path)
-  local cwd = maki.uv.cwd()
-  if cwd then
-    cwd = normalize_sep(cwd)
-    if p:sub(1, #cwd + 1) == cwd .. "/" then
-      local rel = p:sub(#cwd + 2)
-      return rel == "" and "." or rel
-    end
-  end
-  local home = maki.uv.os_homedir()
-  if home then
-    home = normalize_sep(home)
-    if p:sub(1, #home + 1) == home .. "/" then
-      local rel = p:sub(#home + 2)
-      return rel == "" and "~" or "~/" .. rel
-    end
-  end
-  return path
+  return path_text.shorten(path, maki.uv.cwd(), maki.uv.os_homedir())
 end
 
 return shorten_path
@@ -8970,6 +9294,12 @@ function ToolView:update_line(all_idx, line)
 function ToolView:finish()
 function ToolView.restore_lines(lines, opts)
 
+-- The same view of {text} for a renderer, collapsed or {expanded}: the
+-- renderer's `click` keeps that flag on its data.
+function ToolView.draw_lines(lines, opts, expanded)
+function ToolView.draw(text, opts, expanded)
+function ToolView.draw_output(data, ctx)
+
 -- Rebuild a collapsed view from a tool's saved llm_output, click-to-toggle
 -- wired. For `restore` hooks.
 function ToolView.restore(output, opts)
@@ -8986,5 +9316,19 @@ function ToolView.restore_markdown(output, is_error, opts)
 --- require("maki.truncate")(text, max_lines, max_bytes)
 --- Cuts {text} to the limits and notes how many bytes it dropped. A nil limit
 --- is unlimited.
+```
+
+### `require("maki.web_view")`
+
+```lua
+-- Shared renderer body and click of a web tool's call, so every web tool
+-- shows its text the same way. The tool's reply keeps its whole text in
+-- `state.text` when the model got it cut.
+
+-- A renderer's `body`: the text in the web view, collapsed or expanded.
+function M.body(data, ctx)
+
+-- A renderer's `click`: toggles the view between collapsed and expanded.
+function M.click(data)
 ```
 

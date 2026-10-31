@@ -13,12 +13,12 @@ pub(crate) mod lua_float;
 pub(crate) mod mcp_picker;
 pub mod messages;
 pub(crate) mod modal;
-pub(crate) mod model_picker;
 pub(crate) mod pack_review;
 pub(crate) mod permission_prompt;
 pub(crate) mod plan_form;
 pub(crate) mod progress_bar;
 pub mod queue_panel;
+pub(crate) mod remote_model_picker;
 pub(crate) mod rewind_picker;
 pub(crate) mod scrollbar;
 pub(crate) mod search_modal;
@@ -30,19 +30,22 @@ pub(crate) mod thinking;
 pub(crate) mod tool_display;
 pub(crate) mod usage_modal;
 
+use maki_wire::plugins::PluginOperation;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use maki_agent::AgentInput;
-use maki_agent::{BufferSnapshot, TaskEnd, ToolDoneEvent, ToolInput, ToolOutput};
-use maki_lua::{PackCommand, PackPlan};
-use maki_providers::{ImageSource, Message, ModelTier};
+use maki_lua_core::pack::{PackCommand, PackPlan};
+use maki_types::event::ToolDoneEvent;
+use maki_types::input::AgentInput;
+use maki_types::message::{ImageSource, TaskEnd};
+use maki_types::snapshot::BufferSnapshot;
+use maki_types::tool::{ToolInput, ToolOutput};
 use ratatui::text::{Line, Span};
 
 use crate::OpenSession;
 
-pub(crate) use maki_providers::IMAGE_PLACEHOLDER;
+pub(crate) use maki_types::message::IMAGE_PLACEHOLDER;
 
 pub(crate) const CHEVRON: &str = "❯ ";
 
@@ -226,22 +229,24 @@ pub enum Action {
     },
     /// The history under this runtime changed (reset, load, rewind), so the
     /// agent has to be respawned on it.
-    RestartAgent(Vec<Message>),
+    RestartAgent,
+    Rewind(rewind_picker::RewindEntry),
     /// A copy of this session, to run beside it and take the focus.
     OpenFork(Box<OpenSession>),
     ChangeModel(String),
     RefreshProvider {
         slug: String,
     },
-    AssignTier(String, ModelTier),
-    UnassignTier(String, ModelTier),
-    RefreshModels,
     RefreshUsage,
     Compact(Option<String>),
     ToggleMcp(String, bool),
     OpenEditor(PathBuf),
     EditInputInEditor,
     Btw(String),
+    /// `/login` on a remote tab: the agent's own login, in this terminal.
+    RemoteLogin,
+    /// The plan editor on a remote tab: the agent's plan, edited as a copy.
+    EditRemotePlan,
     PreparePack(PackCommand),
     Suspend,
 }
@@ -255,13 +260,14 @@ pub enum ExitRequest {
     Success,
     Error,
     Reload,
+    Plugins(PluginOperation),
     Pack(PackPlan),
 }
 
 impl ExitRequest {
     pub fn code(&self) -> i32 {
         match self {
-            Self::None | Self::Success | Self::Reload | Self::Pack(_) => 0,
+            Self::None | Self::Success | Self::Reload | Self::Plugins(_) | Self::Pack(_) => 0,
             Self::Error => 1,
         }
     }
@@ -486,36 +492,7 @@ impl DisplayRole {
 }
 
 #[cfg(test)]
-use maki_providers::ModelPricing;
-
-#[cfg(test)]
 pub(crate) const TEST_CONTEXT_WINDOW: u32 = 200_000;
-
-#[cfg(test)]
-pub(crate) fn test_pricing() -> ModelPricing {
-    ModelPricing::per_million(3.0, 15.0, 3.75, 0.30)
-}
-
-#[cfg(test)]
-pub(crate) fn test_model() -> maki_providers::Model {
-    maki_providers::Model {
-        id: "test-model".into(),
-        provider: std::sync::Arc::<str>::from("anthropic"),
-        tier: maki_providers::ModelTier::Medium,
-        family: maki_providers::ModelFamily::Claude,
-        supports_tool_examples_override: None,
-        thinking_override: None,
-        supports_vision_override: Some(true),
-        supports_fast_override: None,
-        pricing: test_pricing(),
-        subsidised_by: None,
-        discovered_free: false,
-        max_output_tokens: Some(8192),
-        turn_output_tokens: None,
-        context_window: TEST_CONTEXT_WINDOW,
-        thinking_fields: None,
-    }
-}
 
 /// Every symbol in the buffer, row by row, for `assert!(screen.contains(..))`.
 #[cfg(test)]
@@ -539,7 +516,7 @@ pub(crate) fn key(code: crossterm::event::KeyCode) -> crossterm::event::KeyEvent
 #[cfg(test)]
 mod tests {
     use super::*;
-    use maki_agent::{SnapshotLine, SnapshotSpan, SpanStyle};
+    use maki_types::snapshot::{SnapshotLine, SnapshotSpan, SpanStyle};
     use test_case::test_case;
 
     const SNAPSHOT_GEN: u64 = 7;

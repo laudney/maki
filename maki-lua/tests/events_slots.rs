@@ -1,4 +1,5 @@
 use std::future::Future;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -10,14 +11,11 @@ use maki_agent::tools::hook::{self, Authority, HookCall, HookStage, Verdict};
 use maki_agent::tools::test_support::stub_ctx;
 use maki_agent::tools::{CallOrigin, ToolOutputMode, ToolRegistry};
 use maki_lua::agent_autocmd::host_event_fields;
-use maki_lua::test_support::{content_omitted_message, layer_skipped_message, runtime};
-use maki_lua::{
-    Permission, PlanActionOutcome, PlanFormRow, PlanMenu, PlanRowAction, PluginHost,
-    PluginPermissions, SessionEndReason, UiAction,
-};
+use maki_lua::test_support::content_omitted_message;
+use maki_lua::{Permission, PluginHost, PluginPermissions, SessionEndReason};
+use maki_lua_ui::{PlanActionOutcome, PlanFormRow, PlanMenu, PlanRowAction, UiAction};
 use maki_storage::id::MakiId;
 use test_case::test_case;
-use tokio::time::timeout;
 
 const PROBE_SCHEMA: &str = r#"{ type = "object", properties = {}, additionalProperties = false }"#;
 /// Generous on purpose. A bound a slow machine can trip is a bound that fails
@@ -45,8 +43,8 @@ fn exec_tool(reg: &ToolRegistry, name: &str) -> String {
         .parse(&serde_json::json!({}))
         .expect("parse failed");
     let ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
-    let out = runtime()
-        .block_on(inv.execute(&ctx))
+    let out = maki_lua::test_support::runtime()
+        .block_on(async { inv.execute(&ctx).await })
         .output
         .unwrap_or_else(|e| panic!("tool {name} failed: {e}"));
     match out {
@@ -73,6 +71,18 @@ maki.api.register_tool({{
 
 // ---------------------------------------------------------------- events
 
+fn ui_load(host: &maki_lua_ui::UiHost, name: &str, source: &str) {
+    host.load_source(name, source).unwrap();
+}
+fn ui_load_granted(
+    host: &maki_lua_ui::UiHost,
+    name: &str,
+    source: &str,
+    permissions: PluginPermissions,
+) {
+    host.load_source_with_permissions(name, source, permissions)
+        .unwrap();
+}
 const CONTENT_READER: &str = "content_reader";
 const CONTENT_BLIND: &str = "content_blind";
 const SENTINEL_EVENT: &str = "User";
@@ -127,10 +137,10 @@ fn flashes_until_sentinel(ui: &flume::Receiver<UiAction>) -> Vec<String> {
 #[test_case("InputChanged" ; "input_changed")]
 fn content_fields_are_left_out_without_session_read(event: &str) {
     let fields = host_event_fields(event).expect("a content event is classified");
-    let (_reg, host) = host();
+    let host = maki_lua_ui::UiHost::bare();
     let ui = host.ui_action_rx();
-    load(&host, CONTENT_READER, &key_reporter(CONTENT_READER, event));
-    load_granted(
+    ui_load(&host, CONTENT_READER, &key_reporter(CONTENT_READER, event));
+    ui_load_granted(
         &host,
         CONTENT_BLIND,
         &key_reporter(CONTENT_BLIND, event),
@@ -143,7 +153,7 @@ fn content_fields_are_left_out_without_session_read(event: &str) {
         .chain(fields.metadata)
         .map(|key| ((*key).to_owned(), PAYLOAD_VALUE.into()))
         .collect();
-    let events = host.event_handle();
+    let events = host.core_handle();
     events.fire_autocmd(event, payload.clone().into());
     events.fire_autocmd(event, payload.into());
     events.fire_autocmd(SENTINEL_EVENT, serde_json::json!({}));
@@ -182,16 +192,16 @@ const CUSTOM_EVENT: &str = "MyPluginEvent";
 #[test_case("TurnEnd", false ; "an_unclassified_host_key_is_left_out")]
 #[test_case(CUSTOM_EVENT, true ; "a_plugin_event_arrives_whole")]
 fn only_classified_metadata_reaches_a_plugin_without_session_read(event: &str, whole: bool) {
-    let (_reg, host) = host();
+    let host = maki_lua_ui::UiHost::bare();
     let ui = host.ui_action_rx();
-    load_granted(
+    ui_load_granted(
         &host,
         CONTENT_BLIND,
         &key_reporter(CONTENT_BLIND, event),
         without_session_read(),
     );
 
-    let events = host.event_handle();
+    let events = host.core_handle();
     events.fire_autocmd(
         event,
         serde_json::json!({ SESSION_ID_KEY: PAYLOAD_VALUE, UNCLASSIFIED_KEY: PAYLOAD_VALUE }),
@@ -239,16 +249,16 @@ maki.api.create_autocmd("{SENTINEL_EVENT}", {{
 #[test]
 fn a_key_that_cannot_be_named_does_not_drop_the_event() {
     let event = "TurnEnd";
-    let (_reg, host) = host();
+    let host = maki_lua_ui::UiHost::bare();
     let ui = host.ui_action_rx();
-    load(&host, CONTENT_READER, &key_counter(CONTENT_READER, event));
-    load_granted(
+    ui_load(&host, CONTENT_READER, &key_counter(CONTENT_READER, event));
+    ui_load_granted(
         &host,
         CONTENT_BLIND,
         &key_counter(CONTENT_BLIND, event),
         without_session_read(),
     );
-    load(
+    ui_load(
         &host,
         KEY_FIRER,
         &format!(
@@ -445,7 +455,7 @@ end }})
         probe_tool("probe_turn_end", "return table.concat(log, \";\")")
     );
     load(&host, "listener", &listener);
-    host.event_handle()
+    host.core_handle()
         .fire_autocmd("TurnEnd", serde_json::json!({ "k": "v" }));
     assert_eq!(exec_tool(&reg, "probe_turn_end"), "TurnEnd|nil|v");
 }
@@ -477,7 +487,7 @@ end }})
         SessionEndReason::Completed,
     ] {
         let session = MakiId::generate();
-        host.event_handle().end_sessions_blocking([session], reason);
+        host.core_handle().end_sessions_blocking([session], reason);
         expected.push(format!("{session}|{reason}|number"));
     }
     assert_eq!(
@@ -492,7 +502,7 @@ end }})
         SessionEndReason::Delete,
     ] {
         let session = MakiId::generate();
-        host.event_handle().end_session(session, reason);
+        host.core_handle().end_session(session, reason);
         expected.push(format!("{session}|{reason}|nil"));
     }
 
@@ -583,6 +593,7 @@ fn call_of<'a>(
     cancel: &'a CancelToken,
 ) -> HookCall<'a> {
     HookCall {
+        working_dir: Path::new(env!("CARGO_MANIFEST_DIR")),
         tool,
         tool_id: TOOL_ID,
         tool_kind: None,
@@ -590,8 +601,8 @@ fn call_of<'a>(
         session_id: None,
         origin,
         output_mode: ToolOutputMode::Compact,
-        authority,
         receipt: false,
+        authority,
         cancel,
         deadline: Instant::now() + DISPATCH_TIMEOUT,
     }
@@ -613,9 +624,14 @@ fn fire_call(
 /// Bounded, so a seam that stops answering fails the test instead of hanging
 /// the suite.
 fn within<T>(work: impl Future<Output = T>) -> T {
-    runtime()
-        .block_on(async { timeout(DISPATCH_TIMEOUT, work).await })
-        .expect(NEVER_ANSWERED)
+    maki_lua::test_support::runtime().block_on(async {
+        let work = async { Some(work.await) };
+        let give_up = async {
+            tokio::time::sleep(DISPATCH_TIMEOUT).await;
+            None
+        };
+        tokio::select! { value = work => value, value = give_up => value }.expect(NEVER_ANSWERED)
+    })
 }
 
 /// Fires one stage the way `tool_dispatch::run` does, with the authority the
@@ -633,7 +649,7 @@ fn fire(
         reg,
         &call_of(
             tool,
-            Authority::from(entry.tool.reach()),
+            hook::authority_of(entry.tool.reach()),
             origin,
             &CancelToken::none(),
         ),
@@ -680,6 +696,38 @@ fn output(reg: &ToolRegistry, tool: &str, text: &str, is_error: bool) -> Option<
             unreachable!("an output layer cannot escalate, got {reason}")
         }
     }
+}
+
+#[test]
+fn tool_hook_file_access_uses_the_calling_directory() {
+    const FILE: &str = "hook-input.txt";
+    let (reg, host) = host();
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join(FILE), COMMAND).unwrap();
+    load(
+        &host,
+        LAYER_PLUGIN,
+        &layer(
+            SLOT_TOOL,
+            HookStage::Input,
+            &format!(r#"value.command = assert(maki.fs.read("{FILE}")); return prev(value, ctx)"#),
+        ),
+    );
+    let cancel = CancelToken::none();
+    let call = HookCall {
+        working_dir: tmp.path(),
+        ..call_of(SLOT_TOOL, Authority::Unbounded, CallOrigin::Model, &cancel)
+    };
+    let verdict = fire_call(
+        &reg,
+        &call,
+        HookStage::Input,
+        serde_json::json!({ COMMAND_FIELD: "" }),
+    );
+    let Verdict::Replaced(value) = verdict else {
+        panic!("{verdict:?}")
+    };
+    assert_eq!(value[COMMAND_FIELD], COMMAND);
 }
 
 #[test]
@@ -869,55 +917,6 @@ fn an_output_layer_pays_for_the_content_it_changes(granted: fn() -> PluginPermis
 
     let expected = runs.then(|| (REDACTED_OUTPUT.to_owned(), false));
     assert_eq!(output(&reg, GUARDED_TOOL, "secret", false), expected);
-}
-
-/// Skipping is decided on every call, so only the first one may tell the
-/// user, naming the whole gap. A gap that narrows is news: granting half of it
-/// must not leave the other half unreported.
-#[test]
-fn a_skipped_layer_warns_once_per_gap() {
-    let (reg, host) = host();
-    let ui = host.ui_action_rx();
-    guarded_tool(&host);
-    let slot = format!("tool.{GUARDED_TOOL}.{}", HookStage::Output.as_str());
-
-    load_granted(
-        &host,
-        LAYER_PLUGIN,
-        &redacting_layer(GUARDED_TOOL),
-        only_run(),
-    );
-    assert_eq!(output(&reg, GUARDED_TOOL, "secret", false), None);
-    assert_eq!(output(&reg, GUARDED_TOOL, "secret", false), None);
-    load_granted(
-        &host,
-        LAYER_PLUGIN,
-        &redacting_layer(GUARDED_TOOL),
-        run_and_read(),
-    );
-    assert_eq!(output(&reg, GUARDED_TOOL, "secret", false), None);
-
-    let both = [Permission::SessionRead, Permission::SessionWrite];
-    let about_the_slot: Vec<String> = flashes(&ui)
-        .into_iter()
-        .filter(|msg| msg.contains(&slot))
-        .collect();
-    assert_eq!(
-        about_the_slot,
-        [
-            layer_skipped_message(LAYER_PLUGIN, &slot, &both),
-            layer_skipped_message(LAYER_PLUGIN, &slot, &[Permission::SessionWrite]),
-        ]
-    );
-}
-
-fn flashes(ui: &flume::Receiver<UiAction>) -> Vec<String> {
-    ui.try_iter()
-        .filter_map(|action| match action {
-            UiAction::Flash(msg) => Some(msg),
-            _ => None,
-        })
-        .collect()
 }
 
 #[test]
@@ -1281,15 +1280,15 @@ fn plan_slot_source(slot: &str, body: &str) -> String {
     format!(r#"maki.api.set_slot("{slot}", function(prev, ev) {body} end)"#)
 }
 
-fn plan_slot_layer(host: &PluginHost, plugin: &str, slot: &str, body: &str) {
-    load(host, plugin, &plan_slot_source(slot, body));
+fn plan_slot_layer(host: &maki_lua_ui::UiHost, plugin: &str, slot: &str, body: &str) {
+    ui_load(host, plugin, &plan_slot_source(slot, body));
 }
 
-fn plan_form_layer(host: &PluginHost, plugin: &str, body: &str) {
+fn plan_form_layer(host: &maki_lua_ui::UiHost, plugin: &str, body: &str) {
     plan_slot_layer(host, plugin, "ui.plan_form", body);
 }
 
-fn actions_layer(host: &PluginHost, plugin: &str, body: &str) {
+fn actions_layer(host: &maki_lua_ui::UiHost, plugin: &str, body: &str) {
     plan_slot_layer(host, plugin, "ui.plan_form.actions", body);
 }
 
@@ -1308,8 +1307,8 @@ fn plugin_row(extra: &str) -> String {
     format!(r#"{{ id = "{PLUGIN_ID}", label = "{PLUGIN_LABEL}", {extra} }}"#)
 }
 
-fn ask_plan_form(host: &PluginHost) -> Option<PlanMenu> {
-    host.event_handle()
+fn ask_plan_form(host: &maki_lua_ui::UiHost) -> Option<PlanMenu> {
+    host.ui_handle()
         .open_plan_form(
             PLAN_PATH.to_owned(),
             PLAN_SESSION.to_owned(),
@@ -1319,11 +1318,11 @@ fn ask_plan_form(host: &PluginHost) -> Option<PlanMenu> {
         .expect("the plan form chains must answer")
 }
 
-fn plan_menu(host: &PluginHost) -> PlanMenu {
+fn plan_menu(host: &maki_lua_ui::UiHost) -> PlanMenu {
     ask_plan_form(host).expect("the built-in form must open")
 }
 
-fn menu_labels(host: &PluginHost) -> Vec<String> {
+fn menu_labels(host: &maki_lua_ui::UiHost) -> Vec<String> {
     plan_menu(host)
         .rows
         .into_iter()
@@ -1332,8 +1331,8 @@ fn menu_labels(host: &PluginHost) -> Vec<String> {
 }
 
 /// Picks {row} of {menu} and waits for the host to say what became of it.
-fn pick_row(host: &PluginHost, menu: &PlanMenu, row: usize) -> PlanActionOutcome {
-    host.event_handle()
+fn pick_row(host: &maki_lua_ui::UiHost, menu: &PlanMenu, row: usize) -> PlanActionOutcome {
+    host.ui_handle()
         .run_plan_action(
             PLAN_SESSION.to_owned(),
             menu.generation,
@@ -1360,7 +1359,7 @@ fn plugin_row_index(menu: &PlanMenu) -> usize {
 #[test_case("return prev(ev)", true ; "layer_defers_to_the_builtin")]
 #[test_case("error('boom')", true ; "broken_layer_leaves_the_builtin")]
 fn the_plan_form_slot_decides_whether_the_builtin_opens(body: &str, opens: bool) {
-    let (_reg, host) = host();
+    let host = maki_lua_ui::UiHost::bare();
     plan_form_layer(&host, PLANNER, body);
     assert_eq!(ask_plan_form(&host).is_some(), opens);
 }
@@ -1370,7 +1369,7 @@ fn the_plan_form_slot_decides_whether_the_builtin_opens(body: &str, opens: bool)
 #[test_case("ui.plan_form" ; "the_form_chain")]
 #[test_case("ui.plan_form.actions" ; "the_actions_chain")]
 fn a_parked_plan_form_layer_falls_back_to_the_builtin(slot: &str) {
-    let (_reg, host) = host();
+    let host = maki_lua_ui::UiHost::bare();
     plan_slot_layer(&host, PLANNER, slot, &parked_layer_body());
     assert_eq!(menu_labels(&host), [BUILTIN_LABEL]);
 }
@@ -1380,8 +1379,8 @@ fn a_parked_plan_form_layer_falls_back_to_the_builtin(slot: &str) {
 /// short of one grant is skipped and the built-in form opens.
 #[test]
 fn an_ungranted_layer_cannot_take_the_plan_form_over() {
-    let (_reg, host) = host();
-    load_granted(
+    let host = maki_lua_ui::UiHost::bare();
+    ui_load_granted(
         &host,
         PLANNER,
         &plan_slot_source("ui.plan_form", "return false"),
@@ -1398,8 +1397,8 @@ fn an_ungranted_layer_cannot_take_the_plan_form_over() {
 /// what reads like "Refine plan" would start a build-mode turn.
 #[test]
 fn an_ungranted_actions_layer_cannot_reach_the_menu() {
-    let (_reg, host) = host();
-    load_granted(
+    let host = maki_lua_ui::UiHost::bare();
+    ui_load_granted(
         &host,
         PLANNER,
         &plan_slot_source(
@@ -1415,7 +1414,7 @@ fn an_ungranted_actions_layer_cannot_reach_the_menu() {
 /// for.
 #[test]
 fn the_plan_form_slot_carries_the_path_and_session() {
-    let (_reg, host) = host();
+    let host = maki_lua_ui::UiHost::bare();
     plan_form_layer(
         &host,
         PLANNER,
@@ -1431,7 +1430,7 @@ fn the_plan_form_slot_carries_the_path_and_session() {
 /// built-in form with the rows the host proposed.
 #[test]
 fn an_unlayered_plan_form_opens_the_builtin() {
-    let (_reg, host) = host();
+    let host = maki_lua_ui::UiHost::bare();
     assert_eq!(menu_labels(&host), [BUILTIN_LABEL]);
 }
 
@@ -1439,7 +1438,7 @@ fn an_unlayered_plan_form_opens_the_builtin() {
 /// over tears the layer down and the built-in comes back.
 #[test]
 fn unloading_the_plan_form_owner_hands_the_form_back() {
-    let (_reg, host) = host();
+    let host = maki_lua_ui::UiHost::bare();
     plan_form_layer(&host, PLANNER, "return false");
     assert!(ask_plan_form(&host).is_none());
 
@@ -1455,7 +1454,7 @@ fn unloading_the_plan_form_owner_hands_the_form_back() {
 /// built-in ones.
 #[test]
 fn an_actions_layer_adds_its_row_to_the_menu() {
-    let (_reg, host) = host();
+    let host = maki_lua_ui::UiHost::bare();
     actions_layer(
         &host,
         PLANNER,
@@ -1472,7 +1471,7 @@ fn an_actions_layer_adds_its_row_to_the_menu() {
 /// The rows `prev` hands back are the plugin's to reorder or drop.
 #[test]
 fn an_actions_layer_can_reorder_and_drop_builtin_rows() {
-    let (_reg, host) = host();
+    let host = maki_lua_ui::UiHost::bare();
     actions_layer(
         &host,
         PLANNER,
@@ -1485,7 +1484,7 @@ fn an_actions_layer_can_reorder_and_drop_builtin_rows() {
 /// same row registered twice is still one row.
 #[test]
 fn reloading_an_actions_layer_does_not_stack_duplicates() {
-    let (_reg, host) = host();
+    let host = maki_lua_ui::UiHost::bare();
     let source = format!(
         r#"maki.api.set_slot("ui.plan_form.actions", function(prev, ev)
                local rows = prev(ev)
@@ -1494,15 +1493,15 @@ fn reloading_an_actions_layer_does_not_stack_duplicates() {
            end)"#,
         plugin_row("handler = function() end")
     );
-    load(&host, PLANNER, &source);
-    load(&host, PLANNER, &source);
+    ui_load(&host, PLANNER, &source);
+    ui_load(&host, PLANNER, &source);
     assert_eq!(menu_labels(&host), [BUILTIN_LABEL, PLUGIN_LABEL]);
 }
 
 /// Unload the plugin and the host's own rows are what is left.
 #[test]
 fn unloading_an_actions_layer_restores_the_builtin_rows() {
-    let (_reg, host) = host();
+    let host = maki_lua_ui::UiHost::bare();
     actions_layer(
         &host,
         PLANNER,
@@ -1525,7 +1524,7 @@ fn unloading_an_actions_layer_restores_the_builtin_rows() {
 #[test_case(r#"return { { label = "nope", action = "implement" } }"# ; "row_with_no_id")]
 #[test_case(r#"local rows = prev(ev) table.insert(rows, rows[1]) return rows"# ; "duplicate_ids")]
 fn a_broken_actions_layer_leaves_the_builtin_menu(body: &str) {
-    let (_reg, host) = host();
+    let host = maki_lua_ui::UiHost::bare();
     actions_layer(&host, PLANNER, body);
     assert_eq!(menu_labels(&host), [BUILTIN_LABEL]);
 }
@@ -1533,7 +1532,7 @@ fn a_broken_actions_layer_leaves_the_builtin_menu(body: &str) {
 /// A plugin cannot hand out more rows than the form can draw.
 #[test]
 fn an_actions_layer_cannot_grow_the_menu_without_bound() {
-    let (_reg, host) = host();
+    let host = maki_lua_ui::UiHost::bare();
     actions_layer(
         &host,
         PLANNER,
@@ -1553,8 +1552,8 @@ fn an_actions_layer_cannot_grow_the_menu_without_bound() {
 /// and `maki.session.*`.
 #[test]
 fn a_picked_row_runs_its_handler_with_the_plan_context() {
-    let (reg, host) = host();
-    load(
+    let host = maki_lua_ui::UiHost::bare();
+    ui_load(
         &host,
         PLANNER,
         &format!(
@@ -1568,7 +1567,7 @@ end)
 {}
 "#,
             plugin_row("handler = function(opts) seen = opts end"),
-            probe_tool(
+            ui_probe_source(
                 "probe_plan_row",
                 &format!(
                     r#"
@@ -1584,7 +1583,7 @@ return table.concat({{ seen.session, seen.path, tostring(seen.parallel) }}, "|")
     pick_row(&host, &menu, plugin_row_index(&menu));
 
     assert_eq!(
-        exec_tool(&reg, "probe_plan_row"),
+        ui_probe_result(&host, "probe_plan_row"),
         format!("{PLAN_SESSION}|{PLAN_PATH}|true")
     );
 }
@@ -1599,7 +1598,7 @@ return table.concat({{ seen.session, seen.path, tostring(seen.parallel) }}, "|")
 #[test_case("return false", PlanActionOutcome::Vetoed ; "a_handler_that_declines")]
 #[test_case("error('boom')", PlanActionOutcome::Failed ; "a_handler_that_fails")]
 fn a_handler_runs_before_the_action_it_kept(body: &str, outcome: PlanActionOutcome) {
-    let (_reg, host) = host();
+    let host = maki_lua_ui::UiHost::bare();
     actions_layer(
         &host,
         PLANNER,
@@ -1621,7 +1620,7 @@ fn a_handler_runs_before_the_action_it_kept(body: &str, outcome: PlanActionOutco
 /// hand any plugin a way to suppress every other plugin's.
 #[test]
 fn one_bad_row_does_not_cost_the_other_layers_theirs() {
-    let (_reg, host) = host();
+    let host = maki_lua_ui::UiHost::bare();
     actions_layer(
         &host,
         PLANNER,
@@ -1649,7 +1648,7 @@ fn one_bad_row_does_not_cost_the_other_layers_theirs() {
 /// walk straight past it. The re-keyed row goes, the rest of the menu stays.
 #[test]
 fn a_layer_cannot_refile_another_plugins_handler_under_a_new_id() {
-    let (_reg, host) = host();
+    let host = maki_lua_ui::UiHost::bare();
     actions_layer(
         &host,
         PLANNER,
@@ -1683,7 +1682,7 @@ fn a_layer_cannot_refile_another_plugins_handler_under_a_new_id() {
 /// everything else and a pick after that reaches nothing.
 #[test]
 fn unloading_a_plugin_reaps_the_handlers_of_a_drawn_menu() {
-    let (_reg, host) = host();
+    let host = maki_lua_ui::UiHost::bare();
     actions_layer(
         &host,
         PLANNER,
@@ -1717,7 +1716,7 @@ fn unloading_a_plugin_reaps_the_handlers_of_a_drawn_menu() {
 /// saw.
 #[test]
 fn a_pick_from_a_replaced_menu_reaches_no_handler() {
-    let (_reg, host) = host();
+    let host = maki_lua_ui::UiHost::bare();
     actions_layer(
         &host,
         PLANNER,
@@ -1881,8 +1880,8 @@ fn wildcard_layers_wrap_every_tool_outside_the_specific_ones() {
 }
 
 #[test_case(false ; "final_result")]
-#[test_case(true  ; "receipt_of_a_moved_call")]
-fn output_ctx_carries_the_input_kind_and_receipt(receipt: bool) {
+#[test_case(true ; "receipt_of_a_moved_call")]
+fn output_ctx_carries_the_input_and_kind(receipt: bool) {
     const KIND: &str = "execute";
     let (reg, host) = host();
     slotted_tool(&host);
@@ -2672,4 +2671,24 @@ fn slot_reload_semantics() {
         "ok:<hello world>",
         "surviving filler re-attaches after owner reload"
     );
+}
+
+fn ui_probe_source(name: &str, body: &str) -> String {
+    format!(
+        r#"maki.api.register_command({{ name = "/{name}", handler = function() local function probe() {body} end maki.ui.flash(probe()) end }})"#
+    )
+}
+fn ui_probe_result(host: &maki_lua_ui::UiHost, name: &str) -> String {
+    let rx = host.ui_action_rx();
+    host.ui_handle().run_command(
+        Arc::from(PLANNER),
+        Arc::from(format!("/{name}")),
+        String::new(),
+        0,
+    );
+    loop {
+        if let UiAction::Flash(text) = rx.recv_timeout(DISPATCH_TIMEOUT).unwrap() {
+            return text;
+        }
+    }
 }

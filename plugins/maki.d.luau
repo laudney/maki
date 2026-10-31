@@ -14,7 +14,7 @@ declare maki: {
     system_prompt: @checked (ctx: any, opts: any) -> (string?, string?),
     tools: @checked (ctx: any, opts: any) -> (any, string?),
     callable_tools: @checked (ctx: any) -> (any, string?),
-    call_tool: @checked (ctx: any, name: string, input: any, opts: any) -> (string?, string?),
+    call_tool: @checked (ctx: any, name: string, input: any, opts: any) -> (string?, string?, any),
     session: @checked (ctx: any, opts: any) -> (any, string?),
     list: @checked (opts: any) -> (any, string?),
   },
@@ -172,6 +172,10 @@ declare maki: {
     html_to_markdown: @checked (html: string) -> (string?, string?),
     fuzzy: @checked (needle: string, haystack: string, opts: any) -> (number?, any),
     fuzzy_list: @checked (needle: string, haystacks: any, opts: any) -> (any),
+    humantime: @checked (secs: number) -> (string),
+    display_width: @checked (text: string) -> (number),
+    truncate_text: @checked (text: string, max_width: number) -> (any),
+    diff: @checked (before: string, after: string) -> (any),
   },
   treesitter: {
     get_parser: @checked (source: string, lang: string) -> (any, string?),
@@ -196,7 +200,7 @@ declare maki: {
     },
   },
   ui: {
-    buf: @checked (opts: any) -> (any),
+    buf: @checked () -> (any),
     theme_color: @checked (name: string) -> (string?),
     theme_style: @checked (name: string) -> (any),
     highlight: @checked (code: string, lang: string, opts: any) -> (any),
@@ -217,6 +221,9 @@ declare maki: {
     input_decorate: @checked (opts: any) -> (any, string?),
     input_edit: @checked (opts: any) -> (any, string?),
     input_submit: @checked (opts: any) -> (boolean?, string?),
+    register_renderer: @checked (tool: string, spec: any) -> (),
+    renderer: @checked (tool: string) -> (any),
+    has_renderer: @checked (tool: string) -> (boolean),
   },
   uv: {
     cwd: @checked () -> (string?),

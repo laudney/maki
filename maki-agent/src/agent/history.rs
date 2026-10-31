@@ -6,6 +6,10 @@ use maki_providers::{ContentBlock, EMPTY_RESPONSE_MARKER, Message, Role};
 use maki_storage::frame::{LiveFacts, StoredFrame};
 use maki_storage::id::MakiId;
 use maki_storage::sessions::next_epoch;
+use maki_types::event::ToolDoneEvent;
+pub use maki_types::message::{HistorySnapshot, SharedMessages};
+use maki_types::tool::{ToolData, ToolOutput};
+use maki_types::transcript::facts_told;
 use serde_json::Value;
 use tracing::warn;
 
@@ -16,9 +20,35 @@ use crate::session::SessionHeader;
 const CANCEL_MARKER: &str = "[Cancelled by user]";
 pub const UNAVAILABLE_RESULT: &str = "[Tool result not available]";
 
-pub type HistorySnapshot = maki_storage::sessions::HistorySnapshot<Message>;
-pub type SharedMessages = Arc<ArcSwap<HistorySnapshot>>;
 pub type SharedHeader = Arc<ArcSwap<SessionHeader>>;
+/// A finished call as its session stores it: the tool use id, the output and
+/// the data.
+pub type CapturedCall = (String, Arc<ToolOutput>, Option<Arc<ToolData>>);
+
+/// Where each call lands the moment it finishes, before its `ToolDone` goes
+/// out, so a turn dropped while a sibling still runs keeps the ones that
+/// ended.
+#[derive(Clone, Default)]
+pub(crate) struct CallCapture(Arc<Mutex<Vec<CapturedCall>>>);
+
+impl CallCapture {
+    pub(crate) fn record(&self, done: &ToolDoneEvent) {
+        self.calls()
+            .push((done.id.clone(), Arc::clone(&done.output), done.data.clone()));
+    }
+
+    pub(crate) fn snapshot(&self) -> Vec<CapturedCall> {
+        self.calls().clone()
+    }
+
+    fn take(&self) -> Vec<CapturedCall> {
+        std::mem::take(&mut *self.calls())
+    }
+
+    fn calls(&self) -> MutexGuard<'_, Vec<CapturedCall>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
 
 struct LiveEntry {
     history: Weak<ArcSwap<HistorySnapshot>>,
@@ -93,6 +123,10 @@ pub struct History {
     /// because messages only make sense under the prefix they were sent with,
     /// and every frontend already keeps a `History` for the whole session.
     live: Option<LiveFrame>,
+    /// The calls finished since a writer last took them, kept only for a
+    /// writer that asked. A child call is inside its parent's data, never an
+    /// entry of its own.
+    capture: Option<CallCapture>,
 }
 
 impl History {
@@ -102,7 +136,15 @@ impl History {
             mirror: None,
             unsaved: false,
             live: None,
+            capture: None,
         }
+    }
+
+    /// For the writer that saves the calls with the transcript; any other
+    /// history keeps none.
+    pub fn capturing_calls(mut self) -> Self {
+        self.capture = Some(CallCapture::default());
+        self
     }
 
     /// Call before [`Self::with_mirror`], which publishes.
@@ -187,6 +229,23 @@ impl History {
 
     pub fn mark_saved(&mut self) {
         self.unsaved = false;
+    }
+
+    /// For a save that failed after the collector was drained: the session
+    /// holds the calls now, and only this flag makes the next turn write them.
+    pub(crate) fn mark_unsaved(&mut self) {
+        self.unsaved = true;
+    }
+
+    pub(crate) fn call_capture(&self) -> Option<CallCapture> {
+        self.capture.clone()
+    }
+
+    pub fn take_calls(&self) -> Vec<CapturedCall> {
+        self.capture
+            .as_ref()
+            .map(CallCapture::take)
+            .unwrap_or_default()
     }
 
     pub fn with_mirror(mut self, mirror: SharedMessages) -> Self {
@@ -299,16 +358,6 @@ impl History {
         let Some(mirror) = &self.mirror else { return };
         mirror.store(Arc::new(self.snapshot.clone()));
     }
-}
-
-/// [`History::told`] for a transcript held anywhere, a stored or exported one
-/// included.
-pub(super) fn facts_told(frame: &StoredFrame, messages: &[Message]) -> LiveFacts {
-    let mut facts = frame.facts_at_start();
-    for update in messages.iter().filter_map(Message::facts_update) {
-        facts.apply(update);
-    }
-    facts
 }
 
 pub(super) fn remove_orphaned_tool_results(messages: &mut Vec<Message>) -> bool {

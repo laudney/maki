@@ -318,7 +318,8 @@ fn expand_lua_fn(args: LuaFnArgs, func: &mut ItemFn) -> syn::Result<TokenStream2
     };
     let doc_const = quote! {
         #[allow(non_upper_case_globals)]
-        pub(crate) const #doc_ident: crate::docs::FnDoc = crate::docs::FnDoc {
+        #[doc(hidden)]
+        pub const #doc_ident: crate::docs::FnDoc = crate::docs::FnDoc {
             name: #lua_name,
             args: #args_str,
             desc: #desc,

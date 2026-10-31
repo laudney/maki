@@ -4,8 +4,8 @@ use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent};
-use maki_agent::file_index::MAX_ENTRIES;
-use maki_agent::{FILE_MATCH_CONFIG, FileReader, file_haystack_owned, file_index};
+use maki_storage::file_index::MAX_ENTRIES;
+use maki_storage::file_index::{FILE_MATCH_CONFIG, FileReader, file_haystack_owned, file_index};
 use nucleo::pattern::{CaseMatching, Normalization};
 use nucleo::{Matcher, Nucleo};
 use ratatui::Frame;
@@ -97,7 +97,7 @@ struct Match {
     path: String,
     /// The haystack units the query matched: bytes for an ASCII path,
     /// grapheme clusters for any other, which is what
-    /// [`maki_agent::byte_highlights`] turns into byte ranges of
+    /// [`maki_storage::file_index::byte_highlights`] turns into byte ranges of
     /// [`Self::path`].
     indices: Vec<u32>,
 }
@@ -679,7 +679,7 @@ mod tests {
     use super::*;
     use crate::repaint::expect::{OWED, QUIET};
     use crossterm::event::{KeyEventKind, KeyEventState, KeyModifiers};
-    use maki_agent::{FileIndex, FileQuery, Ranked, file_pattern};
+    use maki_storage::file_index::{FileIndex, FileQuery, Ranked, file_pattern};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use std::sync::atomic::AtomicBool;

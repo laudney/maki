@@ -21,7 +21,7 @@ use std::mem;
 use std::ops::Range;
 use std::rc::Rc;
 
-use maki_agent::SnapshotSpan;
+use maki_types::snapshot::SnapshotSpan;
 use unicode_width::UnicodeWidthChar;
 
 use crate::text_buffer::TextBuffer;
@@ -560,8 +560,8 @@ mod tests {
     use std::ops::Range;
     use std::sync::Arc;
 
-    use maki_agent::{SnapshotSpan, SpanStyle};
-    use maki_lua::{InputRule, PatternRule, SyntaxRule};
+    use maki_lua_ui::{InputRule, PatternRule, SyntaxRule};
+    use maki_types::snapshot::{SnapshotSpan, SpanStyle};
     use test_case::test_case;
 
     use super::{Layout, Row, RowSums, Shape, wrap};

@@ -12,12 +12,11 @@ use common::{
     Chat as LiveChat, WAIT, call_ctx, done_result, exec, next_task_done, request_move, wait_movable,
 };
 use maki_agent::tools::{ToolContext, ToolRegistry};
-use maki_agent::{AgentEvent, AgentSeed, CancelToken, CancelTrigger, EventSender, SessionMailbox};
-use maki_config::{PluginsConfig, ToolOutputLines};
-use maki_lua::{MoveOutcome, PluginHost, RestoreItem, RestoreReason, UiAction};
+use maki_agent::{AgentSeed, CancelToken, CancelTrigger, SessionMailbox};
+use maki_config::PluginsConfig;
+use maki_lua::{MoveOutcome, PluginHost};
 use maki_storage::id::MakiId;
-use serde_json::{Value, json};
-use test_case::test_case;
+use serde_json::json;
 
 const STOP_TOOL: &str = "task_stop";
 const PARK_TOOL: &str = "park";
@@ -33,10 +32,7 @@ const NO_RUNNING_TASK_FRAGMENT: &str = "no running background task";
 const FIRST_ID: &str = "toolu_first";
 const SECOND_ID: &str = "toolu_second";
 const MISSING_ID: &str = "toolu_missing";
-const HEADER_ID: &str = "toolu_header";
-const HEADER_NAME: &str = "Wait then finish";
 const SUBAGENT_TASK_ID: &str = "toolu_subagent";
-const RUN_ID: u64 = 1;
 
 /// With `honor_cancel` the handler returns at once and, like bash with its
 /// job, finishes with the partial output and the cancel reason. Without it
@@ -82,17 +78,24 @@ struct Chat {
     id: MakiId,
     mailbox: SessionMailbox,
     seed: Arc<AgentSeed>,
+    events: flume::Receiver<maki_agent::Envelope>,
     _run_trigger: CancelTrigger,
     run: CancelToken,
 }
 
 fn chat() -> Chat {
-    let LiveChat { id, mailbox, seed } = LiveChat::live();
+    let LiveChat {
+        id,
+        mailbox,
+        seed,
+        events,
+    } = LiveChat::live();
     let (run_trigger, run) = CancelToken::new();
     Chat {
         id,
         mailbox,
         seed,
+        events,
         _run_trigger: run_trigger,
         run,
     }
@@ -140,7 +143,7 @@ fn park_and_move(
     });
 
     wait_movable(&events, id);
-    assert_eq!(request_move(&host.event_handle(), id), MoveOutcome::Moved);
+    assert_eq!(request_move(&host.agent_handle(), id), MoveOutcome::Moved);
 
     let receipt = receipt_rx.recv_timeout(WAIT).unwrap();
     assert!(receipt.backgrounded);
@@ -149,7 +152,7 @@ fn park_and_move(
 
 /// The chat's notice for a task that ended on its own. The host sends it
 /// before the task tab's final reply, so that reply is the signal to look.
-fn next_notice(chat: &Chat, ui: &flume::Receiver<UiAction>) -> (String, bool) {
+fn next_notice(chat: &Chat, ui: &flume::Receiver<maki_agent::Envelope>) -> (String, bool) {
     next_task_done(ui);
     let mut woken = chat.mailbox.claim_wake();
     let woke = !woken.is_empty();
@@ -195,14 +198,12 @@ fn a_stopped_calls_output_passes_its_output_layers() {
 #[test]
 fn a_user_stop_reaches_the_cancel_hook_as_a_cancel() {
     let (reg, host) = host();
-    host.ui_attachment().attach();
-    let ui = host.ui_action_rx();
     let chat = chat();
     park_and_move(&reg, &host, &chat, FIRST_ID, true);
 
-    host.event_handle().cancel_plugin_session(FIRST_ID);
+    host.agent_handle().cancel_plugin_session(FIRST_ID);
 
-    let (notice, _) = next_notice(&chat, &ui);
+    let (notice, _) = next_notice(&chat, &chat.events);
     assert!(
         notice.contains(&format!("{PARTIAL_OUTPUT}: {CANCELLED_REASON}")),
         "{notice}"
@@ -212,15 +213,13 @@ fn a_user_stop_reaches_the_cancel_hook_as_a_cancel() {
 #[test]
 fn a_stop_that_times_out_still_delivers_the_late_result_quietly() {
     let (reg, host) = host();
-    host.ui_attachment().attach();
-    let ui = host.ui_action_rx();
     let chat = chat();
     park_and_move(&reg, &host, &chat, FIRST_ID, false);
 
     let output = stop(&reg, &chat, FIRST_ID).unwrap();
     assert!(output.contains(STOP_REQUESTED_FRAGMENT), "{output}");
 
-    let (notice, woke) = next_notice(&chat, &ui);
+    let (notice, woke) = next_notice(&chat, &chat.events);
     assert!(notice.contains(PARK_TOOL), "{notice}");
     assert!(notice.contains(FIRST_ID), "{notice}");
     assert!(!woke, "a stopped task must not wake the chat");
@@ -287,40 +286,4 @@ fn a_subagent_cannot_stop_a_task_its_chat_moved() {
             .unwrap()
             .contains(PARTIAL_OUTPUT)
     );
-}
-
-/// The stop names the task the way the user knows it, and the id is what is
-/// left when the name was never known.
-#[test_case(None, HEADER_ID ; "without_a_name")]
-#[test_case(Some(json!({ "name": HEADER_NAME })), HEADER_NAME ; "with_a_name")]
-fn restore_shows_the_task_as_the_header(state: Option<Value>, expected: &str) {
-    let (_reg, host) = host();
-    let handle = host.event_handle();
-    let (tx, rx) = flume::unbounded();
-    let item = RestoreItem {
-        tool: Arc::from(STOP_TOOL),
-        tool_use_id: "restore_id".to_owned(),
-        output: PARTIAL_OUTPUT.to_owned(),
-        input: json!({ "id": HEADER_ID }),
-        is_error: false,
-        tool_output_lines: ToolOutputLines::DEFAULT,
-        theme_gen: None,
-        clicks: Vec::new(),
-        state,
-        session_id: None,
-        task_id: None,
-        reason: RestoreReason::default(),
-    };
-
-    handle.request_restore(item, EventSender::new(tx, RUN_ID));
-    handle.wait_restore_complete_for_test();
-
-    let header = rx
-        .drain()
-        .find_map(|env| match env.event {
-            AgentEvent::ToolHeaderSnapshot { snapshot, .. } => Some(snapshot.text()),
-            _ => None,
-        })
-        .expect("restore emits a header");
-    assert_eq!(header, expected);
 }

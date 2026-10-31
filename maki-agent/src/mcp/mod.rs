@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use arc_swap::{ArcSwap, Guard};
+use arc_swap::ArcSwap;
 use maki_config::ProjectConfig;
 use maki_providers::{ContentBlock, DEFER_LOADING_KEY, Message, Model};
 use rmcp::model::{Prompt, PromptArgument, Tool};
@@ -236,51 +236,7 @@ struct PromptRef {
     transport: Arc<dyn McpTransport>,
 }
 
-#[derive(Clone)]
-pub struct McpPromptInfo {
-    pub display_name: String,
-    pub qualified_name: String,
-    pub description: String,
-    pub arguments: Vec<McpPromptArg>,
-}
-
-#[derive(Clone)]
-pub struct McpPromptArg {
-    pub name: String,
-    pub description: String,
-    pub required: bool,
-}
-
-#[derive(Clone, Default)]
-pub struct McpSnapshot {
-    pub infos: Vec<McpServerInfo>,
-    pub prompts: Vec<McpPromptInfo>,
-    pub pids: Vec<u32>,
-    pub generation: u64,
-}
-
-/// Read-only view of the latest published `McpSnapshot`. Handing this out instead of the
-/// raw `ArcSwap` keeps outside code from publishing snapshots of its own.
-#[derive(Clone)]
-pub struct McpSnapshotReader(Arc<ArcSwap<McpSnapshot>>);
-
-impl McpSnapshotReader {
-    pub fn empty() -> Self {
-        Self::from_snapshot(McpSnapshot::default())
-    }
-
-    pub fn from_snapshot(snapshot: McpSnapshot) -> Self {
-        Self(Arc::new(ArcSwap::from_pointee(snapshot)))
-    }
-
-    pub fn load(&self) -> Guard<Arc<McpSnapshot>> {
-        self.0.load()
-    }
-
-    pub fn load_full(&self) -> Arc<McpSnapshot> {
-        self.0.load_full()
-    }
-}
+pub use maki_types::mcp::{McpPromptArg, McpPromptInfo, McpSnapshot, McpSnapshotReader};
 
 pub enum McpCommand {
     Toggle {
@@ -642,7 +598,7 @@ impl McpHandle {
     }
 
     pub fn reader(&self) -> McpSnapshotReader {
-        McpSnapshotReader(Arc::clone(&self.snapshot))
+        McpSnapshotReader::over(Arc::clone(&self.snapshot))
     }
 
     /// Where wire names (`server__tool`, what providers send) and internal names
@@ -1166,7 +1122,7 @@ fn publish(inner: &McpManagerInner, index: &ArcSwap<ToolIndex>, snapshot: &ArcSw
 
         server_infos.push(McpServerInfo {
             name: entry.name.clone(),
-            transport_kind: entry.transport_kind,
+            transport_kind: entry.transport_kind.into(),
             tool_count: entry.tools.len(),
             prompt_count: entry.prompts.len(),
             status: entry.status.clone(),
@@ -1183,6 +1139,7 @@ fn publish(inner: &McpManagerInner, index: &ArcSwap<ToolIndex>, snapshot: &ArcSw
         descriptors: descriptors.into(),
     }));
     snapshot.store(Arc::new(McpSnapshot {
+        config_error: None,
         infos: server_infos,
         prompts: prompt_infos,
         pids,

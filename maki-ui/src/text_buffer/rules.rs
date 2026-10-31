@@ -12,8 +12,8 @@ use std::iter::repeat_with;
 use std::ops::Range;
 use std::sync::{Arc, LazyLock};
 
-use maki_agent::SpanStyle;
-use maki_lua::{Decoration, InputRule, PatternRule, SyntaxRule};
+use maki_lua_ui::{Decoration, InputRule, PatternRule, SyntaxRule};
+use maki_types::snapshot::SpanStyle;
 
 use super::marks::Placed;
 use crate::app::shell::parse_shell_prefix;

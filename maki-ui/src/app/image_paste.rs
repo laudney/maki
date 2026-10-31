@@ -3,7 +3,7 @@ use std::thread;
 
 use crate::image;
 use flume::Receiver;
-use maki_agent::{ImageMediaType, ImageSource};
+use maki_types::message::{ImageMediaType, ImageSource};
 
 use crate::repaint::Dirty;
 
@@ -34,7 +34,7 @@ pub(super) fn take_ready<T>(receivers: &mut Vec<Receiver<T>>) -> Option<T> {
 
 impl App {
     pub(super) fn start_file_image_paste(&mut self, path: PathBuf, media_type: ImageMediaType) {
-        if !self.state.model.supports_vision() {
+        if !self.backend.takes_images() {
             self.status_bar.flash(IMAGE_NOT_SUPPORTED_MSG.into());
             return;
         }
@@ -43,7 +43,7 @@ impl App {
     }
 
     pub(super) fn start_image_paste(&mut self) {
-        if !self.state.model.supports_vision() {
+        if !self.backend.takes_images() {
             self.status_bar.flash(IMAGE_NOT_SUPPORTED_MSG.into());
             return;
         }
@@ -65,7 +65,7 @@ impl App {
             dirty = Dirty::YES;
             match result {
                 Ok(source) => {
-                    if !self.state.model.supports_vision() {
+                    if !self.backend.takes_images() {
                         self.status_bar.flash(IMAGE_NOT_SUPPORTED_MSG.into());
                     } else {
                         self.input_box.attach_image(source);

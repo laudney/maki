@@ -51,7 +51,7 @@ function M.open()
 
   local state = Picker.new(model)
   local width = math.min(WIDTH, maki.ui.terminal_size().cols - MARGIN)
-  local buf = maki.ui.buf({ scratch = true })
+  local buf = maki.ui.buf()
   local win = maki.ui.open_win(buf, {
     title = title_for(model.id, width),
     width = width,

@@ -12,8 +12,9 @@ mod transcript;
 pub use compaction::compact;
 pub use display_order::{DisplayItem, display_order, observation_detail, observation_line};
 pub use frame::{RunContext, RunContextBuilder, plan_mode_update};
+pub(crate) use history::CallCapture;
 pub use history::{
-    History, HistorySnapshot, SharedHeader, SharedMessages, UNAVAILABLE_RESULT,
+    CapturedCall, History, HistorySnapshot, SharedHeader, SharedMessages, UNAVAILABLE_RESULT,
     close_dangling_tool_calls, live_header, live_history, live_snapshot, publish_live_history,
     publish_live_session,
 };
@@ -23,5 +24,6 @@ pub use instructions::{
     default_instruction_files, find_subdirectory_instructions, is_instruction_file,
     load_instruction_text, load_instructions,
 };
+pub use maki_types::transcript::{NEWER_FORMAT, SessionExport, Transcript};
 pub use run::{Agent, AgentParams, AgentRunParams, ModelSlot, resolve_compaction_model};
-pub use transcript::{NEWER_FORMAT, SessionExport, Transcript, TranscriptError};
+pub use transcript::{TranscriptError, transcript_into_session};

@@ -1,13 +1,17 @@
 //! Queue for messages typed while the agent is busy, and the subagent
 //! inbox a message typed in a subagent's chat goes to instead.
 
+use maki_types::inbox::InboxSnapshot;
 use std::borrow::Cow;
 
-use maki_agent::{AgentInput, AgentMode, ImageSource, InputSource};
-use maki_lua::agent_autocmd::HostEvent;
+use maki_lua_core::agent_autocmd::HostEvent;
+use maki_types::input::{AgentInput, AgentMode, InputSource};
+use maki_types::message::ImageSource;
+use maki_wire::session::SessionOperation;
 
 use super::{Action, App, Status};
 
+use crate::agent::capabilities::CONNECTION_LOST;
 use crate::agent::shared_queue::{Compaction, QueueItem, QueueSender, QueuedInput};
 use crate::components::queue_panel::QueueEntry;
 use crate::theme;
@@ -57,6 +61,19 @@ impl MessageQueue {
             shared.clear();
         }
         self.focus = None;
+    }
+
+    pub(crate) fn take_messages(&mut self) -> Vec<(String, Vec<ImageSource>)> {
+        self.focus = None;
+        self.shared
+            .as_ref()
+            .map_or_else(Vec::new, QueueSender::take_messages)
+    }
+
+    pub(crate) fn take_rejected(&mut self) -> Vec<(String, Vec<ImageSource>)> {
+        self.shared
+            .as_ref()
+            .map_or_else(Vec::new, QueueSender::take_rejected)
     }
 
     pub(crate) fn focus(&self) -> Option<usize> {
@@ -130,6 +147,9 @@ impl App {
         if msg.text.trim().is_empty() && msg.images.is_empty() {
             return SubmitOutcome::Rejected(EMPTY_PROMPT_ERR);
         }
+        if !self.backend.accepts_prompts() {
+            return SubmitOutcome::Rejected(CONNECTION_LOST);
+        }
         if self.status == Status::Streaming {
             if self.queue_and_notify(msg) {
                 SubmitOutcome::Queued
@@ -144,6 +164,14 @@ impl App {
     /// Keyboard path: nobody is around to receive an `Err`, so
     /// rejections flash on screen instead.
     pub(super) fn submit_or_queue(&mut self, msg: QueuedMessage) -> Vec<Action> {
+        if !self.backend.accepts_prompts() {
+            self.input_box.set_input(&msg.text);
+            for image in msg.images {
+                self.input_box.attach_image(image);
+            }
+            self.flash(CONNECTION_LOST.into());
+            return vec![];
+        }
         match self.submit_prompt(msg) {
             SubmitOutcome::Started(actions) => actions,
             SubmitOutcome::Queued => vec![],
@@ -160,16 +188,12 @@ impl App {
     /// subagent runs its own settings, so the input carries them.
     pub(super) fn queue_for_subagent(&mut self, msg: QueuedMessage) -> Vec<Action> {
         let chat = &self.chats[self.active_chat];
-        let Some(inbox) = chat.inbox.as_ref() else {
-            self.flash(NO_INBOX_ERR.into());
-            return vec![];
-        };
         let (thinking, fast) = chat
             .opts
             .map_or((self.state.thinking, self.state.fast), |o| {
                 (o.thinking, o.fast)
             });
-        inbox.push(AgentInput {
+        let input = AgentInput {
             message: msg.text,
             mode: AgentMode::Build,
             images: msg.images,
@@ -180,8 +204,48 @@ impl App {
             workflow: false,
             prompt: None,
             source: InputSource::Tui,
-        });
+        };
+        if chat.remote_inbox.is_some() {
+            let rejected = input.clone();
+            let id = chat.task_id().unwrap().to_string();
+            let result = self
+                .remote_link
+                .as_ref()
+                .ok_or(NO_INBOX_ERR.to_owned())
+                .and_then(|link| {
+                    link.request(|session_id| SessionOperation::TaskInput {
+                        session_id,
+                        id: id.clone(),
+                        input: Box::new(input),
+                    })
+                });
+            match result {
+                Ok(snapshot) => self.update_task_queue(&id, snapshot),
+                Err(error) => {
+                    self.input_box.set_input(&rejected.message);
+                    for image in rejected.images {
+                        self.input_box.attach_image(image);
+                    }
+                    self.flash(error);
+                }
+            }
+        } else {
+            self.flash(NO_INBOX_ERR.into());
+        }
         vec![]
+    }
+
+    pub(super) fn update_task_queue(&mut self, id: &str, snapshot: InboxSnapshot) {
+        if let Ok(index) = self.chat_of_task(id) {
+            let chat = &mut self.chats[index];
+            if chat
+                .remote_inbox
+                .as_ref()
+                .is_none_or(|old| old.revision <= snapshot.revision)
+            {
+                chat.remote_inbox = Some(snapshot);
+            }
+        }
     }
 
     /// The panel above the input shows the queue of the chat in front: the
@@ -190,10 +254,10 @@ impl App {
         if self.is_main_chat() {
             return self.queue.panel_len();
         }
-        self.chats[self.active_chat]
-            .inbox
+        let chat = &self.chats[self.active_chat];
+        chat.remote_inbox
             .as_ref()
-            .map_or(0, |inbox| inbox.len())
+            .map_or(0, |inbox| inbox.texts.len())
     }
 
     pub(super) fn active_queue_entries(&self) -> Vec<QueueEntry<'static>> {
@@ -201,10 +265,10 @@ impl App {
             return self.queue.panel_entries();
         }
         let color = theme::current().foreground;
-        self.chats[self.active_chat]
-            .inbox
+        let chat = &self.chats[self.active_chat];
+        chat.remote_inbox
             .as_ref()
-            .map_or_else(Vec::new, |inbox| inbox.texts())
+            .map_or_else(Vec::new, |inbox| inbox.texts.clone())
             .into_iter()
             .map(|text| QueueEntry {
                 text: Cow::Owned(text),
@@ -217,8 +281,23 @@ impl App {
         if self.is_main_chat() {
             return self.queue.remove(0);
         }
-        if let Some(ref inbox) = self.chats[self.active_chat].inbox {
-            inbox.remove(0);
+        let chat = &self.chats[self.active_chat];
+        if chat.remote_inbox.is_some() {
+            let id = chat.task_id().unwrap().to_string();
+            let result = self
+                .remote_link
+                .as_ref()
+                .ok_or(NO_INBOX_ERR.to_owned())
+                .and_then(|link| {
+                    link.request(|session_id| SessionOperation::TaskPop {
+                        session_id,
+                        id: id.clone(),
+                    })
+                });
+            match result {
+                Ok(snapshot) => self.update_task_queue(&id, snapshot),
+                Err(error) => self.flash(error),
+            }
         }
     }
 
@@ -239,16 +318,8 @@ impl App {
         true
     }
 
-    /// Push restored queue items only here, never in `restore_display`: on
-    /// load/rewind the display is restored before `respawn` swaps the shared
-    /// queue, so pushing earlier would fill a queue that is about to die.
-    pub(crate) fn flush_restored_queue(&mut self) {
-        // The live queue owns the text from here on, so the recovery
-        // snapshot must stop overriding it on save.
-        self.recoverable_queue.clear();
-        // Read, not taken: the live queue is what the next checkpoint mirrors
-        // back into the session, so emptying it here changes nothing on disk.
-        for text in self.state.session.meta.queued_messages.clone() {
+    pub(super) fn restore_queue(&mut self, queued: Vec<String>) {
+        for text in queued {
             self.queue_and_notify(QueuedMessage {
                 text,
                 images: Vec::new(),
@@ -281,18 +352,6 @@ impl App {
     pub(super) fn start_from_queue(&mut self, msg: &QueuedMessage) -> Vec<Action> {
         let input = self.build_agent_input(msg);
         self.start_run(input, msg.text.clone())
-    }
-
-    pub(crate) fn start_mailbox_run(
-        &mut self,
-        preamble: Vec<maki_providers::Message>,
-    ) -> Vec<Action> {
-        let mut input = self.build_agent_input(&QueuedMessage {
-            text: String::new(),
-            images: Vec::new(),
-        });
-        input.preamble = preamble;
-        self.start_run(input, String::new())
     }
 
     /// The one place a fresh run starts: every path that emits

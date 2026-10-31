@@ -6,12 +6,12 @@ mod common;
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
-use common::{Chat, Parked, WAIT, call_ctx, done_text, exec, next_task_event, request_move};
+use common::{Chat, Parked, call_ctx, done_text, exec, next_task_event, request_move};
 use maki_agent::cancel::{CancelToken, CancelTrigger};
 use maki_agent::tools::ToolRegistry;
 use maki_agent::tools::test_support::stub_ctx;
 use maki_agent::{AgentEvent, AgentMode, CancelMap, Envelope, ToolDoneEvent};
-use maki_lua::{MoveOutcome, PluginHost, UiAction};
+use maki_lua::{MoveOutcome, PluginHost};
 use maki_storage::id::MakiId;
 use serde_json::json;
 use test_case::test_case;
@@ -74,7 +74,6 @@ end)
 struct Host {
     reg: Arc<ToolRegistry>,
     host: PluginHost,
-    ui: flume::Receiver<UiAction>,
 }
 
 impl Host {
@@ -82,13 +81,11 @@ impl Host {
         let reg = Arc::new(ToolRegistry::new());
         let host = PluginHost::new(Arc::clone(&reg)).unwrap();
         host.load_source(PLUGIN, SRC).unwrap();
-        host.ui_attachment().attach();
-        let ui = host.ui_action_rx();
-        Self { reg, host, ui }
+        Self { reg, host }
     }
 
     fn request(&self) -> MoveOutcome {
-        request_move(&self.host.event_handle(), CALL_ID)
+        request_move(&self.host.agent_handle(), CALL_ID)
     }
 
     /// The `ui_id` of every session the plugin opened so far.
@@ -105,10 +102,10 @@ impl Host {
 
     /// What the task tabs heard up to the moved call's final reply, and
     /// that reply.
-    fn until_task_done(&self) -> (Vec<AgentEvent>, ToolDoneEvent) {
+    fn until_task_done(&self, chat: &Chat) -> (Vec<AgentEvent>, ToolDoneEvent) {
         let mut relayed = Vec::new();
         loop {
-            let envelope = next_task_event(&self.ui);
+            let envelope = next_task_event(&chat.events);
             match (envelope.event, envelope.subagent) {
                 (AgentEvent::ToolDone(done), None) if done.id == CALL_ID => {
                     return (relayed, *done);
@@ -171,7 +168,7 @@ fn a_moved_subagent_outlives_its_run_and_reports_to_the_chat() {
     cancels.cancel_all();
     parked.release.send(()).unwrap();
 
-    let (relayed, done) = host.until_task_done();
+    let (relayed, done) = host.until_task_done(&chat);
     assert_eq!(done_text(&done), (ANSWER.to_owned(), false));
     let turn = relayed
         .iter()
@@ -219,20 +216,13 @@ fn a_move_opens_the_tab_of_a_nested_subagent_mid_turn() {
     assert!(running.call.join().expect("call thread").backgrounded);
 
     let id = host.opened();
-    let opened = loop {
-        if let UiAction::PluginTaskOpened {
-            session,
-            plugin,
-            info,
-        } = host.ui.recv_timeout(WAIT).expect("tab opened at the move")
-        {
-            break (session, plugin.to_string(), info.parent_tool_use_id);
-        }
-    };
+    let envelope = next_task_event(&chat.events);
+    let info = envelope.subagent.expect("nested task");
+    let opened = (chat.id, PLUGIN.to_owned(), info.parent_tool_use_id);
     assert_eq!(opened, (chat.id, PLUGIN.to_owned(), id));
 
     parked.release.send(()).unwrap();
-    host.until_task_done();
+    host.until_task_done(&chat);
 }
 
 /// Esc in the adopted tab stops the subagent by its own id while its turn
@@ -253,9 +243,9 @@ fn stopping_an_adopted_subagent_by_its_id_stops_it(tool: &str, reply: Option<&st
     if reply.is_none() {
         assert_eq!(id, CALL_ID);
     }
-    host.host.event_handle().cancel_plugin_session(&id);
+    host.host.agent_handle().cancel_plugin_session(&id);
 
-    let (_, done) = host.until_task_done();
+    let (_, done) = host.until_task_done(&chat);
     if let Some(reply) = reply {
         assert_eq!(done.output.as_text(), reply);
     }

@@ -16,6 +16,7 @@ tokio = { workspace = true }
 maki-agent = { workspace = true }
 maki-config = { workspace = true }
 maki-lua = { workspace = true }
+maki-lua-ui = { workspace = true }
 maki-providers = { workspace = true }
 maki-ui = { workspace = true }
 regex = { workspace = true }

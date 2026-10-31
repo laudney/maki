@@ -303,17 +303,80 @@ function ToolView:finish()
   end
 end
 
-function ToolView.restore_lines(lines, opts)
+local function view_of(lines, opts)
   local buf = maki.ui.buf()
   local view = ToolView.new(buf, opts)
   for _, line in ipairs(lines) do
     view:append(line)
   end
   view:finish()
+  return buf, view
+end
+
+function ToolView.restore_lines(lines, opts)
+  local buf, view = view_of(lines, opts)
   buf:on("click", function()
     view:toggle()
   end)
   return buf
+end
+
+-- The same view of {text} for a renderer, collapsed or {expanded}: the
+-- renderer's `click` keeps that flag on its data.
+function ToolView.draw_lines(lines, opts, expanded)
+  local buf, view = view_of(lines, opts)
+  if expanded then
+    view:toggle()
+  end
+  return buf
+end
+
+function ToolView.draw(text, opts, expanded)
+  return ToolView.draw_lines(maki.split(text, "\n"), opts, expanded)
+end
+
+function ToolView.draw_output(data, ctx)
+  local output = data.output
+  if not output then
+    return nil
+  end
+  local opts = { max_lines = ctx.tool_output_lines[data.tool] or ctx.tool_output_lines.other, keep = "head" }
+  if output.Diff then
+    local lines = {}
+    for _, hunk in ipairs(maki.text.diff(output.Diff.before, output.Diff.after)) do
+      if #lines > 0 then
+        lines[#lines + 1] = {}
+      end
+      local nr = hunk.before_start
+      for _, line in ipairs(hunk.lines) do
+        local spans, prefix, style
+        if line.Unchanged then
+          spans, prefix, style = { { text = line.Unchanged } }, "  ", "dim"
+        elseif line.Removed then
+          spans, prefix, style = line.Removed, "- ", "diff_old"
+        else
+          spans, prefix, style = line.Added, "+ ", "diff_new"
+        end
+        local row = { { line.Added and "  " or (nr .. " "), "line_nr" }, { prefix, style } }
+        for _, span in ipairs(spans) do
+          row[#row + 1] = { span.text, style }
+        end
+        lines[#lines + 1] = row
+        if not line.Added then
+          nr = nr + 1
+        end
+      end
+    end
+    return ToolView.draw_lines(lines, { max_lines = math.huge }, true)
+  end
+  local text = output.Plain or output.Markdown or output.ReadDir or output.Image or output.Batch
+  text = type(text) == "string" and text or text and text.text
+  local code = output.ReadCode or output.WriteCode
+  text = text or code and table.concat(code.lines, "\n") or ""
+  if output.Markdown and data.status == "done" then
+    return ToolView.draw_lines(maki.ui.markdown(text, ctx.width), opts, data.expanded)
+  end
+  return ToolView.draw(text, opts, data.expanded)
 end
 
 -- Rebuild a collapsed view from a tool's saved llm_output, click-to-toggle

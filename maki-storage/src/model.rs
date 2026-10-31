@@ -1,7 +1,4 @@
-use std::collections::BTreeSet;
 use std::fs;
-
-use serde::{Deserialize, Serialize};
 
 use crate::sessions::StoredThinking;
 use crate::{StateDir, atomic_write};
@@ -9,7 +6,6 @@ use crate::{StateDir, atomic_write};
 const MODEL_FILE: &str = "model";
 const RECENT_FILE: &str = "recent-models";
 const THINKING_FILE: &str = "thinking";
-const COLLAPSED_FILE: &str = "collapsed-providers";
 const MAX_RECENTS: usize = 4;
 
 pub fn persist_model(dir: &StateDir, spec: &str) {
@@ -36,24 +32,6 @@ pub fn read_thinking(dir: &StateDir) -> Option<StoredThinking> {
     StoredThinking::parse_setting(&raw).ok()
 }
 
-/// Providers folded away in the model picker, by slug. Kept as a sorted set,
-/// so folding and unfolding the same provider leaves the file as it was.
-pub fn read_collapsed_providers(dir: &StateDir) -> BTreeSet<String> {
-    fs::read_to_string(dir.path().join(COLLAPSED_FILE))
-        .ok()
-        .and_then(|raw| serde_json::from_str(&raw).ok())
-        .unwrap_or_default()
-}
-
-pub fn persist_collapsed_providers(dir: &StateDir, slugs: &BTreeSet<String>) {
-    if let Ok(json) = serde_json::to_vec_pretty(slugs) {
-        let _ = atomic_write(&dir.path().join(COLLAPSED_FILE), &json);
-    }
-}
-
-#[derive(Serialize, Deserialize, Default)]
-struct RecentList(Vec<String>);
-
 pub fn push_recent(dir: &StateDir, spec: &str) -> Vec<String> {
     let mut recents = read_recents(dir);
     recents.retain(|s| s != spec);
@@ -67,18 +45,11 @@ pub fn read_recents(dir: &StateDir) -> Vec<String> {
     let Ok(raw) = fs::read_to_string(dir.path().join(RECENT_FILE)) else {
         return Vec::new();
     };
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Vec::new();
-    }
-    match serde_json::from_str::<RecentList>(trimmed) {
-        Ok(list) => list.0,
-        Err(_) => Vec::new(),
-    }
+    serde_json::from_str(&raw).unwrap_or_default()
 }
 
 fn write_recents(dir: &StateDir, recents: &[String]) {
-    let json = match serde_json::to_vec_pretty(&RecentList(recents.to_vec())) {
+    let json = match serde_json::to_vec_pretty(recents) {
         Ok(v) => v,
         Err(_) => return,
     };

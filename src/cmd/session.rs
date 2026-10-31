@@ -10,7 +10,7 @@ use color_eyre::eyre::{Context, Report, bail, eyre};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use maki_agent::Transcript;
-use maki_agent::agent::SessionExport;
+use maki_agent::agent::{SessionExport, transcript_into_session};
 use maki_agent::session::store_new;
 use maki_storage::id::MakiId;
 use maki_storage::paths;
@@ -145,8 +145,7 @@ fn import_from(mut reader: impl Read, cwd: &str, storage: &StateDir) -> Result<M
         .read_to_string(&mut document)
         .context("read transcript")?;
     let transcript: Transcript = serde_json::from_str(&document).context(INVALID_TRANSCRIPT)?;
-    let session = transcript
-        .into_session(AppSession::new("", cwd))
+    let session = transcript_into_session(transcript, AppSession::new("", cwd))
         .context(INVALID_TRANSCRIPT)?;
     store_new(session, storage).context("store session")
 }

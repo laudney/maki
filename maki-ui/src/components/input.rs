@@ -11,11 +11,11 @@ use crate::text_buffer::{EditResult, Mark, Marks, Prompt, TextBuffer, Writers, i
 use crate::theme;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use maki_lua::{InputMarks, InputMode, TextEdit};
+use maki_lua_ui::{InputMarks, InputMode, TextEdit};
 use maki_storage::input_history::InputHistory;
 use std::mem;
 
-use maki_providers::ImageSource;
+use maki_types::message::ImageSource;
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Modifier, Style};
@@ -962,10 +962,9 @@ mod tests {
     use crate::decor_worker;
     use crate::text_buffer::test_support::{mark_ranges, text_edit};
     use crate::text_buffer::{Decoration, INPUT_REPLACED_ERR, Reveal, RuleSet, VirtTextPos};
-    use maki_agent::types::InlineStyle;
-    use maki_agent::{SnapshotSpan, SpanColor, SpanStyle};
-    use maki_lua::{InputRule, PatternRule, SyntaxRule};
-    use maki_providers::ImageMediaType;
+    use maki_lua_ui::{InputRule, PatternRule, SyntaxRule};
+    use maki_types::message::ImageMediaType;
+    use maki_types::snapshot::{InlineStyle, SnapshotSpan, SpanColor, SpanStyle};
     use ratatui::layout::{Position, Rect};
     use ratatui::style::Color;
     use std::ops::Range;

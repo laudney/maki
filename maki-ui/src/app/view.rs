@@ -1,4 +1,3 @@
-use maki_providers::ModelThinking;
 use std::sync::atomic::Ordering;
 
 use crate::components::Overlay;
@@ -11,8 +10,8 @@ use crate::components::status_bar::{StatusBarContext, UsageStats};
 use crate::components::usage_modal::UsageModalContext;
 use crate::selection::{self, SelectableZone, SelectionZone, ZoneRegistry};
 use crate::theme;
-use maki_lua::Split;
-use maki_providers::RequestOptions;
+use maki_lua_ui::Split;
+
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::text::{Line, Span};
@@ -290,7 +289,7 @@ impl App {
 
         render_if_open!(self.rewind_picker);
         render_if_open!(self.theme_picker);
-        render_if_open!(self.model_picker);
+        render_if_open!(self.remote_model_picker);
         render_if_open!(self.login_picker);
         render_if_open!(self.mcp_picker);
 
@@ -320,8 +319,7 @@ impl App {
                 total_cost: self.state.cost,
                 total_list_cost: self.state.subsidised_list_cost,
                 by_model: self.state.session.usage_by_model(),
-                model: &self.state.model,
-                fast: self.state.fast,
+                subsidy_source: self.state.subsidised_by.as_deref(),
                 clock_format: self.ui_config.clock_format,
             };
             let r = self.usage_modal.view(frame, full, &ctx);
@@ -343,38 +341,34 @@ impl App {
     fn render_status_bar(&mut self, frame: &mut Frame, status_area: Rect, render_chat: usize) {
         let chat = &self.chats[render_chat];
         let chat_name = (self.chats.len() > 1).then_some(chat.name.as_str());
-        // Only the session's model is at hand here, and a subagent may run on
-        // another, so a subagent's options are shown as stored.
-        let opts = chat.opts.unwrap_or(RequestOptions {
-            thinking: self.state.thinking.shown(&self.state.model),
-            fast: self.state.fast,
-        });
         let (mode_label, mode_style) = self.mode_label();
+        let remote = self.remote_indicators();
         let ctx = StatusBarContext {
             status: &self.status,
             mode_label,
             mode_style,
-            model_id: chat
-                .model_id
-                .as_deref()
+            // What the agent confirmed, never the pick still waiting.
+            model_id: self
+                .remote_model_name()
+                .or(chat.model_id.as_deref())
                 .unwrap_or(&self.state.session.model),
             stats: UsageStats {
                 global_cost: self.state.cost,
                 context_size: chat.context_size,
                 cost: chat.cost,
                 list_cost: chat.list_cost,
-                subsidy_source: self.state.model.subsidised_by.clone(),
-                context_window: self.state.model.context_window,
+                subsidy_source: self.state.subsidised_by.clone(),
+                context_window: self.state.context_window,
                 show_global: self.chats.len() > 1,
             },
             auto_scroll: chat.auto_scroll(),
             chat_name,
             retry_info: self.retry_info.as_ref(),
-            thinking_label: opts.thinking.status_label(),
-            fast: opts.fast,
-            workflow: self.state.workflow,
+            thinking_label: remote.thinking,
+            fast: remote.fast,
+            workflow: remote.workflow,
             restricted: self.trust_question.is_some(),
-            yolo: self.permissions.is_yolo(),
+            yolo: remote.yolo,
             restoring: self.restoring.load(Ordering::Relaxed),
         };
         self.status_bar.view(frame, status_area, &ctx);
@@ -466,10 +460,11 @@ impl App {
     }
 
     fn lua_hint_line(&self) -> Option<Line<'static>> {
+        let remote = self.remote_session_id();
         let spans: Vec<_> = self
             .hints
             .get()?
-            .visible_in(self.state.session.id)
+            .visible_in(self.state.session.id, remote.as_deref())
             .flat_map(|entry| &entry.spans)
             .map(|(text, style_name)| Span::styled(text.clone(), theme::style_by_name(style_name)))
             .collect();
@@ -487,7 +482,7 @@ impl App {
             contexts.push(KeybindContext::RewindPicker);
         } else if self.theme_picker.is_open() {
             contexts.push(KeybindContext::ThemePicker);
-        } else if self.model_picker.is_open() {
+        } else if self.remote_model_picker.is_open() {
             contexts.push(KeybindContext::ModelPicker);
         } else if self.command_palette.is_active(&self.input_box.buffer) {
             contexts.push(KeybindContext::CommandPalette);

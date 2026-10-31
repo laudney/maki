@@ -14,15 +14,16 @@ use common::{Chat, Gate, WAIT, done_result, isolated_state, poll_until, request_
 use maki_agent::agent::tool_dispatch;
 use maki_agent::template::Vars;
 use maki_agent::tools::{
-    CallOrigin, DescriptionContext, ToolAudience, ToolFilter, ToolOutputMode, ToolRegistry,
+    CallOrigin, DescriptionContext, ProgressScope, ToolAudience, ToolFilter, ToolOutputMode,
+    ToolRegistry,
 };
 use maki_agent::{
     AgentEvent, AgentSeed, CallScope, CancelToken, CancelTrigger, Envelope, EventSender,
-    SessionMailbox, SharedBuf,
+    SessionMailbox,
 };
 use maki_config::{PluginFileConfig, PluginsConfig};
 use maki_lua::test_support::runtime;
-use maki_lua::{EventHandle, MoveOutcome, PluginHost};
+use maki_lua::{AgentHandle, MoveOutcome, PluginHost};
 use maki_storage::id::MakiId;
 use maki_storage::paths::{session_task_logs_dir, state_dir};
 use serde_json::{Value, json};
@@ -85,13 +86,14 @@ fn builtins_host(opts: &Value) -> (Arc<ToolRegistry>, PluginHost) {
 /// One bash call in a live chat, executing on its own thread so the test can
 /// ask for the move from outside, the way Ctrl+B does.
 struct Run {
-    handle: EventHandle,
+    handle: AgentHandle,
     call_id: String,
     session: MakiId,
     mailbox: SessionMailbox,
     events: flume::Receiver<Envelope>,
     result: flume::Receiver<Result<String, String>>,
-    live: Option<Arc<SharedBuf>>,
+    shown: String,
+    _task_events: flume::Receiver<Envelope>,
     gate: Gate,
     finish: flume::Sender<()>,
     thread: Option<JoinHandle<()>>,
@@ -128,6 +130,7 @@ impl Run {
             id: session,
             mailbox,
             seed,
+            events: task_events,
         } = Chat::live();
         let call_id = format!("toolu_{}", MakiId::generate());
         let (events_tx, events) = flume::unbounded();
@@ -143,12 +146,13 @@ impl Run {
             let call_id = call_id.clone();
             move || {
                 let (reg, host) = builtins_host(&opts);
-                handle_tx.send(host.event_handle()).unwrap();
+                handle_tx.send(host.agent_handle()).unwrap();
                 let scope = Arc::new(CallScope::new(call_id.clone(), &run_token));
                 let mut ctx = seed.tool_context(scope.cancel().clone());
                 ctx.event_tx = EventSender::new(events_tx, 0);
                 ctx.tool_use_id = Some(call_id.clone());
                 ctx.call = Some(scope);
+                ctx.progress = Some(ProgressScope::default());
                 ctx.mailbox = Some(mailbox);
                 ctx.output_mode = ToolOutputMode::Compact;
                 ctx.config.rtk = false;
@@ -180,7 +184,8 @@ impl Run {
             mailbox,
             events,
             result,
-            live: None,
+            shown: String::new(),
+            _task_events: task_events,
             gate,
             finish,
             thread: Some(thread),
@@ -199,20 +204,22 @@ impl Run {
         self.gate.release();
     }
 
-    /// Output shows in the live buf in order, so seeing the last line printed
-    /// before the gate means the plugin has them all.
     fn wait_for_output(&mut self, needle: &str) {
         poll_until("bash never showed the expected output", || {
-            if self.live.is_none() {
-                self.live = self.events.drain().find_map(|env| match env.event {
-                    AgentEvent::LiveToolBuf { id, body } if id == self.call_id => Some(body),
-                    _ => None,
-                });
+            for envelope in self.events.try_iter() {
+                if let AgentEvent::ToolProgress(progress) = envelope.event
+                    && progress.id == self.call_id
+                    && progress.path.is_empty()
+                {
+                    self.shown.push_str(&progress.append);
+                    if let Some(state) = progress.state
+                        && let Some(text) = state["text"].as_str()
+                    {
+                        self.shown = text.to_owned();
+                    }
+                }
             }
-            self.live
-                .as_ref()
-                .is_some_and(|buf| buf.take().text().contains(needle))
-                .then_some(())
+            self.shown.contains(needle).then_some(())
         });
     }
 
@@ -312,23 +319,6 @@ fn the_background_param_moves_the_command_at_once() {
     run.release();
     let notice = run.final_notice();
     assert!(notice.contains(FINISHED_LATE), "{notice}");
-}
-
-/// The chat row a call moved out of shows only the head of its buf, so the
-/// head must be the command, nothing more and nothing less.
-#[test]
-fn a_moved_command_is_the_head_of_its_buf() {
-    let gate = Gate::closed();
-    let command = gate.command(READY_COMMAND, "true");
-    let mut input = json!({ "command": command });
-    input[BACKGROUND_PARAM] = json!(true);
-    let mut run = Run::launch(json!({}), BASH_TOOL, input, gate);
-    run.reply().expect("a receipt is a success");
-
-    run.wait_for_output(READY_LINE);
-
-    let snapshot = run.live.as_ref().unwrap().take();
-    assert_eq!(snapshot.head_only().map(|head| head.text()), Some(command));
 }
 
 #[test]
@@ -578,12 +568,10 @@ fn the_timeout_annotates_the_header_and_stays_out_of_the_summary() {
     assert_eq!(start.annotation, Some(format!("{TIMEOUT_SECS}s timeout")));
 }
 
-/// The UI repeats an error reply under a view that lacks the reply's last
-/// line, so the view of a moved command must end on the log line its final
-/// reply ends on, or a stopped or failed command shows its output twice.
+/// A failed or stopped command still points to its complete output log.
 #[test_case(false ; "failed")]
 #[test_case(true ; "stopped")]
-fn the_view_ends_on_the_line_the_final_reply_ends_on(stop: bool) {
+fn the_final_reply_ends_on_its_log_path(stop: bool) {
     let mut run = Run::start(json!({}), None, READY_COMMAND, FAILING_COMMAND);
     run.wait_for_output(READY_LINE);
     run.move_to_background();
@@ -597,6 +585,4 @@ fn the_view_ends_on_the_line_the_final_reply_ends_on(stop: bool) {
 
     let log_line = progress_line(&run);
     assert_eq!(notice.lines().last(), Some(log_line.as_str()), "{notice}");
-    let view = run.live.as_ref().expect("the live buf").take().text();
-    assert_eq!(view.lines().last(), Some(log_line.as_str()), "{view}");
 }

@@ -5,15 +5,16 @@
 //! Both `maki.task.list()` and the `TaskStatusChanged` autocmd serialize the
 //! types below, so the two can never spell a status differently.
 
+use flume::TryRecvError;
+use maki_types::event::{AgentEvent, PartStatus, ToolDoneEvent, ToolPart};
+use maki_wire::session::MoveOutcome;
 use std::mem;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use flume::TryRecvError;
-use maki_agent::tools::{MAIN_TASK_ID, ToolRegistry, ToolSource};
-use maki_agent::{AgentEvent, PartStatus, ToolDoneEvent, ToolPart};
-use maki_lua::MoveOutcome;
 use maki_storage::id::MakiId;
+use maki_types::tool::MAIN_TASK_ID;
+use maki_wire::session::SessionOperation;
 use serde::Serialize;
 use strum::IntoStaticStr;
 
@@ -271,7 +272,7 @@ pub(crate) fn count_phrase(count: usize, one: &str, many_suffix: &str) -> String
 /// come.
 fn show_part(chat: &mut Chat, id: &str, part: ToolPart, call_end: Option<TaskOutcome>) {
     if let Some(body) = part.body {
-        chat.register_live_buf(id.to_owned(), body);
+        chat.set_snapshot(id, body);
     }
     let ending = match part.status {
         PartStatus::Working => call_end,
@@ -297,10 +298,7 @@ fn part_task_id(call: &str, part: &str) -> String {
 /// The plugin that registered {tool}, or the tool itself for one no plugin
 /// owns, so the task still has an owner to show.
 fn tool_owner(tool: &Arc<str>) -> Arc<str> {
-    match ToolRegistry::global().get(tool).map(|entry| entry.source) {
-        Some(ToolSource::Lua { plugin }) => plugin,
-        _ => Arc::clone(tool),
-    }
+    Arc::clone(tool)
 }
 
 impl App {
@@ -324,9 +322,29 @@ impl App {
                         call.tool
                     )));
             } else {
-                self.background_moves
-                    .pending
-                    .push(self.lua_event_handle.request_background(call.id.clone()));
+                self.background_moves.pending.push({
+                    let (reply, result) = flume::bounded(1);
+                    if let Some((link, session_id)) = self
+                        .remote_link
+                        .clone()
+                        .and_then(|link| link.session().map(|id| (link, id)))
+                    {
+                        let id = call.id.clone();
+                        tokio::spawn(async move {
+                            let outcome = link
+                                .client
+                                .session_operation(SessionOperation::MoveTool { session_id, id })
+                                .await
+                                .ok()
+                                .and_then(|value| serde_json::from_value(value).ok())
+                                .unwrap_or(MoveOutcome::NoHook);
+                            let _ = reply.send(outcome);
+                        });
+                    } else {
+                        let _ = reply.send(MoveOutcome::NoHook);
+                    }
+                    result
+                });
             }
         }
         if asked && self.background_moves.pending.is_empty() {
@@ -391,7 +409,6 @@ impl App {
                 .filter(|line| !line.is_empty())
                 .unwrap_or(&*done.tool)
                 .to_owned();
-            let buf = self.chats[origin].live_buf(&done.id);
             let mut chat = Chat::new(
                 self.state.session.id,
                 Some(&done.id),
@@ -399,13 +416,16 @@ impl App {
                 self.ui_config.clone(),
                 self.lua_event_handle.clone(),
             );
-            chat.set_restore_channel(self.restore_event_tx.clone());
             chat.plugin = Some(tool_owner(&done.tool));
             chat.backs_moved_call = true;
             chat.clock = Some(TaskClock::started_ago(done.ran_for()));
+            let snapshot = row.render_snapshot.clone();
             chat.load_messages(vec![row]);
-            if let Some(buf) = buf {
-                chat.register_live_buf(done.id.clone(), buf);
+            if let Some((data, _)) = self.chats[origin].call_data(&done.id) {
+                chat.route_loaded(&std::collections::HashMap::from([(done.id.clone(), data)]));
+            }
+            if let Some(snapshot) = snapshot {
+                chat.set_snapshot(&done.id, snapshot);
             }
             self.chats.push(chat);
         }
@@ -452,7 +472,7 @@ impl App {
             BackgroundOutcome::Done
         };
         let (ending, text) = tab_ending(outcome);
-        chat.handle_event(event, None);
+        chat.handle_event(event);
         chat.mark_finished(ending, text);
         self.set_badge_outcome(&id, outcome);
     }
@@ -484,6 +504,7 @@ impl App {
         let Ok(parent) = self.chat_of_task(call) else {
             return;
         };
+        let data = self.chats[parent].call_data(call);
         let call_end = self.chats[parent].finish_outcome();
         let started = self.chats[parent].clock.as_ref().map(|clock| clock.started);
         for part in parts {
@@ -495,6 +516,32 @@ impl App {
                 Ok(idx) => idx,
                 Err(_) => self.open_part(call, &id, &part, started),
             };
+            if let Some((data, streams)) = &data {
+                let index = part
+                    .id
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|ordinal| ordinal.checked_sub(1))
+                    .and_then(|ordinal| {
+                        data.state
+                            .get("children")?
+                            .get(ordinal)?
+                            .get("index")?
+                            .as_u64()
+                    });
+                if let Some(child) = index.and_then(|index| {
+                    data.children
+                        .iter()
+                        .find(|child| u64::from(child.index) == index)
+                }) {
+                    let streams = streams
+                        .iter()
+                        .filter(|(path, _)| path.first() == Some(&child.index))
+                        .map(|(path, text)| (path[1..].to_vec(), text.clone()))
+                        .collect::<Vec<_>>();
+                    self.chats[idx].show_child(&id, child, &streams);
+                }
+            }
             show_part(&mut self.chats[idx], &id, part, call_end);
         }
     }
@@ -691,7 +738,7 @@ impl App {
     }
 
     /// Ends task `id` before its final result, if one ever comes. The user or
-    /// the model stopped it, or the host lost it (`UiAction::PluginTaskEnded`).
+    /// the model stopped it, or the host lost it (`AgentEvent::TaskEnded`).
     /// The subagents it started go down with it, since their own end comes
     /// later and would read as a plain finish. The badge settles now too,
     /// because the tab and its final result may be gone before the call
@@ -738,10 +785,20 @@ impl App {
             return Err(format!("{RUNNING_DELETE_ERR}{id}"));
         }
 
+        if let Some(link) = &self.remote_link
+            && !link.request::<bool>(|session_id| SessionOperation::RemoveTask {
+                session_id,
+                id: id.to_owned(),
+            })?
+        {
+            return Err("The agent did not remove the task".into());
+        }
+
         self.remove_chat_at(pos);
-        self.state.session_mut().remove_subagent(id, |m| {
-            m.tool_uses()
-                .map(|(tool_id, _, _)| tool_id.to_owned())
+        self.state.session_mut().remove_subagent(id, |message| {
+            message
+                .tool_uses()
+                .map(|(id, _, _)| id.to_owned())
                 .collect()
         });
         self.deleted_tasks.insert(id.to_owned());
@@ -878,8 +935,11 @@ mod tests {
     use crate::components::Overlay;
     use crate::components::keybindings::key;
     use crate::repaint::Cadence;
-    use maki_agent::{Envelope, SharedBuf, ToolOutput};
     use maki_config::ToolKey;
+    use maki_types::event::{Envelope, ToolProgressEvent};
+    use maki_types::message::TaskEnd;
+    use maki_types::snapshot::SharedBuf;
+    use maki_types::tool::{ChildStatus, ToolChild, ToolData, ToolOutput};
     use test_case::test_case;
 
     const TASK_ID: &str = "toolu_01";
@@ -962,6 +1022,8 @@ mod tests {
             tool: ToolKey::native(SLOW_TOOL),
             scopes: vec![],
             reason: None,
+
+            choices: Vec::new(),
         }));
         assert!(app.permission_prompt.is_open());
 
@@ -1005,6 +1067,8 @@ mod tests {
                     tool: ToolKey::native(SUB_TOOL),
                     scopes: vec![],
                     reason: None,
+
+                    choices: Vec::new(),
                 },
             );
         }
@@ -1027,9 +1091,13 @@ mod tests {
         assert_eq!(tab.task_id().map(|id| &**id), Some(MOVED_ID));
         assert_eq!(tab.task_status(), TaskStatus::Working);
         assert_eq!(tab.plugin.as_deref(), Some(SLOW_TOOL));
-        assert!(
-            tab.live_buf(MOVED_ID)
-                .is_some_and(|shared| Arc::ptr_eq(&shared, &buf))
+        assert_eq!(
+            tab.tool_message(MOVED_ID)
+                .unwrap()
+                .render_snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.text()),
+            Some(buf.take().text())
         );
         let badge = app.chats[0]
             .tool_message(MOVED_ID)
@@ -1083,6 +1151,8 @@ mod tests {
             annotation: None,
             written_path: None,
             backgrounded: false,
+
+            data: None,
         }))
     }
 
@@ -1115,7 +1185,19 @@ mod tests {
                 app.stop_task(MOVED_ID),
                 Ok(Action::CancelPluginTask { id, .. }) if id == MOVED_ID
             )),
-            StoppedBy::Model => app.end_task(MOVED_ID, BackgroundOutcome::Cancelled),
+            StoppedBy::Model => {
+                app.deliver(
+                    Envelope {
+                        event: AgentEvent::TaskEnded {
+                            id: MOVED_ID.into(),
+                            end: TaskEnd::Cancelled,
+                        },
+                        subagent: None,
+                        run_id: 0,
+                    },
+                    Some(SLOW_TOOL.into()),
+                );
+            }
         }
         for event in [final_result(is_error), AgentEvent::StreamClosed] {
             app.deliver(
@@ -1167,7 +1249,7 @@ mod tests {
                 name: PART_NAME.into(),
                 tool: SUB_TOOL.into(),
                 status,
-                body: Some(Arc::clone(body)),
+                body: Some(body.take()),
             }],
         }));
     }
@@ -1177,6 +1259,72 @@ mod tests {
         let body = Arc::new(SharedBuf::new());
         report_part(&mut app, PartStatus::Working, &body);
         (app, body, part_task_id(MOVED_ID, PART_KEY))
+    }
+
+    #[test]
+    fn a_moved_batch_part_draws_its_child_tool_data() {
+        let (mut app, _) = app_with_moved_call();
+        let child = ToolChild {
+            index: 3,
+            status: ChildStatus::Done,
+            data: ToolData::new(SUB_TOOL.into(), 1, serde_json::json!({}), PART_NAME.into()),
+            output: Some(Arc::new(ToolOutput::Plain(FINAL_OUTPUT.into()))),
+            usage: None,
+        };
+        for progress in [
+            ToolProgressEvent {
+                id: MOVED_ID.into(),
+                path: Vec::new(),
+                append: String::new(),
+                state: Some(serde_json::json!({"children":[{"index":3}]})),
+                child: None,
+            },
+            ToolProgressEvent {
+                id: MOVED_ID.into(),
+                path: vec![3],
+                append: String::new(),
+                state: None,
+                child: Some(Box::new(child)),
+            },
+        ] {
+            app.deliver(
+                Envelope {
+                    event: AgentEvent::ToolProgress(Box::new(progress)),
+                    subagent: None,
+                    run_id: 0,
+                },
+                Some(SLOW_TOOL.into()),
+            );
+        }
+        app.deliver(
+            Envelope {
+                event: AgentEvent::ToolParts {
+                    id: MOVED_ID.into(),
+                    parts: vec![ToolPart {
+                        id: PART_KEY.into(),
+                        name: PART_NAME.into(),
+                        tool: SUB_TOOL.into(),
+                        status: PartStatus::Done,
+                        body: None,
+                    }],
+                },
+                subagent: None,
+                run_id: 0,
+            },
+            Some(SLOW_TOOL.into()),
+        );
+        let id = part_task_id(MOVED_ID, PART_KEY);
+        let tab = &app.chats[app.chat_of_task(&id).unwrap()];
+        assert_eq!(
+            tab.tool_message(&id)
+                .unwrap()
+                .tool_output
+                .as_ref()
+                .unwrap()
+                .as_text(),
+            FINAL_OUTPUT
+        );
+        assert_eq!(tab.task_status(), TaskStatus::Done);
     }
 
     fn part_status(app: &App, part: &str) -> Option<TaskStatus> {
@@ -1194,9 +1342,13 @@ mod tests {
 
         let tab = &app.chats[app.active_chat];
         assert_eq!(tab.part_of().map(|call| &**call), Some(MOVED_ID));
-        assert!(
-            tab.live_buf(&part)
-                .is_some_and(|shared| Arc::ptr_eq(&shared, &body))
+        assert_eq!(
+            tab.tool_message(&part)
+                .unwrap()
+                .render_snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.text()),
+            Some(body.take().text())
         );
         assert_eq!(
             app.running_background_tasks().count(),
@@ -1510,6 +1662,23 @@ mod tests {
         let chat = &app.chats[app.active_chat];
         assert_eq!(chat.task_id().map(|task_id| &**task_id), Some(id));
         assert_eq!(chat.name, name);
+    }
+
+    #[test]
+    fn native_restore_draws_tasks_without_replaying_legacy_queued_work() {
+        let mut app = app_with_subagent_id(TASK_ID);
+        close_subagent_transcript(&mut app, TASK_ID);
+        let mut snapshot = (*app.state.session).clone();
+        snapshot.meta.queued_messages = vec![BUILD_NAME.into()];
+        snapshot.meta.input_draft = Some(RESEARCH_NAME.into());
+        snapshot.id = MakiId::generate();
+        let local_id = app.state.session.id;
+        app.restore_remote_transcript(snapshot);
+        assert_eq!(app.state.session.id, local_id);
+        assert_eq!(app.task_states().count(), 1);
+        assert!(app.state.session.meta.queued_messages.is_empty());
+        assert!(app.queue.is_empty());
+        assert_eq!(app.input_box.buffer.value(), RESEARCH_NAME);
     }
 
     /// A subagent reaches disk when it spawns but its transcript only when it

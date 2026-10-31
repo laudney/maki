@@ -17,7 +17,9 @@ use std::time::Instant;
 use color_eyre::Result;
 use color_eyre::eyre::{Context, eyre};
 use flume::Sender;
-use maki_agent::headless::{self, BackgroundMode, InteractiveHandle, InteractiveParams};
+use maki_agent::headless::{
+    self, BackgroundMode, InteractiveHandle, InteractiveParams, SessionInput,
+};
 use maki_agent::mcp;
 use maki_agent::permissions::{PermissionAnswer, PluginRuleStore, TaggedAnswer};
 use maki_agent::prompt::ResolvedPrompts;
@@ -29,6 +31,7 @@ use maki_agent::{
 };
 use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
 use maki_lua::session_snapshot::{HeadlessMeta, HeadlessSnapshot, MODE_BUILD, MODE_PLAN};
+use maki_lua::{AgentHandle, CoreHandle};
 use maki_providers::model::Model;
 use maki_providers::{ImageSource, StopReason, Timeouts, TokenUsage};
 use maki_storage::StateDir;
@@ -468,7 +471,8 @@ pub struct SdkParams {
     pub plugin_rules: Arc<PluginRuleStore>,
     /// Plugins loaded here still want turn events, and this is what fires
     /// them the way `maki-ui` does.
-    pub lua_handle: maki_lua::EventHandle,
+    pub lua_core: CoreHandle,
+    pub lua_agent: AgentHandle,
     pub project_config: ProjectConfig,
 }
 
@@ -558,7 +562,8 @@ pub async fn run(params: SdkParams) -> Result<Interrupt> {
         defaults,
         model_policy,
         plugin_rules,
-        lua_handle,
+        lua_core,
+        lua_agent,
         project_config,
     } = params;
     cli.warn_ignored_flags();
@@ -579,6 +584,7 @@ pub async fn run(params: SdkParams) -> Result<Interrupt> {
 
     let startup_model = model.clone();
     let (handle, events) = headless::spawn_interactive(InteractiveParams {
+        plugins: None,
         model,
         config,
         permissions_config,
@@ -592,6 +598,8 @@ pub async fn run(params: SdkParams) -> Result<Interrupt> {
         storage,
         yolo: permission_mode == PermissionMode::BypassPermissions,
         unattended: false,
+        auto_wake: false,
+        reauth: false,
         system_prompt_override: cli.system_prompt.clone().filter(|s| !s.is_empty()),
         append_system_prompt: cli.append_system_prompt.clone().filter(|s| !s.is_empty()),
         defaults,
@@ -601,6 +609,7 @@ pub async fn run(params: SdkParams) -> Result<Interrupt> {
         local_tools: Default::default(),
         background: BackgroundMode::from_wait(cli.background_wait()),
         stop: stop.clone(),
+        settings: None,
     });
 
     let (out_tx, out_rx) = flume::unbounded::<String>();
@@ -646,7 +655,7 @@ pub async fn run(params: SdkParams) -> Result<Interrupt> {
     let snapshot = HeadlessSnapshot::default();
     let shared_for_mode = Arc::clone(&shared);
     snapshot.install(
-        &lua_handle,
+        &lua_agent,
         HeadlessMeta {
             id: handle.session_id.to_string(),
             cwd: working_dir.clone(),
@@ -669,7 +678,7 @@ pub async fn run(params: SdkParams) -> Result<Interrupt> {
         reported: RunTotals::default(),
         run_id: None,
         request_counter: 0,
-        lua_handle: lua_handle.clone(),
+        lua_handle: lua_core.clone(),
         session_id: handle.session_id.to_string(),
         snapshot,
     }
@@ -713,7 +722,7 @@ pub async fn run(params: SdkParams) -> Result<Interrupt> {
                     defaults,
                     InputSource::Headless,
                 );
-                if handle.input_tx.send(input).is_err() {
+                if handle.input_tx.send(SessionInput::Prompt(input)).is_err() {
                     break;
                 }
             }
@@ -782,7 +791,7 @@ pub async fn run(params: SdkParams) -> Result<Interrupt> {
     // Reaps session-owned plugin jobs before the writer thread joins: an
     // orphan inheriting stdout would keep an orchestrator's read blocked
     // after maki exits.
-    lua_handle.end_sessions_blocking([session_id.id()], SessionEndReason::Completed);
+    lua_core.end_sessions_blocking([session_id.id()], SessionEndReason::Completed);
     // Background work and plugin jobs are stopped by now, so nothing spends
     // any more. Dropping the track saves the full bill, also what no result
     // was left to report.
@@ -876,7 +885,7 @@ fn handle_control_request(
             )
         }
         "interrupt" => {
-            let _ = handle.cancel_tx.try_send(());
+            handle.cancels.cancel_current();
             writer.emit_control_response(&cr.request_id, ok, None)
         }
         "set_permission_mode" => {
@@ -978,7 +987,7 @@ struct EventPump {
     /// The run the last event belonged to. A new one starts a turn.
     run_id: Option<u64>,
     request_counter: u64,
-    lua_handle: maki_lua::EventHandle,
+    lua_handle: CoreHandle,
     session_id: String,
     snapshot: HeadlessSnapshot,
 }
@@ -991,12 +1000,8 @@ impl EventPump {
                 // Folded in first, so a plugin handling `TurnEnd` finds the
                 // finished totals when it calls `maki.session.read()`.
                 self.snapshot.observe(&envelope);
-                maki_lua::agent_autocmd::dispatch(
-                    &self.lua_handle,
-                    &self.session_id,
-                    &envelope,
-                    envelope.subagent.is_some(),
-                );
+                self.lua_handle
+                    .dispatch(&self.session_id, &envelope, envelope.subagent.is_some());
                 if let Err(e) = self.handle(envelope) {
                     warn!(error = %e, "sdk event pump stopped");
                     break;
@@ -1105,20 +1110,23 @@ impl EventPump {
                 self.tool_inputs.insert(ts.id.clone(), (name, input));
             }
             AgentEvent::ToolPending { .. }
+            | AgentEvent::ToolProgress(_)
             | AgentEvent::ToolOutput { .. }
             | AgentEvent::ToolDone(_)
+            | AgentEvent::TaskEnded { .. }
             | AgentEvent::ToolMovable { .. }
             | AgentEvent::ToolParts { .. }
             | AgentEvent::QueueItemConsumed { .. }
+            | AgentEvent::PluginTask { .. }
+            | AgentEvent::ContextReset { .. }
+            | AgentEvent::TaskQueue { .. }
+            | AgentEvent::QueueUpdated(_)
             | AgentEvent::QueueDrained
             | AgentEvent::AutoCompacting { .. }
             | AgentEvent::CompactionDone { .. }
             | AgentEvent::AuthRequired
             | AgentEvent::AllowedByPlugin { .. }
             | AgentEvent::SubagentHistory { .. }
-            | AgentEvent::ToolSnapshot { .. }
-            | AgentEvent::ToolHeaderSnapshot { .. }
-            | AgentEvent::LiveToolBuf { .. }
             | AgentEvent::Nudge
             | AgentEvent::Notice { .. }
             | AgentEvent::PromptProgress { .. }
@@ -1730,7 +1738,7 @@ mod tests {
             reported: RunTotals::default(),
             run_id: None,
             request_counter: 0,
-            lua_handle: maki_lua::EventHandle::disconnected_for_test(),
+            lua_handle: CoreHandle::disconnected_for_test(),
             session_id: session_id.to_string(),
             snapshot: HeadlessSnapshot::default(),
         };
@@ -1744,6 +1752,7 @@ mod tests {
                 tool: ToolKey::parse(TEST_TOOL).unwrap(),
                 scopes: Vec::new(),
                 reason: None,
+                choices: Vec::new(),
             },
             subagent: None,
             run_id: 0,

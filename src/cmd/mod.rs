@@ -1,214 +1,22 @@
-use maki_config::project::Runtime;
-mod acp;
 mod migrate;
 mod session;
 mod subcmd;
 mod tui;
 
-use std::env;
-use std::sync::Arc;
-
 use color_eyre::Result;
 use color_eyre::eyre::Context;
 
-use maki_agent::tools::ToolRegistry;
-use maki_config::project::{self, TrustMode};
-use maki_config::{Config, load_env_files, load_permissions};
-use maki_lua::{DiscoveredPackage, InitFiles, Interaction, PluginHost};
+use maki_host::start::{cli_stack, trust_mode};
+use maki_host::{auth, project_trust};
+
 use maki_storage::StateDir;
 
 use crate::cli::{AuthAction, Cli, Command, McpAction, MigrateAction, SessionAction, TrustAction};
-use crate::project_trust;
-use crate::setup;
 use crate::update;
 
-fn sanitize_warnings(warnings: &[String]) -> Vec<String> {
-    warnings
-        .iter()
-        .map(String::as_str)
-        .map(maki_lua::sanitize_message)
-        .collect()
-}
-
-fn report_warnings(warnings: Vec<String>) {
-    for warning in sanitize_warnings(&warnings) {
-        eprintln!("warning: {warning}");
-    }
-}
-
-/// What a builtin that fails to load means for the run in progress.
-#[derive(Clone, Copy)]
-enum BuiltinFailure {
-    /// Startup has nothing to fall back on.
-    Fatal,
-    /// `/reload` keeps the open UI alive, so the failure is only reported.
-    Warn,
-}
-
-/// Discovered package names plus the ones `init.lua` declared with
-/// `maki.pack.add`. Resolved by `build_config` instead of handed to it, because
-/// the declared set is only complete once the init files have run, and
-/// validation would otherwise reject a `plugins.<name>` for a package the user
-/// just declared.
-type KnownNames<'a> = dyn Fn(&PluginHost) -> Result<Vec<String>> + 'a;
-
-/// The plugin startup every entry point shares. Packages are discovered before
-/// `build_config` runs, so `plugins.<name>` can configure an installed package,
-/// declared ones are installed after it, and everything is loaded after the
-/// builtins, so a package claiming a builtin tool name is the side that fails.
-///
-/// `interaction` decides whether an install that needs the user's confirmation
-/// may ask for it or has to fail; only the interactive UI can answer.
-///
-/// Warnings are returned sanitized, leaving the sink to the caller; the extra
-/// `Vec` handed to `build_config` is for warnings raised while building it.
-fn load_plugins(
-    host: &mut PluginHost,
-    no_plugins: bool,
-    on_builtin_failure: BuiltinFailure,
-    interaction: Interaction,
-    build_config: impl FnOnce(&PluginHost, &KnownNames<'_>, &mut Vec<String>) -> Result<Config>,
-) -> Result<(Config, Vec<String>)> {
-    // Opens the provider registration window and drops what the previous load
-    // registered: on a `/reload` this host is a new one, and an entry the old
-    // one left behind answers on a channel nobody serves.
-    maki_providers::plugin::begin_load();
-    let legacy_warnings = maki_providers::plugin::keep_legacy_selections();
-
-    let discovery = maki_lua::discover_installed(no_plugins);
-    // Includes the names discovery refused, so a package it could not read does
-    // not become a config error pointing at the user's `plugins.<name>` table.
-    let discovered_names = discovery.known_names();
-    let mut warnings: Vec<String> = discovery
-        .problems
-        .into_iter()
-        .map(|problem| format!("skipping package: {problem}"))
-        .collect();
-    warnings.extend(legacy_warnings);
-
-    let config = build_config(
-        host,
-        &|host: &PluginHost| {
-            let mut names = discovered_names.clone();
-            names.extend(declared_packages(host)?.into_iter().map(|d| d.spec.name));
-            names.sort();
-            names.dedup();
-            Ok(names)
-        },
-        &mut warnings,
-    )?;
-
-    // Before any plugin can call `maki.net`, so the first request already sees
-    // the hosts the user exempted from the private-address block.
-    maki_lua::set_allowed_private_hosts(&config.net.allowed_private_hosts);
-    maki_lua::set_shell_preference(config.agent.shell.clone());
-
-    if let Err(e) = host.load_builtins(&config.plugins) {
-        let e = color_eyre::eyre::Report::from(e).wrap_err("load builtin plugins");
-        match on_builtin_failure {
-            BuiltinFailure::Fatal => return Err(e),
-            BuiltinFailure::Warn => warnings.push(format!("{e:#}")),
-        }
-    }
-
-    // Installing here rather than inside `maki.pack.add` keeps a clone off the
-    // Lua thread, and is the phase Neovim's own `load` default defers to.
-    let declared = declared_packages(host)?;
-    let installed = maki_lua::install_declared(&declared, interaction);
-    warnings.extend(installed.failures);
-    let available: Vec<DiscoveredPackage> = discovery
-        .packages
-        .into_iter()
-        .chain(installed.packages)
-        .collect();
-    warnings.extend(host.load_declared_packages(&available, &declared, &config.plugins));
-
-    // Last, so it covers every load above. Taking empties it, so a later
-    // `/reload` only reports what that load found.
-    warnings.extend(host.take_key_warning());
-
-    // Publishes this load's providers in one step. Until here every reader
-    // still sees the generation that was serving, so a `/reload` never opens a
-    // window in which a registered provider answers "unknown".
-    maki_providers::plugin::commit_load();
-
-    Ok((config, sanitize_warnings(&warnings)))
-}
-
-fn declared_packages(host: &PluginHost) -> Result<Vec<maki_lua::Declared>> {
-    host.declared_packages().context("read declared packages")
-}
-
-/// Everything a non-session subcommand needs before it can do work: the model
-/// registry, project trust, `.env`, the plugin host, the effective config, and
-/// the TUI's logging and telemetry, so a plugin's `maki.log.*` has somewhere to
-/// go. One function, so the next
-/// subcommand cannot forget a step the way all three of these did.
-///
-/// Plugins still load before the subscriber exists, because the config that
-/// configures it is Lua-produced. That is unchanged from `cmd::tui::run`.
-fn cli_stack(
-    no_plugins: bool,
-    no_jit: bool,
-    trust_mode: TrustMode,
-) -> Result<(PluginHost, Config)> {
-    // First, as in `cmd::tui::run`, so anything that resolves a model sees the
-    // models the TUI would.
-    let storage = StateDir::resolve().context("resolve data directory")?;
-    maki_providers::model_registry::load_from_storage(&storage);
-    let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
-    // The `trust.paths` policy deliberately stops at the session entry points
-    // (`cmd::tui`, `maki-acp`): a one-shot utility would record a grant the
-    // user never saw, for a session it never runs.
-    let trust = project::resolve_noninteractive(&cwd, trust_mode, Runtime::Agent);
-    load_env_files(&trust.project_config);
-
-    let mut host = PluginHost::start(
-        Arc::clone(ToolRegistry::global_arc()),
-        Interaction::None,
-        !no_jit,
-    )
-    .context("initialize lua plugin host")?;
-    let (config, warnings) = load_plugins(
-        &mut host,
-        no_plugins,
-        BuiltinFailure::Fatal,
-        Interaction::None,
-        |host, names, warnings| {
-            // `notices`, not `warning`: these commands never ask, so the
-            // skipped path and how to undo it are the only sign the project
-            // config did nothing.
-            warnings.extend(trust.notices());
-            let raw = host
-                .load_init_files(
-                    InitFiles::resolve(&trust.project_config, no_plugins),
-                    warnings,
-                )
-                .context("load init.lua files")?;
-            let mut config = raw
-                .unwrap_or_default()
-                .into_config(&names(host)?)
-                .context("invalid config")?;
-            config.permissions = load_permissions(&trust.project_config);
-            Ok(config)
-        },
-    )?;
-    setup::init_logging(&config.storage, trust.project_config.config_root());
-    setup::init_telemetry(&config.telemetry);
-    setup::install_panic_log_hook();
-    report_warnings(warnings);
-    Ok((host, config))
-}
-
 pub fn dispatch(cli: Cli) -> Result<()> {
-    // `--trust` is a grant for this process, so every entry point under it
-    // reads the same shared project config the TUI would.
-    let trust_mode = if cli.trust {
-        TrustMode::Session
-    } else {
-        TrustMode::Consult
-    };
-    let background = cli.background_wait().is_some();
+    let trust_mode = trust_mode(&cli.host);
+    let background_timeout = cli.background_timeout;
     match cli.command {
         Some(Command::Auth { action }) => {
             let storage = StateDir::resolve().context("resolve data directory")?;
@@ -216,20 +24,18 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             // plugin load has published them, and `login`/`logout` drive a hook
             // that runs on the host's Lua thread, so `_host` stays bound for the
             // whole arm.
-            let _host = cli_stack(cli.no_plugins, cli.no_jit, trust_mode)?;
+            let _host = cli_stack(cli.host.no_plugins, cli.host.no_jit, trust_mode)?;
             match action {
-                AuthAction::Login { provider } => {
-                    subcmd::auth_login(provider.as_deref(), &storage)?
-                }
-                AuthAction::Logout { provider } => subcmd::auth_logout(&provider, &storage)?,
-                AuthAction::Status => subcmd::auth_status(&storage)?,
+                AuthAction::Login { provider } => auth::auth_login(provider.as_deref(), &storage)?,
+                AuthAction::Logout { provider } => auth::auth_logout(&provider, &storage)?,
+                AuthAction::Status => auth::auth_status(&storage)?,
             }
         }
         Some(Command::Index { path }) => {
-            subcmd::index(&path, cli.no_plugins, cli.no_jit, trust_mode)?;
+            subcmd::index(&path, cli.host.no_plugins, cli.host.no_jit, trust_mode)?;
         }
         Some(Command::Models { refresh }) => {
-            subcmd::models(cli.no_plugins, cli.no_jit, refresh, trust_mode)?
+            subcmd::models(cli.host.no_plugins, cli.host.no_jit, refresh, trust_mode)?
         }
         Some(Command::Session { action }) => {
             let storage = StateDir::resolve().context("resolve data directory")?;
@@ -255,21 +61,15 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         Some(Command::Rollback) => {
             update::rollback().map_err(|e| color_eyre::eyre::eyre!("{e}"))?;
         }
-        Some(Command::Acp { model, yolo }) => {
-            acp::run(
-                model,
-                yolo,
-                cli.no_plugins,
-                cli.no_jit,
-                trust_mode,
-                background,
-            )?;
+        Some(Command::Acp(mut args)) => {
+            args.background_timeout = args.background_timeout.or(background_timeout);
+            maki_host::acp(args, &cli.host)?;
         }
         Some(Command::Migrate { action }) => match action {
             MigrateAction::Xdg => migrate::xdg()?,
             MigrateAction::Providers => {
                 // A script counts as ported once a plugin registers its slug.
-                let _host = cli_stack(cli.no_plugins, cli.no_jit, trust_mode)?;
+                let _host = cli_stack(cli.host.no_plugins, cli.host.no_jit, trust_mode)?;
                 migrate::providers()?
             }
         },
@@ -298,8 +98,8 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 plan,
                 tools,
                 names,
-                cli.no_plugins,
-                cli.no_jit,
+                cli.host.no_plugins,
+                cli.host.no_jit,
                 trust_mode,
             )?;
         }

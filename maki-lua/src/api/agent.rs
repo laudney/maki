@@ -1,15 +1,13 @@
 //! `maki.agent` exposes subagent primitives to Lua plugins. Policy (retries,
 //! validation, concurrency) lives in the task plugin, not here.
 
-use maki_providers::ModelRequestOptions;
-#[cfg(test)]
-use maki_providers::ModelThinking;
-
 use std::collections::HashMap;
+use std::future;
 use std::pin::pin;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
+use flume::Receiver;
 use futures::future::{Either, select};
 use maki_agent::agent::{LoadedInstructions, tool_dispatch};
 use maki_agent::cancel::{CancelMap, CancelSlot, CancelToken, CancelTrigger};
@@ -18,24 +16,26 @@ use maki_agent::tools::interpreter_bridge;
 use maki_agent::tools::registry::ToolRegistry;
 use maki_agent::tools::schema::sanitize_tool_input_schema;
 use maki_agent::tools::{
-    BackgroundFor, CallOrigin, Deadline, DescriptionContext, LocalTool, LocalTools, RequestTools,
-    ToolAudience, ToolContext, ToolFilter, ToolLive, ToolOutputMode,
+    BackgroundFor, CallOrigin, Deadline, DescriptionContext, LocalTool, LocalTools,
+    PendingProgress, ProgressScope, RequestTools, ToolAudience, ToolContext, ToolFilter, ToolLive,
+    ToolOutputMode,
 };
 use maki_agent::types::ALLOWED_BY;
 use maki_agent::{
     Agent, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, AgentSeed, CallScope,
-    DoneReason, EMPTY_RESPONSE_MARKER, EarlierInput, Envelope, EventSender, EventStreamGuard,
-    History, ImageSource, InputSource, McpSession, RunContext, RunContextBuilder, RunLedger,
-    RunTotals, SessionEvents, SessionMailbox, SessionStub, SubagentInbox, SubagentInfo, TaskHome,
-    ToolDoneEvent, UNAVAILABLE_RESULT, event_stream,
+    ChildStatus, DEFAULT_DATA_VERSION, DoneReason, EMPTY_RESPONSE_MARKER, EarlierInput, Envelope,
+    EventSender, EventStreamGuard, History, ImageSource, InputSource, McpSession, RunContext,
+    RunContextBuilder, RunLedger, RunTotals, SessionEvents, SessionMailbox, SessionStub,
+    SubagentInbox, SubagentInfo, TaskHome, ToolData, ToolDoneEvent, UNAVAILABLE_RESULT,
+    event_stream,
 };
 use maki_lua_macro::{lua_class, lua_fn, lua_table};
 use maki_providers::model::ModelTier;
 use maki_providers::model_registry;
 use maki_providers::provider;
 use maki_providers::{
-    AgentError, ContentBlock, ContextGauge, Message, Model, RequestOptions, Role, ThinkingConfig,
-    add_cost,
+    AgentError, ContentBlock, ContextGauge, Message, Model, ModelRequestOptions, RequestOptions,
+    Role, ThinkingConfig, add_cost,
 };
 use maki_storage::id::MakiId;
 use maki_storage::now_epoch;
@@ -51,8 +51,7 @@ use tracing::info;
 
 use crate::api::session::{not_live, required_session};
 use crate::api::tool::{audiences_to_lua, parse_audience};
-use crate::api::ui::buf::BufHandle;
-use crate::api::util::command::UiAction;
+use crate::api::util::call::{call_to_lua, child_to_lua, path_to_lua};
 use crate::api::util::convert::{TableExt, json_to_lua, lua_to_json, lua_tool_result};
 use crate::api::util::ctx::{AgentContext, LuaCtx};
 use crate::api::util::pair::{Pair, err_pair, pair, try_pair};
@@ -60,7 +59,7 @@ use crate::background::{
     BackgroundInfo, BackgroundTask, BackgroundTasks, Fire, Kind, Lifetime, Stop, StopMark,
 };
 use crate::plugin_permissions::{Permission, PluginPermissions, require};
-use crate::runtime::{CANCELLED_MSG, active_task_cancel, host_ui};
+use crate::runtime::{CANCELLED_MSG, active_task_cancel};
 
 const SESSION_CLOSED_ERR: &str = "session closed";
 /// Esc in the task's tab. Distinct from [`CANCELLED_MSG`], so a loop can tell
@@ -79,6 +78,14 @@ const MCP_REACH_ERR: &str =
     "mcp = true reaches whatever its servers do, so a session of your own takes every permission";
 const TASK_REQUIRED_ERR: &str = "maki.agent.session({ session = id }) and its prompts must run \
      in a task: maki.async.spawn, an autocmd callback or a tool handler";
+const PATH_KEY: &str = "path";
+const APPEND_KEY: &str = "append";
+const STATE_KEY: &str = "state";
+const CHILD_KEY: &str = "child";
+
+/// What `call_tool` answers: the text or the error, then the call itself
+/// once it ran.
+type CallReply = (Option<String>, Option<String>, Option<Table>);
 
 fn resolve_model_from_ctx(ctx: &AgentContext, tier: Option<&str>) -> Result<Model, String> {
     let Some(tier_str) = tier else {
@@ -201,12 +208,8 @@ fn parse_scope(scope: Option<String>, task: u64) -> LuaResult<Option<u64>> {
 }
 
 /// Where a session's events go. A session opened on a tool ctx reports to the
-/// tool's parent agent, until the call that opened it moves to the background:
-/// from then on the parent's next run would drop its events as stale, so they
-/// go to the chat it moved to. One a plugin opened by chat session id reports
-/// to the chat's tab, which shows it as a task owned by that plugin. Headless
-/// there is no tab, so `ui` is `None` and only the registry keeps the cost
-/// for `maki.agent.list()`.
+/// tool's parent agent. One a plugin opened by chat session id reports to
+/// its mailbox, which forwards the task under its owning plugin.
 #[derive(Clone)]
 enum Upstream {
     Parent {
@@ -216,7 +219,6 @@ enum Upstream {
     Chat {
         session: MakiId,
         plugin: Arc<str>,
-        ui: Option<flume::Sender<UiAction>>,
         registry: BackgroundTasks,
         id: String,
     },
@@ -226,7 +228,6 @@ enum Upstream {
 #[derive(Clone)]
 struct Adoption {
     call: Arc<CallScope>,
-    ui: Option<flume::Sender<UiAction>>,
     registry: BackgroundTasks,
     /// The session's `ui_id`.
     id: String,
@@ -253,12 +254,7 @@ impl Adoption {
 /// A session that already ran has a chat in the UI, under the call's row.
 /// The UI adopts it now rather than at its next event, or a quiet one would
 /// look dead once the turn that started it ends.
-pub(crate) fn adopt_session(
-    registry: &BackgroundTasks,
-    ui: Option<&flume::Sender<UiAction>>,
-    home: &TaskHome,
-    stub: SessionStub,
-) {
+pub(crate) fn adopt_session(registry: &BackgroundTasks, home: &TaskHome, stub: SessionStub) {
     if stub.ui_id == home.id {
         return;
     }
@@ -283,12 +279,16 @@ pub(crate) fn adopt_session(
         tracing::debug!(call = %home.id, %error, "session under a moved call outlived its chat");
         return;
     }
-    if let (Some(ui), Some(info)) = (ui, stub.info.get()) {
-        let _ = ui.try_send(UiAction::PluginTaskOpened {
-            session: home.chat,
-            plugin: stub.plugin,
-            info: Box::new(info.clone()),
-        });
+    if let Some(info) = stub.info.get() {
+        SessionMailbox::task_event(
+            home.chat,
+            stub.plugin,
+            Envelope {
+                event: AgentEvent::Nudge,
+                subagent: Some(info.clone()),
+                run_id: 0,
+            },
+        );
     }
 }
 
@@ -299,18 +299,8 @@ impl Upstream {
                 let _ = tx.send_envelope(envelope);
             }
             Self::Chat {
-                session,
-                plugin,
-                ui: Some(ui),
-                ..
-            } => {
-                let _ = ui.try_send(UiAction::PluginTaskEvent {
-                    session: *session,
-                    plugin: Arc::clone(plugin),
-                    envelope: Box::new(envelope),
-                });
-            }
-            Self::Chat { ui: None, .. } => {}
+                session, plugin, ..
+            } => SessionMailbox::task_event(*session, Arc::clone(plugin), envelope),
         }
     }
 
@@ -328,7 +318,6 @@ impl Upstream {
         Some(Self::Chat {
             session: home.chat,
             plugin: Arc::clone(&adoption.plugin),
-            ui: adoption.ui.clone(),
             registry: adoption.registry.clone(),
             id: adoption.id.clone(),
         })
@@ -357,18 +346,8 @@ impl Upstream {
     /// A plugin task shows up in its chat as soon as it opens, so the user can
     /// find it in `/tasks` and stop it even before its first prompt.
     fn open_task(&self, info: SubagentInfo) {
-        if let Self::Chat {
-            session,
-            plugin,
-            ui: Some(ui),
-            ..
-        } = self
-        {
-            let _ = ui.try_send(UiAction::PluginTaskOpened {
-                session: *session,
-                plugin: Arc::clone(plugin),
-                info: Box::new(info),
-            });
+        if matches!(self, Self::Chat { .. }) {
+            self.send_event(AgentEvent::Nudge, Some(info));
         }
     }
 
@@ -411,7 +390,7 @@ async fn relay_session_events(
     let mut cost = None;
     while let Some(mut envelope) = sub_events.next().await {
         upstream.follow_move();
-        if matches!(upstream, Upstream::Chat { ui: None, .. })
+        if matches!(upstream, Upstream::Chat { session, .. } if !SessionMailbox::has_events(session))
             && let Some(answer) = unattended_answer(&envelope.event)
         {
             if let Some(answers) = subagent_info.get().and_then(|i| i.answer_tx.as_ref()) {
@@ -719,8 +698,24 @@ async fn callable_tools(lua: Lua, ctx: mlua::UserDataRef<LuaCtx>) -> LuaResult<P
 /// Run a tool by name and wait for the result. This is how you call built-in
 /// tools (like `read`, `bash`, `glob`) from Lua without going through the LLM.
 ///
-/// Live events (streaming output, annotations, cumulative usage) are delivered
-/// through optional callbacks while the tool runs.
+/// Live events (streaming output, annotations, cumulative usage, progress) are
+/// delivered through optional callbacks while the tool runs.
+///
+/// A call reads as the `data` a renderer draws it from (see
+/// `maki.ui.register_renderer`): `tool`, `version`, `input` (the input it ran
+/// with, after input hooks), `output` (the `ToolOutput` in its JSON form, such
+/// as `{ Plain = { text = "..." } }`), `state`, `status` (`"running"`,
+/// `"done"`, `"error"` or `"cancelled"`), `summary`, `annotations`,
+/// `rewritten` (true when an output hook changed its output) and `children`.
+/// Each of `children` is a call it made in turn, with `usage` and `index`,
+/// its 1-based invocation index.
+///
+/// An `on_progress` update names the call that changed by `path`: empty for
+/// this call, `{ i }` for the call it made at invocation index `i`, and so on
+/// down. It carries `append`, the text that call streamed, or `state`, its new
+/// live state (`maki.NIL` for null), or `child`, its whole record as a call
+/// of `children` reads. A record comes at the call's start, with the input it
+/// runs with, and again on each change, its end included.
 ///
 /// @param ctx LuaCtx Agent context.
 /// @param name string Tool name, e.g. `"bash"`, `"read"`.
@@ -731,8 +726,6 @@ async fn callable_tools(lua: Lua, ctx: mlua::UserDataRef<LuaCtx>) -> LuaResult<P
 ///     "compact" returns what the model would get, with output limits and
 ///     RTK rewriting. Permissions and hooks apply in both modes, and hooks
 ///     see the mode as `ctx.output_mode`.
-///   `on_live_buf` (function?) - called with a `BufHandle` for each live buffer
-///     the tool publishes. Must not yield.
 ///   `on_annotation` (function?) - called with an annotation string for each
 ///     annotation event. Must not yield. A call a `permission.prompt` layer
 ///     allowed arrives as `"allowed by <plugin>"`. Without this callback that
@@ -746,6 +739,11 @@ async fn callable_tools(lua: Lua, ctx: mlua::UserDataRef<LuaCtx>) -> LuaResult<P
 ///     a subagent, which `/tasks` then lists as a task of its own. Must not
 ///     yield.
 /// @return (string?, string?) Tool output text, or `(nil, err)` on failure.
+///   `on_progress` (function?) - called in order with an update for each
+///     change to the call and to the calls it makes in turn, as it happens.
+///     Only a call made inside a tool handler reports progress. Must not yield.
+/// @return (string?, string?, table?) Tool output text, or `(nil, err)` on
+///   failure, then the call once it ran, its `status` `"done"` or `"error"`.
 ///   Instruction files the child picks up (a subdirectory `AGENTS.md`) are
 ///   not in the text: they land on the calling tool's own result.
 /// @example
@@ -762,47 +760,60 @@ async fn call_tool(
     name: String,
     input: LuaValue,
     opts: Option<Table>,
-) -> LuaResult<Pair<String>> {
+) -> LuaResult<CallReply> {
+    let refused = |err: &dyn ToString| Ok((None, Some(err.to_string()), None));
     let input_json = lua_to_json(&lua, &input)?;
-    let agent = try_pair!(dispatch_ctx(&ctx, "call_tool"));
+    let agent = match dispatch_ctx(&ctx, "call_tool") {
+        Ok(agent) => agent,
+        Err(e) => return refused(&e),
+    };
     let mut tctx = agent.to_tool_context();
     tctx.output_mode = ToolOutputMode::Full;
     // Open even without callbacks: when a plugin answers the child's
     // permission prompt, the user still has to see it somewhere.
     let (live_tx, live_rx) = flume::unbounded();
     tctx.live_sink = Some(live_tx);
-    let (mut on_buf, mut on_ann, mut on_usage, mut on_movable, mut on_task) =
+    let (mut on_ann, mut on_usage, mut on_movable, mut on_task, mut on_progress) =
         (None, None, None, None, None);
     if let Some(o) = opts {
         if let Some(mode) = o.opt::<String>("output_mode")? {
             let Some(mode) = ToolOutputMode::parse(&mode) else {
-                return Ok(err_pair(OUTPUT_MODE_ERR));
+                return refused(&OUTPUT_MODE_ERR);
             };
             tctx.output_mode = mode;
         }
         if let Some(secs) = o.opt::<u64>("timeout")? {
             tctx.deadline = Deadline::after(Duration::from_secs(secs));
         }
-        on_buf = o.opt::<Function>("on_live_buf")?;
         on_ann = o.opt::<Function>("on_annotation")?;
         on_usage = o.opt::<Function>("on_usage")?;
         on_movable = o.opt::<Function>("on_movable")?;
         on_task = o.opt::<Function>("on_task")?;
+        on_progress = o.opt::<Function>("on_progress")?;
     }
+    if let Err(e) = tctx.deadline.check() {
+        return refused(&e);
+    }
+    // Taken last, so a call that never dispatches leaves no gap in the
+    // indices of its siblings.
+    tctx.progress = agent.child_progress();
+    let watch = on_progress
+        .as_ref()
+        .and(tctx.progress.as_ref())
+        .map(ProgressScope::watch);
     let cbs = LiveCallbacks {
+        lua: &lua,
         tool: &name,
         caller: ToolContext::clone(agent),
-        on_buf,
         on_ann,
         on_usage,
         on_movable,
         on_task,
+        on_progress,
     };
     drop(ctx);
-    if let Err(e) = tctx.deadline.check() {
-        return Ok(err_pair(e));
-    }
-    let done = dispatch_racing_live(&tctx, &name, &input_json, live_rx, &cbs).await;
+    let progress = watch.as_ref().map(|watch| watch.updates());
+    let done = dispatch_racing_live(&tctx, &name, &input_json, live_rx, progress, &cbs).await;
     // Same fallback the UI applies on tool completion, so a batch child's
     // header carries the annotation its standalone run would get.
     let annotation = done
@@ -812,7 +823,59 @@ async fn call_tool(
     if let Some(a) = annotation {
         cbs.deliver(ToolLive::Annotation(a)).await;
     }
-    Ok(pair(interpreter_bridge::flatten(&done)))
+    let call = ran_call_to_lua(&lua, &done, &input_json)?;
+    let (text, err) = pair(interpreter_bridge::flatten(&done));
+    Ok((text, err, Some(call)))
+}
+
+/// The call `call_tool` ran, in the shape a renderer reads. A call no tool
+/// took has no data of its own, so it gets what dispatch knows of it.
+fn ran_call_to_lua(lua: &Lua, done: &ToolDoneEvent, input: &JsonValue) -> LuaResult<Table> {
+    let unrouted;
+    let data = match done.data.as_deref() {
+        Some(data) => data,
+        None => {
+            unrouted = ToolData::new(
+                Arc::clone(&done.tool),
+                DEFAULT_DATA_VERSION,
+                input.clone(),
+                done.tool.to_string(),
+            );
+            &unrouted
+        }
+    };
+    let status = if done.is_error {
+        ChildStatus::Error
+    } else {
+        ChildStatus::Done
+    };
+    call_to_lua(lua, data, Some(&done.output), status)
+}
+
+/// One change `on_progress` hears of. A state set to null stays `maki.NIL`,
+/// so it reads apart from an unchanged one.
+fn progress_to_lua(lua: &Lua, update: PendingProgress) -> LuaResult<Table> {
+    let PendingProgress {
+        path,
+        append,
+        state,
+        child,
+    } = update;
+    let table = lua.create_table()?;
+    table.set(PATH_KEY, path_to_lua(lua, &path)?)?;
+    if !append.is_empty() {
+        table.set(APPEND_KEY, append)?;
+    }
+    if let Some(state) = state {
+        let state = match state {
+            JsonValue::Null => LuaValue::NULL,
+            state => json_to_lua(lua, &state)?,
+        };
+        table.set(STATE_KEY, state)?;
+    }
+    let child = child.map(|child| child_to_lua(lua, &child));
+    table.set(CHILD_KEY, child.transpose()?)?;
+    Ok(table)
 }
 
 /// Create a new subagent session. The session inherits the parent model and
@@ -1069,11 +1132,9 @@ async fn session(
         .unwrap_or_else(|| format!("session-{}", MakiId::generate()));
     let name = name.unwrap_or_default();
     let registry = BackgroundTasks::of(&lua);
-    let ui = host_ui(&lua);
     let adoption = match (&owner, &agent_ctx.call) {
         (None, Some(call)) => Some(Adoption {
             call: Arc::clone(call),
-            ui: ui.clone(),
             registry: registry.clone(),
             id: ui_id.clone(),
             plugin: Arc::clone(&plugin),
@@ -1084,7 +1145,6 @@ async fn session(
         Some((session, ..)) => Upstream::Chat {
             session: *session,
             plugin: Arc::clone(&plugin),
-            ui,
             registry: registry.clone(),
             id: ui_id.clone(),
         },
@@ -1128,7 +1188,7 @@ async fn session(
         if let Some(stub) = adoption.call.add_session(stub)
             && let Some(home) = adoption.call.home()
         {
-            adopt_session(&adoption.registry, adoption.ui.as_ref(), home, stub);
+            adopt_session(&adoption.registry, home, stub);
         }
     }
 
@@ -1195,6 +1255,7 @@ async fn session(
             config: agent_ctx.config.clone(),
             tool_output_lines: maki_config::ToolOutputLines::default(),
             permissions: Arc::clone(&agent_ctx.permissions),
+            working_dir: Arc::clone(&agent_ctx.working_dir),
             session_id: agent_ctx.session_id.clone(),
             // Once the call moves nobody watches its writes, so they honour
             // plan mode from then on, as other background work does.
@@ -1390,21 +1451,34 @@ lua_table! {
 /// Must use `call_async`, not `call`: callbacks that yield (highlight,
 /// markdown) hit the C-call boundary otherwise.
 struct LiveCallbacks<'a> {
+    lua: &'a Lua,
     tool: &'a str,
     /// The tool that called `call_tool`. A child's "allowed by" mark goes on
     /// its row when there is no `on_annotation` to show it.
     caller: ToolContext,
-    on_buf: Option<Function>,
     on_ann: Option<Function>,
     on_usage: Option<Function>,
     on_movable: Option<Function>,
     on_task: Option<Function>,
+    on_progress: Option<Function>,
 }
 
 impl LiveCallbacks<'_> {
+    async fn progress(&self, update: PendingProgress) {
+        let Some(on_progress) = &self.on_progress else {
+            return;
+        };
+        let res = match progress_to_lua(self.lua, update) {
+            Ok(update) => on_progress.call_async::<()>(update).await,
+            Err(e) => Err(e),
+        };
+        if let Err(e) = res {
+            tracing::warn!(tool = self.tool, error = %e, "call_tool on_progress failed");
+        }
+    }
+
     async fn deliver(&self, ev: ToolLive) {
         let res = match ev {
-            ToolLive::Buf(buf) => call_opt(&self.on_buf, BufHandle::foreign(buf)).await,
             ToolLive::Annotation(ann) => call_opt(&self.on_ann, ann).await,
             ToolLive::Usage(usage) => call_opt(&self.on_usage, usage).await,
             ToolLive::AllowedBy(plugin) if self.on_ann.is_some() => {
@@ -1431,13 +1505,14 @@ async fn call_opt(f: &Option<Function>, arg: impl IntoLuaMulti) -> Option<LuaRes
 }
 
 /// Like `interpreter_bridge::dispatch`, but keeps the full `ToolDoneEvent`
-/// (the annotation lives there) and feeds live events to `cbs` while the
-/// child runs.
+/// (the annotation lives there) and feeds live events and progress to `cbs`
+/// while the child runs.
 async fn dispatch_racing_live(
     tctx: &ToolContext,
     name: &str,
     input: &JsonValue,
-    rx: flume::Receiver<ToolLive>,
+    rx: Receiver<ToolLive>,
+    progress: Option<&Receiver<PendingProgress>>,
     cbs: &LiveCallbacks<'_>,
 ) -> ToolDoneEvent {
     let mut run = pin!(tool_dispatch::run(
@@ -1448,18 +1523,46 @@ async fn dispatch_racing_live(
         CallOrigin::Nested
     ));
     loop {
-        match select(run.as_mut(), pin!(rx.recv_async())).await {
+        match select(run.as_mut(), pin!(next_live(&rx, progress))).await {
             Either::Left((done, _)) => {
+                while let Some(update) = progress.and_then(|progress| progress.try_recv().ok()) {
+                    cbs.progress(update).await;
+                }
                 while let Ok(ev) = rx.try_recv() {
                     cbs.deliver(ev).await;
                 }
                 return done;
             }
-            Either::Right((Ok(ev), _)) => cbs.deliver(ev).await,
-            // The sender is gone but no result arrived: just wait for the run.
-            Either::Right((Err(_), _)) => return run.await,
+            Either::Right((Live::Event(ev), _)) => cbs.deliver(ev).await,
+            Either::Right((Live::Progress(update), _)) => cbs.progress(*update).await,
         }
     }
+}
+
+enum Live {
+    Event(ToolLive),
+    Progress(Box<PendingProgress>),
+}
+
+/// The next live event or progress update. A channel whose sender is gone
+/// waits for the run instead.
+async fn next_live(rx: &Receiver<ToolLive>, progress: Option<&Receiver<PendingProgress>>) -> Live {
+    let event = async {
+        match rx.recv_async().await {
+            Ok(ev) => Live::Event(ev),
+            Err(_) => future::pending().await,
+        }
+    };
+    let update = async {
+        match progress {
+            Some(progress) => match progress.recv_async().await {
+                Ok(update) => Live::Progress(Box::new(update)),
+                Err(_) => future::pending().await,
+            },
+            None => future::pending().await,
+        }
+    };
+    tokio::select! { biased; value = event => value, value = update => value }
 }
 
 struct SessionState {
@@ -1745,7 +1848,7 @@ impl SessionCancellation {
     /// See [`SubagentInfo::parent_call`].
     fn parent_call(&self) -> Option<String> {
         let call = self.adoption.as_ref()?.call.id();
-        (call != self.ui_id).then(|| call.to_owned())
+        Some(call.to_owned())
     }
 
     /// Why this session takes no more messages, closing aside. It needs no
@@ -1985,7 +2088,7 @@ async fn prompt(
             settle.outcome = result
                 .as_ref()
                 .err()
-                .map(|e| AgentEvent::error(e, RunTotals::default()));
+                .map(|e| maki_agent::error_event(e, RunTotals::default()));
         }
         if let Some(Ok(_)) = finished {
             s.dones.expect_one();
@@ -2185,8 +2288,8 @@ mod tests {
     use maki_providers::model::ThinkingSupport;
     use maki_providers::provider::{BoxFuture, Provider};
     use maki_providers::{
-        AgentError, ContentBlock, Message, ModelInfo, ProviderEvent, Role, StopReason,
-        StreamResponse, TokenUsage,
+        AgentError, ContentBlock, Message, ModelInfo, ModelThinking, ProviderEvent, Role,
+        StopReason, StreamResponse, TokenUsage,
     };
     use maki_storage::id::SessionRef;
     use maki_storage::sessions::Effort;
@@ -2641,7 +2744,7 @@ mod tests {
             lua.load("return select(2, agent.session({ session = sid }))")
                 .eval_async::<Option<String>>()
         };
-        let task = TaskScope::new(&lua, TaskCell::new(CancelToken::none(), None, None));
+        let task = TaskScope::new(&lua, TaskCell::new(CancelToken::none(), None));
 
         assert_eq!(open().await.unwrap().as_deref(), Some(TASK_REQUIRED_ERR));
         assert_eq!(
@@ -2691,6 +2794,7 @@ mod tests {
             model: model.into(),
             cost: Some(cost),
             subsidised_list_cost: None,
+            subsidised_by: None,
             context_size: None,
             context_window: 0,
         }))
@@ -2781,20 +2885,42 @@ mod tests {
         (upstream, parent_rx)
     }
 
-    fn chat_upstream(session: MakiId, ui_tx: Sender<UiAction>) -> Upstream {
-        Upstream::Chat {
-            session,
-            plugin: Arc::from(PLUGIN),
-            ui: Some(ui_tx),
-            registry: BackgroundTasks::default(),
-            id: PARENT_ID.into(),
-        }
+    fn chat_upstream() -> (Upstream, Receiver<Envelope>, SessionMailbox) {
+        let session = MakiId::generate();
+        let mailbox = SessionMailbox::register(session);
+        let (tx, rx) = flume::unbounded();
+        mailbox.publish_events(EventSender::new(tx, RUN_ID));
+        (
+            Upstream::Chat {
+                session,
+                plugin: Arc::from(PLUGIN),
+                registry: BackgroundTasks::default(),
+                id: PARENT_ID.into(),
+            },
+            rx,
+            mailbox,
+        )
+    }
+
+    fn chat_events(rx: &Receiver<Envelope>, _session: MakiId) -> Vec<AgentEvent> {
+        rx.drain()
+            .map(|envelope| task_envelope(envelope).event)
+            .collect()
+    }
+
+    fn task_envelope(envelope: Envelope) -> Envelope {
+        let AgentEvent::PluginTask { plugin, envelope } = envelope.event else {
+            panic!("expected a plugin task");
+        };
+        assert_eq!(&*plugin, PLUGIN);
+        *envelope
     }
 
     fn permission_ask() -> AgentEvent {
         AgentEvent::PermissionRequest {
             id: REQUEST_ID.into(),
             tool: ToolKey::native(ASKING_TOOL),
+            choices: Vec::new(),
             scopes: Vec::new(),
             reason: None,
         }
@@ -2826,11 +2952,14 @@ mod tests {
         })
         .unwrap();
         let session = MakiId::generate();
+        let mailbox = SessionMailbox::register(session);
         let (ui_tx, ui_rx) = flume::unbounded();
+        if watched {
+            mailbox.publish_events(EventSender::new(ui_tx, RUN_ID));
+        }
         let upstream = Upstream::Chat {
             session,
             plugin: Arc::from(PLUGIN),
-            ui: watched.then_some(ui_tx),
             registry: BackgroundTasks::default(),
             id: PARENT_ID.into(),
         };
@@ -2902,53 +3031,31 @@ mod tests {
         ));
     }
 
-    /// What reached the tab of this chat, each event checked to name the
-    /// owning plugin and the subagent.
-    fn chat_events(ui_rx: &flume::Receiver<UiAction>, session: MakiId) -> Vec<AgentEvent> {
-        ui_rx
-            .drain()
-            .map(|action| match action {
-                UiAction::PluginTaskEvent {
-                    session: owner,
-                    plugin,
-                    envelope,
-                } if owner == session && &*plugin == PLUGIN => envelope,
-                _ => panic!("relay must only send task events for this chat session"),
-            })
-            .map(|envelope| {
-                assert!(
-                    envelope
-                        .subagent
-                        .as_ref()
-                        .is_some_and(|info| info.parent_tool_use_id == PARENT_ID)
-                );
-                envelope.event
-            })
-            .collect()
-    }
-
     /// A chat tab hears everything a task needs to show itself: the turns,
     /// the error, the run's `Done` (its task goes idle on it) and, once the
     /// guard drops, `StreamClosed` (its task is done). Every event names the
     /// owning plugin and chat session.
     #[tokio::test]
     async fn relay_to_chat_forwards_run_ends_and_closes_the_task() {
-        let session = MakiId::generate();
         let (done_tx, done_rx) = flume::unbounded();
-        let (ui_tx, ui_rx) = flume::unbounded();
+        let (upstream, tab_rx, _mailbox) = chat_upstream();
 
-        relay_session_events(
-            relayed_run(),
-            chat_upstream(session, ui_tx),
-            subagent_info(),
-            done_tx,
-            None,
-        )
-        .await;
+        relay_session_events(relayed_run(), upstream, subagent_info(), done_tx, None).await;
 
         assert_eq!(done_rx.try_recv(), Ok(()));
+        let forwarded = tab_rx.drain().map(task_envelope).collect::<Vec<_>>();
+        assert!(forwarded.iter().all(|envelope| {
+            envelope
+                .subagent
+                .as_ref()
+                .is_some_and(|info| info.parent_tool_use_id == PARENT_ID)
+        }));
+        let events = forwarded
+            .into_iter()
+            .map(|envelope| envelope.event)
+            .collect::<Vec<_>>();
         assert_eq!(
-            event_names(&chat_events(&ui_rx, session)),
+            event_names(&events),
             [
                 "turn_complete",
                 "turn_complete",
@@ -3026,11 +3133,11 @@ mod tests {
         registry.register(call_entry(chat, PARENT_ID)).unwrap();
         let (parent_tx, parent_rx) = flume::unbounded();
         let (ui_tx, ui_rx) = flume::unbounded();
+        _mailbox.publish_events(EventSender::new(ui_tx, RUN_ID));
         let upstream = Upstream::Parent {
             tx: EventSender::new(parent_tx, RUN_ID),
             adoption: Some(Adoption {
                 call: Arc::clone(&call),
-                ui: Some(ui_tx),
                 registry: registry.clone(),
                 id: PARENT_ID.into(),
                 plugin: Arc::from(PLUGIN),
@@ -3094,24 +3201,14 @@ mod tests {
         drop(settle);
         drop(guard);
         let (done_tx, done_rx) = flume::unbounded();
-        let (ui_tx, ui_rx) = flume::unbounded();
+        let (upstream, tab_rx, _mailbox) = chat_upstream();
 
-        relay_session_events(
-            sub_events,
-            chat_upstream(MakiId::generate(), ui_tx),
-            subagent_info(),
-            done_tx,
-            None,
-        )
-        .await;
+        relay_session_events(sub_events, upstream, subagent_info(), done_tx, None).await;
 
         assert!(done_rx.is_empty());
-        let events = ui_rx
+        let events = tab_rx
             .drain()
-            .map(|action| match action {
-                UiAction::PluginTaskEvent { envelope, .. } => envelope.event,
-                _ => panic!("relay must only send task events"),
-            })
+            .map(|envelope| task_envelope(envelope).event)
             .collect::<Vec<_>>();
         assert!(
             matches!(
@@ -3194,17 +3291,12 @@ mod tests {
     }
 
     /// The runtime's move commit, minus the call's own entry.
-    fn move_call(
-        lua: &Lua,
-        call: &CallScope,
-        chat: MakiId,
-        ui: Option<&Sender<UiAction>>,
-    ) -> CancelTrigger {
+    fn move_call(lua: &Lua, call: &CallScope, chat: MakiId) -> CancelTrigger {
         let home = home(chat, CALL_ID);
         let trigger = call.move_to(home.clone()).unwrap();
         let registry = BackgroundTasks::of(lua);
         for stub in call.take_sessions() {
-            adopt_session(&registry, ui, &home, stub);
+            adopt_session(&registry, &home, stub);
         }
         trigger
     }
@@ -3243,10 +3335,10 @@ mod tests {
         match opened {
             Opened::BeforeTheMove => {
                 let sess = native_session(lua, ctx).await;
-                (sess, move_call(lua, call, chat, None))
+                (sess, move_call(lua, call, chat))
             }
             Opened::AfterTheMove => {
-                let trigger = move_call(lua, call, chat, None);
+                let trigger = move_call(lua, call, chat);
                 (native_session(lua, ctx).await, trigger)
             }
         }
@@ -3383,17 +3475,16 @@ mod tests {
             session_state(&sess, |state| state.subagent_info.set(info).unwrap());
         }
         let (ui_tx, ui_rx) = flume::unbounded();
+        _mailbox.publish_events(EventSender::new(ui_tx, RUN_ID));
 
-        let _call_trigger = move_call(&lua, &call, chat, Some(&ui_tx));
+        let _call_trigger = move_call(&lua, &call, chat);
 
         let opened = ui_rx
             .drain()
-            .filter_map(|action| match action {
-                UiAction::PluginTaskOpened {
-                    session,
-                    plugin,
-                    info,
-                } => Some((session, plugin.to_string(), info.parent_tool_use_id)),
+            .filter_map(|event| match event.event {
+                AgentEvent::PluginTask { plugin, envelope } => envelope
+                    .subagent
+                    .map(|info| (chat, plugin.to_string(), info.parent_tool_use_id)),
                 _ => None,
             })
             .collect::<Vec<_>>();

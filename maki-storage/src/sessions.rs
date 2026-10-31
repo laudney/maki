@@ -1932,12 +1932,6 @@ where
         &self.messages
     }
 
-    /// The transcript itself rather than a copy, for a reader that keeps it
-    /// past the borrow.
-    pub fn shared_messages(&self) -> &Arc<Vec<M>> {
-        &self.messages
-    }
-
     pub fn take_messages(self) -> Vec<M> {
         Arc::unwrap_or_clone(self.messages)
     }

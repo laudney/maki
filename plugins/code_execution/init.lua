@@ -3,13 +3,11 @@
 -- dispatch live in Rust, which exposes primitives only (`maki.api.get_tools`,
 -- `maki.agent.call_tool`); orchestration policy is here.
 
-local ToolView = require("maki.tool_view")
 local output_limits = require("maki.output_limits")
 local partial = require("maki.partial")
 
 local DEFAULT_MAX_OUTPUT_LINES = 2000
 local DEFAULT_MAX_OUTPUT_BYTES = 50 * 1024
-local MAX_SCRIPT_LINES = 2000
 local OPEN_READ_CHECK_LINES = 1
 local READ_INPUT_SLOTS = { "tool.read.input", "tool.*.input" }
 local LIST_INPUT_SLOTS = { "tool.list.input", "tool.*.input" }
@@ -75,55 +73,6 @@ local opts = maki.api.register_options(output_limits.extend({
   },
   max_memory_mb = { default = 50, min = 10, desc = "Memory limit for the Python sandbox (MB)." },
 }))
-
-local function new_view(ctx, buf)
-  return ToolView.new(buf, { max_lines = ctx:tool_output_lines().code_execution or 30 })
-end
-
--- One body builder for every path (start preview, handler, restore), so the
--- script renders the same no matter which lifecycle callbacks ran. The
--- header is always rebuilt from scratch; nothing mutates existing lines.
-local function build_body(ctx, code)
-  local lines = maki.split(code:gsub("\n+$", ""), "\n")
-  local hl
-  local buf = maki.ui.buf()
-  local view = new_view(ctx, buf)
-
-  local function header()
-    local total = #lines
-    local shown = view.expanded and total or math.min(total, MAX_SCRIPT_LINES)
-    local fmt = ToolView.line_nr_fmt(shown) .. " "
-    local out = {}
-    for i = 1, shown do
-      local spans = { { string.format(fmt, i), "line_nr" } }
-      for _, seg in ipairs(hl and hl[i] or { { lines[i] } }) do
-        spans[#spans + 1] = seg
-      end
-      out[#out + 1] = spans
-    end
-    if shown < total then
-      out[#out + 1] = { { "... (" .. (total - shown) .. " lines) (click to expand)", "dim" } }
-    end
-    return out
-  end
-
-  view:set_header(header())
-  -- Flip the flag directly: `toggle` would flush the old header first, and
-  -- each flush walks every line of a script this long.
-  buf:on("click", function()
-    view.expanded = not view.expanded
-    view:set_header(header())
-  end)
-
-  local function highlight()
-    local highlighted = maki.ui.highlight(table.concat(lines, "\n"), "py")
-    if highlighted then
-      hl = highlighted
-      view:set_header(header())
-    end
-  end
-  return buf, view, highlight
-end
 
 local description = [[Execute a Python subset (Monty) in a sandbox where every tool is an async function.
 
@@ -265,15 +214,6 @@ local function describe(dctx)
   return table.concat(parts)
 end
 
--- Publishes the script before the permission prompt paints. Highlight is
--- awaited inline: an async task from here could outlive ToolDone on fast
--- auto-allowed runs and bake a stale script-only snapshot.
-local function start(input, ctx)
-  local buf, _, highlight = build_body(ctx, input.code)
-  ctx:live_buf(buf)
-  highlight()
-end
-
 local function hooked(slot_names)
   local slots = maki.api.get_slots()
   for _, name in ipairs(slot_names) do
@@ -342,30 +282,23 @@ local function handler(input, ctx)
   local started_at = os.time()
   local timeout = input.timeout or opts.timeout_secs
 
-  local buf, view, highlight = build_body(ctx, input.code)
-  ctx:live_buf(buf)
-  maki.async.run(highlight)
-
-  view:append({ { "Waiting for output...", "dim" } })
-
   local max_lines, max_bytes = output_limits.resolve(opts, ctx)
-
-  local waiting = true
+  local state = { text = "" }
+  local display = output_limits.live_collector(ctx, state)
+  ctx:set_state(state)
   local collected = output_limits.collector(max_lines, max_bytes)
   local function show(line)
-    if waiting then
-      waiting = false
-      view:clear()
-    end
     collected:append(line)
-    view:append(line)
+    display(line)
   end
 
   -- Memoized, because a cancel reaches us twice: once through the hook and
-  -- again as the interpreter's error, and the view is painted only once.
+  -- again as the interpreter's error.
   local cut_reply
   local function cut(reason)
-    cut_reply = cut_reply or partial.cut(view, collected:result(), reason, timeout, started_at)
+    local output = collected:result()
+    cut_reply = cut_reply or partial.reply(output, partial.marker(output, reason, timeout, started_at))
+    cut_reply.state = state
     return cut_reply
   end
 
@@ -417,55 +350,28 @@ local function handler(input, ctx)
     if err:find(TIME_LIMIT_SUBSTR, 1, true) then
       return cut("timeout")
     end
-    if waiting then
-      view:clear()
-    end
-    view:append_text(err)
-    view:finish()
     -- The run is already paid for, so point a script that reached for
     -- `asyncio.gather` at the wrapper that would have kept its other results.
     local hint = input.code:find(ASYNCIO_GATHER, 1, true) and GATHER_HINT or ""
-    return { llm_output = output_limits.cut_middle(err .. hint, max_lines, max_bytes), is_error = true, body = buf }
+    return { llm_output = output_limits.cut_middle(err .. hint, max_lines, max_bytes), is_error = true, state = state }
   end
 
   if result.output then
     show("return: " .. result.output)
   end
 
-  -- Every line already went through `show`, so the collector holds the
-  -- reply and a finished run keeps its tail just like a cut one. Full mode
-  -- promises the whole output, so a cut there is an error.
+  -- Every line already streamed through `show`, so the collector holds the
+  -- reply: a finished run is cut like a partial one, keeping its tail, and
+  -- nothing walks the whole output again. Full mode promises all of it, so
+  -- a cut there is an error.
   local over_full_limit = not max_bytes and collected:truncated()
   local llm_output = collected:result()
   if llm_output == "" then
     llm_output = NO_OUTPUT
-    view:clear()
-    view:append({ { "No output", "dim" } })
   elseif over_full_limit then
     llm_output = llm_output .. "\n" .. output_limits.FULL_LIMIT_NOTE
   end
-  view:finish()
-
-  return { llm_output = llm_output, is_error = over_full_limit, body = buf }
-end
-
-local function header(input)
-  local lines = select(2, input.code:gsub("\n", "\n")) + 1
-  return lines .. " lines"
-end
-
-local function restore(input, output, is_error, ctx)
-  local buf, view, highlight = build_body(ctx, input.code)
-  if is_error then
-    view:append(output)
-  elseif output == NO_OUTPUT then
-    view:append({ { "No output", "dim" } })
-  else
-    view:append_text(output)
-  end
-  view:finish()
-  highlight()
-  return buf
+  return { llm_output = llm_output, is_error = over_full_limit, state = state }
 end
 
 maki.api.register_tool({
@@ -477,10 +383,10 @@ maki.api.register_tool({
   kind = "execute",
   audiences = { "main", "research_sub", "general_sub" },
   start_annotation = { field = "timeout", kind = "timeout" },
-  start = start,
   handler = handler,
-  header = header,
-  restore = restore,
+  summary = function(input)
+    return (select(2, input.code:gsub("\n", "\n")) + 1) .. " lines"
+  end,
 })
 
 maki.api.register_prompt_hint({

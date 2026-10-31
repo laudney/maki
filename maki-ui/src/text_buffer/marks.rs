@@ -14,8 +14,8 @@
 use std::cmp::Reverse;
 use std::ops::{Range, RangeInclusive};
 
-use maki_lua::chunks::{Chunks, PIECE_LEN, Spot, shifted};
-pub use maki_lua::{Decoration, Mark, Reveal, VirtTextPos};
+use maki_lua_core::chunks::{Chunks, PIECE_LEN, Spot, shifted};
+pub use maki_lua_ui::{Decoration, Mark, Reveal, VirtTextPos};
 
 use super::Change;
 

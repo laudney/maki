@@ -2,8 +2,14 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use maki_agent::tools::ToolRegistry;
 use maki_lua::PluginHost;
+use maki_lua::docs::ModuleDoc;
 
 static WINDOW: Mutex<()> = Mutex::new(());
+
+/// The docs of the combined composition: the agent's domains and the UI's.
+pub fn api_docs() -> Vec<&'static ModuleDoc> {
+    maki_lua::api_docs(maki_lua_ui::DOCS)
+}
 
 fn window() -> MutexGuard<'static, ()> {
     WINDOW.lock().unwrap_or_else(|e| e.into_inner())

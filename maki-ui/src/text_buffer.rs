@@ -13,7 +13,8 @@ use std::ops::{Range, RangeInclusive};
 use std::sync::Arc;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use maki_lua::{InputMarks, PluginReach, SyntaxInput, TextEdit};
+use maki_lua_core::plugin_permissions::PluginReach;
+use maki_lua_ui::{InputMarks, SyntaxInput, TextEdit};
 
 use crate::components::input::sent_text;
 use crate::highlight::TAB_SPACES;
@@ -1753,7 +1754,8 @@ mod tests {
     };
     use super::{Decoration, Mark, Reveal, RuleSet};
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
-    use maki_lua::{InputRule, PatternRule, PluginPermissions, PluginReach};
+    use maki_lua_core::plugin_permissions::{PluginPermissions, PluginReach};
+    use maki_lua_ui::{InputRule, PatternRule};
     use std::ops::Range;
     use std::sync::Arc;
     use test_case::test_case;

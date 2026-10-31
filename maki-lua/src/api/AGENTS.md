@@ -10,7 +10,7 @@ Our goal is to let plugin authors have as much freedom as possible, that's why d
 
 Long-lived work is a `maki.async.spawn` task, and a repeating timer is a `maki.async.sleep` loop inside one.
 
-Read optional keys with `TableExt::opt` / `opt_bool` (`util/convert.rs`), never `get::<Option<T>>` or `get::<bool>`, so the `maki.NIL` that `maki.json.decode` gives for null counts as absent.
+Read optional keys with `TableExt::opt` / `opt_bool` (`maki-lua-core/src/api/util/convert.rs`), never `get::<Option<T>>` or `get::<bool>`, so the `maki.NIL` that `maki.json.decode` gives for null counts as absent.
 
 ## Lua thread
 
@@ -21,7 +21,7 @@ Long loops must yield with `maki.async.sleep(0)`. Heavy work belongs in a `maki.
 
 Fallible runtime operations return the pair (value, err) and never throw.
 Throwing is reserved for programmer errors, like passing a number where a string belongs.
-`util/pair.rs` is the single home for that shape: use `Pair<T>`, `err_pair`, `pair`, and `try_pair!` instead of writing a new helper.
+`maki-lua-core/src/api/util/pair.rs` is the single home for that shape: use `Pair<T>`, `err_pair`, `pair`, and `try_pair!` instead of writing a new helper.
 A call with nothing to return still answers `(true, nil)` on success, so `if not ok` always means failure.
 
 Tool handlers fail with `{ llm_output = msg, is_error = true }`; a plain string is always success (only `is_error` flags the result as an error to the provider).

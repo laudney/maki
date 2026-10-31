@@ -10,27 +10,24 @@ mod file_access;
 pub mod grep;
 pub mod hook;
 pub mod interpreter_bridge;
+mod progress;
 pub mod registry;
 pub mod schema;
 
 pub use deadline::Deadline;
 pub use file_access::{FileAccess, FileKey};
 pub use hook::{Authority, HookCall, HookStage, ToolHook, Verdict};
+pub use maki_types::tool::{compact_duration, is_timeout_annotation, timeout_annotation};
+pub use progress::{Closed, PendingProgress, ProgressScope, ProgressWatch};
 pub use registry::{
-    BoxFuture, ExecFuture, HeaderFuture, HeaderResult, MovedCall, MovedLand, ParseError,
-    PermissionScopes, RegisteredTool, RegistryError, Tool, ToolAudience, ToolExecResult,
-    ToolInvocation, ToolReach, ToolRegistry, ToolSource,
+    BoxFuture, ExecFuture, MovedCall, MovedLand, ParseError, PermissionScopes, RegisteredTool,
+    RegistryError, Tool, ToolAudience, ToolExecResult, ToolInvocation, ToolReach, ToolRegistry,
 };
 
 use std::collections::HashMap;
-use std::env;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
-use std::time::{Duration, SystemTime};
 
-use ignore::WalkBuilder;
-use jiff::fmt::friendly::{Designator, Spacing, SpanPrinter};
 use maki_config::ProjectConfig;
 use serde_json::Value;
 use tokio::sync::Mutex;
@@ -42,7 +39,7 @@ use crate::live_session::SessionMailbox;
 use crate::mcp::McpSession;
 use crate::permissions::PermissionManager;
 use crate::prompt::ResolvedPrompts;
-use crate::{AgentConfig, AgentMode, EventSender, RunLedger, SharedBuf};
+use crate::{AgentConfig, AgentMode, EventSender, RunLedger};
 use maki_config::{ModelPolicy, ToolOutputLines};
 use maki_providers::Model;
 use maki_providers::RequestOptions;
@@ -50,13 +47,8 @@ use maki_providers::provider::Provider;
 use maki_storage::id::{MakiId, SessionRef};
 
 pub(crate) const TOOL_NAME_FIELD: &str = "name";
-const COMPACT_DURATION: SpanPrinter = SpanPrinter::new()
-    .designator(Designator::Compact)
-    .spacing(Spacing::None);
-const COMPACT_DURATION_UNITS: [char; 3] = ['h', 'm', 's'];
-const TIMEOUT_SUFFIX: &str = " timeout";
 /// What `maki.task` calls the session's own chat.
-pub const MAIN_TASK_ID: &str = "main";
+pub use maki_types::tool::MAIN_TASK_ID;
 
 /// Who made a tool call. A resumed session rebuilds its state from the `ToolUse`
 /// blocks in history, and those hold the model's own calls only, so a nested
@@ -296,39 +288,13 @@ pub fn is_tool_enabled(disabled_tools: &[String], name: &str) -> bool {
     !disabled_tools.iter().any(|s| s == name)
 }
 
-pub const BASH_TOOL_NAME: &str = "bash";
-pub const CODE_EXECUTION_TOOL_NAME: &str = "code_execution";
-pub const EDIT_TOOL_NAME: &str = "edit";
-pub const GLOB_TOOL_NAME: &str = "glob";
-pub const GREP_TOOL_NAME: &str = "grep";
-pub const MULTIEDIT_TOOL_NAME: &str = "multiedit";
-pub const QUESTION_TOOL_NAME: &str = "question";
-pub const READ_TOOL_NAME: &str = "read";
-pub const TASK_TOOL_NAME: &str = "task";
-pub const TODOWRITE_TOOL_NAME: &str = "todo_write";
-pub const VIEW_IMAGE_TOOL_NAME: &str = "view_image";
-pub const WRITE_TOOL_NAME: &str = "write";
+pub use maki_types::tool::{
+    BASH_TOOL_NAME, CODE_EXECUTION_TOOL_NAME, EDIT_TOOL_NAME, GLOB_TOOL_NAME, GREP_TOOL_NAME,
+    MULTIEDIT_TOOL_NAME, QUESTION_TOOL_NAME, READ_TOOL_NAME, TASK_TOOL_NAME, TODOWRITE_TOOL_NAME,
+    VIEW_IMAGE_TOOL_NAME, WRITE_TOOL_NAME,
+};
 
 pub(crate) const PLAN_WRITE_RESTRICTED: &str = "write restricted to plan file in plan mode";
-/// Whole seconds as `1h1m1s`. Hours are the largest unit, so a day reads `24h`.
-pub fn compact_duration(secs: u64) -> String {
-    COMPACT_DURATION.unsigned_duration_to_string(&Duration::from_secs(secs))
-}
-
-pub fn timeout_annotation(secs: u64) -> String {
-    format!("{}{TIMEOUT_SUFFIX}", compact_duration(secs))
-}
-
-/// Whether {note} is what [`timeout_annotation`] writes.
-pub fn is_timeout_annotation(note: &str) -> bool {
-    note.strip_suffix(TIMEOUT_SUFFIX).is_some_and(|span| {
-        !span.is_empty()
-            && span
-                .chars()
-                .all(|c| c.is_ascii_digit() || COMPACT_DURATION_UNITS.contains(&c))
-    })
-}
-
 pub type LocalToolResult = BoxFuture<'static, Result<String, String>>;
 pub type LocalToolFn = Arc<dyn Fn(Value, ToolContext) -> LocalToolResult + Send + Sync>;
 pub type LocalTools = Arc<HashMap<String, LocalTool>>;
@@ -400,6 +366,10 @@ pub struct ToolContext {
     pub tool_output_lines: ToolOutputLines,
     pub output_mode: ToolOutputMode,
     pub permissions: Arc<PermissionManager>,
+    /// The session's working directory as this call runs, which an ACP
+    /// session may set apart from the agent process's and a TUI `/cd`
+    /// moves. The permission rules keep the root they were built for.
+    pub working_dir: Arc<Path>,
     pub timeouts: maki_providers::Timeouts,
     pub file_access: Arc<FileAccess>,
     pub prompt_slots: Arc<ResolvedPrompts>,
@@ -416,12 +386,23 @@ pub struct ToolContext {
     /// caller (`maki.agent.call_tool`). Never inherited: `to_tool_context`
     /// clears it, and each caller sets it for its own call only.
     pub live_sink: Option<flume::Sender<ToolLive>>,
+    /// Where the handler streams `ToolProgress` and where its nested calls
+    /// are recorded: a root scope per model call, drained by dispatch while
+    /// the call runs, and a child scope per `maki.agent.call_tool` under it.
+    /// `None` outside a model call, where nothing is recorded.
+    pub progress: Option<ProgressScope>,
     pub model_policy: Arc<ModelPolicy>,
+}
+
+impl ToolContext {
+    pub fn resolve_path(&self, path: &Path) -> PathBuf {
+        self.working_dir
+            .join(maki_storage::paths::expand_tilde(path))
+    }
 }
 
 /// Live progress of a dispatched child tool, streamed while it runs.
 pub enum ToolLive {
-    Buf(Arc<SharedBuf>),
     Annotation(String),
     Usage(String),
     /// The plugin that answered the child's permission prompt.
@@ -454,109 +435,9 @@ impl BackgroundFor {
     }
 }
 
-pub(crate) fn resolve_path(path: &str) -> Result<String, String> {
-    let expanded = if let Some(rest) = path.strip_prefix("~/") {
-        let home = HOME.as_deref().ok_or("cannot expand ~: HOME not set")?;
-        home.join(rest).to_string_lossy().into_owned()
-    } else if path == "~" {
-        let home = HOME.as_deref().ok_or("cannot expand ~: HOME not set")?;
-        home.to_string_lossy().into_owned()
-    } else {
-        path.to_string()
-    };
-
-    if Path::new(&expanded).is_relative() {
-        let cwd = env::current_dir().map_err(|e| format!("cwd error: {e}"))?;
-        Ok(cwd.join(&expanded).to_string_lossy().into_owned())
-    } else {
-        Ok(expanded)
-    }
-}
-
-pub fn resolve_search_path(path: Option<&str>) -> Result<String, String> {
-    match path {
-        Some(p) => resolve_path(p),
-        None => env::current_dir()
-            .map(|p| p.to_string_lossy().into_owned())
-            .map_err(|e| format!("cwd error: {e}")),
-    }
-}
-
-static CWD: LazyLock<Option<PathBuf>> = LazyLock::new(|| env::current_dir().ok());
-static HOME: LazyLock<Option<PathBuf>> = LazyLock::new(maki_storage::paths::home);
-
-pub(crate) fn relative_path(path: &str) -> String {
-    let p = Path::new(path);
-    if let Some(cwd) = CWD.as_deref()
-        && let Ok(rel) = p.strip_prefix(cwd)
-    {
-        return format_rel("", ".", rel);
-    }
-    if let Some(home) = HOME.as_deref()
-        && let Ok(rel) = p.strip_prefix(home)
-    {
-        return format_rel("~/", "~", rel);
-    }
-    path.to_string()
-}
-
-fn format_rel(prefix: &str, fallback: &str, rel: &Path) -> String {
-    let s = rel.to_string_lossy();
-    if s.is_empty() {
-        fallback.into()
-    } else {
-        format!("{prefix}{s}")
-    }
-}
-
-/// Convenience wrapper that always respects gitignore.
-pub fn walk_builder(root: &str, patterns: &[&str]) -> Result<WalkBuilder, String> {
-    walk_builder_opts(root, patterns, true)
-}
-
-/// `.git` is always excluded, even when `gitignore` is false.
-pub fn walk_builder_opts(
-    root: &str,
-    patterns: &[&str],
-    gitignore: bool,
-) -> Result<WalkBuilder, String> {
-    let mut ob = ignore::overrides::OverrideBuilder::new(root);
-    ob.add("!.git").expect("!.git is a valid glob");
-
-    for p in patterns {
-        ob.add(p)
-            .map_err(|e| format!("invalid glob pattern: {e}"))?;
-    }
-
-    let overrides = ob
-        .build()
-        .map_err(|e| format!("invalid glob pattern: {e}"))?;
-
-    let mut wb = WalkBuilder::new(root);
-    wb.hidden(false).overrides(overrides);
-    if !gitignore {
-        wb.ignore(false)
-            .git_ignore(false)
-            .git_global(false)
-            .git_exclude(false);
-    }
-    Ok(wb)
-}
-
-pub fn mtime(path: &Path) -> SystemTime {
-    fs::metadata(path)
-        .and_then(|m| m.modified())
-        .unwrap_or(SystemTime::UNIX_EPOCH)
-}
-
-pub(crate) fn truncate_bytes(line: &str, max_bytes: usize) -> String {
-    if line.len() > max_bytes {
-        let boundary = line.floor_char_boundary(max_bytes);
-        format!("{}...", &line[..boundary])
-    } else {
-        line.to_owned()
-    }
-}
+pub use maki_storage::search::{
+    mtime, resolve_path, resolve_search_path, truncate_bytes, walk_builder, walk_builder_opts,
+};
 
 pub fn truncate_output(text: String, max_lines: usize, max_bytes: usize) -> String {
     const TRUNCATED_MARKER: &str = "[truncated]";
@@ -664,6 +545,7 @@ pub fn interpreter_ctx(
         tool_filter: Arc::default(),
         tool_output_lines: ToolOutputLines::default(),
         output_mode: ToolOutputMode::Full,
+        working_dir: Arc::from(permissions.working_dir()),
         permissions,
         timeouts: maki_providers::Timeouts::default(),
         file_access,
@@ -676,6 +558,7 @@ pub fn interpreter_ctx(
         audience: ToolAudience::MAIN,
         local_tools: LocalTools::default(),
         live_sink: None,
+        progress: None,
         model_policy: Arc::new(ModelPolicy::default()),
     }
 }
@@ -708,6 +591,12 @@ pub fn cli_tool_ctx() -> ToolContext {
 
 pub mod test_support {
     use std::borrow::Cow;
+    #[cfg(test)]
+    use std::fs;
+    #[cfg(test)]
+    use std::time::Duration;
+    #[cfg(test)]
+    use std::time::SystemTime;
 
     use arc_swap::ArcSwap;
     use maki_providers::Timeouts;
@@ -751,9 +640,6 @@ pub mod test_support {
     struct MockInvocation;
 
     impl registry::ToolInvocation for MockInvocation {
-        fn start_header(&self) -> registry::HeaderFuture {
-            registry::HeaderFuture::Ready(registry::HeaderResult::plain("mock".into()))
-        }
         fn execute<'a>(self: Box<Self>, _ctx: &'a ToolContext) -> registry::ExecFuture<'a> {
             Box::pin(async { Ok(ToolOutput::Plain(String::new().into())).into() })
         }
@@ -785,10 +671,10 @@ pub mod test_support {
     struct GuardedInvocation;
 
     impl registry::ToolInvocation for GuardedInvocation {
-        fn start_header(&self) -> registry::HeaderFuture {
-            registry::HeaderFuture::Ready(registry::HeaderResult::plain("mock".into()))
-        }
-        fn permission_scopes(&self) -> registry::BoxFuture<'_, Option<registry::PermissionScopes>> {
+        fn permission_scopes(
+            &self,
+            _ctx: &ToolContext,
+        ) -> registry::BoxFuture<'_, Option<registry::PermissionScopes>> {
             Box::pin(std::future::ready(Some(
                 registry::PermissionScopes::single("guarded".into()),
             )))
@@ -874,6 +760,7 @@ pub mod test_support {
             AgentConfig::default(),
             ToolOutputLines::default(),
             ctx.permissions,
+            ctx.working_dir,
             None,
             Timeouts::default(),
             Arc::default(),
@@ -917,7 +804,11 @@ pub mod test_support {
 
 #[cfg(test)]
 mod tests {
+    use ignore::WalkBuilder;
+    use std::env;
     use std::fs::{self, File};
+    use std::time::Duration;
+    use std::time::SystemTime;
 
     use tempfile::TempDir;
     use test_case::test_case;
@@ -971,13 +862,6 @@ mod tests {
     #[test_case("24 lines"        ; "another_note")]
     fn is_timeout_annotation_rejects(note: &str) {
         assert!(!is_timeout_annotation(note));
-    }
-
-    #[test_case(0,     "0s"     ; "zero")]
-    #[test_case(3661,  "1h1m1s" ; "all_units")]
-    #[test_case(90000, "25h"    ; "days_stay_in_hours")]
-    fn compact_duration_cases(secs: u64, expected: &str) {
-        assert_eq!(compact_duration(secs), expected);
     }
 
     #[test_case("short",                            "short"                             ; "short_passthrough")]
@@ -1194,28 +1078,6 @@ mod tests {
         assert!(rs_only.contains(&"lib.rs".into()));
         assert!(!rs_only.contains(&"main.py".into()), "glob must filter");
         assert!(!rs_only.iter().any(|p| p.starts_with(".git")));
-    }
-
-    #[test]
-    fn relative_path_cases() {
-        let cwd = env::current_dir().unwrap();
-        let home = maki_storage::paths::home().unwrap();
-
-        let cases: &[(&str, &str)] = &[
-            (&format!("{}/src/main.rs", cwd.display()), "src/main.rs"),
-            (&cwd.to_string_lossy(), "."),
-            (
-                &format!("{}/.config/something.toml", home.display()),
-                "~/.config/something.toml",
-            ),
-            ("/etc/hosts", "/etc/hosts"),
-        ];
-        for (input, expected) in cases {
-            assert_eq!(relative_path(input), *expected, "input: {input}");
-        }
-
-        let no_partial = format!("{}sibling/file.txt", home.display());
-        assert_eq!(relative_path(&no_partial), no_partial);
     }
 
     #[test]

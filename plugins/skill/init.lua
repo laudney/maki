@@ -2,13 +2,11 @@ local SKILL_FILE = "SKILL.md"
 local NOT_FOUND = "skill not found: "
 local REFERENCE_FILE = "lua-api.md"
 local REFERENCE_UNAVAILABLE = "(unavailable; full reference inlined below)"
-local shorten_path = require("maki.shorten_path")
-local ToolView = require("maki.tool_view")
+local output_limits = require("maki.output_limits")
 local helpers = require("skill_helpers")
 local parse_frontmatter = helpers.parse_frontmatter
 local build_skill_list = helpers.build_skill_list
 local format_output = helpers.format_output
-local parse_output = helpers.parse_output
 
 local PROJECT_SKILL_DIRS = {
   ".maki/skills",
@@ -47,8 +45,7 @@ local function scan_skill_dir(dir, skills)
   end
 end
 
-local function find_project_ancestors()
-  local cwd = maki.uv.cwd()
+local function find_project_ancestors(cwd)
   if not cwd then
     return {}
   end
@@ -97,7 +94,8 @@ local function resolve_builtin_content()
   return content .. "\n---\n\n" .. reference.content
 end
 
-local function discover_skills()
+-- Project skills come from {cwd} and its parents up to the repository root.
+local function discover_skills(cwd)
   local skills = {}
 
   if builtin and opts.plugin_dev then
@@ -122,7 +120,7 @@ local function discover_skills()
     end
   end
 
-  for _, ancestor in ipairs(find_project_ancestors()) do
+  for _, ancestor in ipairs(find_project_ancestors(cwd)) do
     for _, rel in ipairs(PROJECT_SKILL_DIRS) do
       scan_skill_dir(maki.fs.joinpath(ancestor, rel), skills)
     end
@@ -131,33 +129,7 @@ local function discover_skills()
   return skills
 end
 
-local function view_opts(ctx)
-  local tol = ctx:tool_output_lines()
-  return { max_lines = (tol and tol.other) or 20, keep = "head" }
-end
-
--- Live call and restore both draw from the llm text, so the two views
--- cannot drift. Nil when the text is not a skill listing.
-local function skill_view(output, ctx)
-  local location, content = parse_output(output)
-  if not location then
-    return nil
-  end
-
-  local buf = maki.ui.buf()
-  local view = ToolView.new(buf, view_opts(ctx))
-  buf:on("click", function()
-    view:toggle()
-  end)
-  view:set_highlight(content, location:match("%.([^%.]+)$") or "md")
-  view:finish()
-
-  local header = maki.ui.buf()
-  header:line({ { shorten_path(location), "path" } })
-  return { body = buf, header = header }
-end
-
-local boot_skills = discover_skills()
+local boot_skills = discover_skills(maki.uv.cwd())
 local description = "Load a skill that provides instructions and workflows for specific tasks."
   .. build_skill_list(boot_skills)
 
@@ -173,12 +145,11 @@ maki.api.register_tool({
     },
   },
 
-  header = function(input)
-    return input.name
-  end,
+  -- The state keeps the skill's location and content, so its renderer
+  -- reads them without parsing the model's text.
 
-  restore = function(_input, output, _is_error, ctx)
-    return skill_view(output, ctx) or ToolView.restore(output, view_opts(ctx))
+  summary = function(input)
+    return input.name
   end,
 
   handler = function(input, ctx)
@@ -186,7 +157,10 @@ maki.api.register_tool({
       return { llm_output = "error: name is required", is_error = true }
     end
 
-    local skills = discover_skills()
+    -- The session's working directory, which an ACP session may set apart
+    -- from the agent process's.
+    local place = ctx:place()
+    local skills = discover_skills(place and place.cwd or maki.uv.cwd())
     local skill = skills[input.name]
     if not skill then
       local available = build_skill_list(skills)
@@ -196,9 +170,10 @@ maki.api.register_tool({
       skill.content = skill.resolve()
     end
 
-    local llm_output = format_output(skill.location, skill.content)
-    local result = skill_view(llm_output, ctx)
-    result.llm_output = llm_output
-    return result
+    local kept = #skill.location + #skill.content <= output_limits.STATE_TEXT_MAX_BYTES
+    return {
+      llm_output = format_output(skill.location, skill.content),
+      state = kept and { location = skill.location, content = skill.content } or nil,
+    }
   end,
 })

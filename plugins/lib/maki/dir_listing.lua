@@ -1,10 +1,6 @@
 -- Shared directory listing for index and list plugins, so every caller
--- shows a directory the same way. Listing also loads the directory's
--- instruction files onto the call.
-
-local ToolView = require("maki.tool_view")
-
-local DEFAULT_MAX_LINES = 10
+-- lists a directory the same way. Listing also loads the directory's
+-- instruction files onto the call. `maki.dir_listing_view` shows it.
 
 local M = {}
 
@@ -37,18 +33,6 @@ function M.list(path, ctx)
     text = table.concat(dirs, "\n"),
     count = #dirs,
   }
-end
-
-function M.view(text, ctx)
-  local tol = ctx:tool_output_lines()
-  local buf = maki.ui.buf()
-  local view = ToolView.new(buf, { max_lines = (tol and tol.read) or DEFAULT_MAX_LINES, keep = "head" })
-  view:append_text(text)
-  view:finish()
-  buf:on("click", function()
-    view:toggle()
-  end)
-  return buf
 end
 
 return M

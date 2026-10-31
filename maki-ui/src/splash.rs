@@ -2,7 +2,7 @@ use crate::components::keybindings::key;
 use crate::repaint::{Cadence, Dirty};
 use crate::theme::{self, lerp_u8};
 use crate::update;
-use maki_lua::LuaCommandInfo;
+use maki_lua_ui::LuaCommandInfo;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -587,7 +587,7 @@ mod tests {
     use super::*;
     use crate::components::buffer_text;
     use crate::repaint::expect::{OWED, QUIET};
-    use maki_lua::{PluginPermissions, PluginReach};
+    use maki_lua_core::plugin_permissions::{PluginPermissions, PluginReach};
     use std::time::Duration;
     use test_case::test_case;
 

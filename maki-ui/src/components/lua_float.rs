@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use crossterm::event::KeyEvent;
-use maki_agent::{BufWatch, SharedBuf, SnapshotLine, SpanStyle};
-use maki_lua::{Anchor, Axis, Border, FloatConfig, Key, Split, TitlePos, WinCommand, WinEvent};
+use maki_lua_ui::{Anchor, Axis, Border, FloatConfig, Key, Split, TitlePos, WinCommand, WinEvent};
+use maki_types::snapshot::{BufWatch, SharedBuf, SnapshotLine, SpanStyle};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 use ratatui::text::{Line, Span};
@@ -959,8 +959,8 @@ mod tests {
     use super::*;
     use crate::repaint::expect::{OWED, QUIET};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    use maki_agent::SnapshotSpan;
-    use maki_lua::{Dimension, FloatConfigPatch};
+    use maki_lua_ui::{Dimension, FloatConfigPatch};
+    use maki_types::snapshot::SnapshotSpan;
     use test_case::test_case;
 
     const EXPECT_OPEN: &str = "expected manager to have open windows";

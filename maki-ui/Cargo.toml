@@ -4,14 +4,16 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-maki-agent = { workspace = true }
+maki-types = { workspace = true }
+agent-client-protocol-schema = { workspace = true }
 maki-config = { workspace = true }
 maki-otel = { workspace = true }
 maki-highlight = { workspace = true }
 maki-markdown = { workspace = true }
-maki-providers = { workspace = true }
-maki-lua = { workspace = true }
+maki-lua-core = { workspace = true }
+maki-lua-ui = { workspace = true }
 maki-storage = { workspace = true }
+maki-wire = { workspace = true }
 ratatui = { workspace = true }
 ratatui-image = { workspace = true }
 crossterm = { workspace = true }
@@ -25,6 +27,7 @@ arboard = { workspace = true }
 jiff = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
+futures-lite = { workspace = true }
 flume = { workspace = true }
 serde = { workspace = true }
 toml = { workspace = true }
@@ -54,8 +57,8 @@ rustix = { workspace = true }
 windows-sys = { workspace = true }
 
 [dev-dependencies]
+maki-lua-ui = { workspace = true, features = ["test-support"] }
 maki-config = { workspace = true, features = ["test-util"] }
-maki-lua = { workspace = true, features = ["test-support"] }
 test-case = { workspace = true }
 tempfile = { workspace = true }
 criterion = { workspace = true }

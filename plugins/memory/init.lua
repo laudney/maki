@@ -1,43 +1,13 @@
-local ToolView = require("maki.tool_view")
 local helpers = require("memory_helpers")
-local ListPicker = require("maki.list_picker")
-local Toast = require("maki.toast")
 
 local WRITE_TOOLS = { "write", "edit", "multiedit", "edit_lines", "insert_lines" }
-local VIEW_PREF_FILE = "picker_view"
-
--- A toast and not a flash, because this feedback has to stay readable while
--- the picker is still covering the screen. Kept local on purpose: claiming the
--- global `maki.notify` slot here would put a "memory" toast in front of every
--- other plugin's notices too.
-local function notify(msg)
-  Toast.show(msg, { title = "memory" })
-end
-
-local function memories_path_suffix()
-  local cwd = maki.uv.cwd()
-  local root = maki.fs.root(cwd, ".git") or cwd
-  return "projects/" .. helpers.project_id(root) .. "/memories"
-end
-
-local function legacy_dir_if_exists(suffix): string?
-  local legacy = maki.env.legacy_dir()
-  if not legacy then
-    return nil
-  end
-  local dir = maki.fs.joinpath(legacy, suffix)
-  local meta = maki.fs.metadata(dir)
-  if meta and meta.is_dir then
-    return dir
-  end
-end
 
 -- Notes live outside cwd, where file-write tools normally prompt; pre-allow
 -- them here so the agent can edit notes directly. Reads may come from the
 -- legacy dir while writes go to the state dir, so cover both.
 local function register_write_rules()
-  local suffix = memories_path_suffix()
-  local dirs = { legacy_dir_if_exists(suffix) }
+  local suffix = helpers.memories_path_suffix()
+  local dirs = { helpers.legacy_dir_if_exists(suffix) }
   local state = maki.env.state_dir()
   if state then
     dirs[#dirs + 1] = maki.fs.joinpath(state, suffix)
@@ -55,26 +25,11 @@ local function register_write_rules()
 end
 register_write_rules()
 
-local function resolve_dir(check_legacy)
-  local suffix = memories_path_suffix()
-  if check_legacy then
-    local dir = legacy_dir_if_exists(suffix)
-    if dir then
-      return dir
-    end
-  end
-  local state = maki.env.state_dir()
-  if not state then
-    return nil, "cannot resolve state dir"
-  end
-  return maki.fs.joinpath(state, suffix)
-end
-
 maki.api.register_prompt_hint({
   prompt = "system",
   slot = "after_instructions",
   content = function()
-    local dir = resolve_dir(true)
+    local dir = helpers.resolve_dir(true)
     if not dir then
       return nil
     end
@@ -91,25 +46,6 @@ maki.api.register_prompt_hint({
   content = "- Proactively save non-obvious project gotchas and architecture decisions to **memory**.",
 })
 
-local function render_content(content, path, ctx)
-  local buf = maki.ui.buf()
-  local tol = ctx:tool_output_lines()
-  local view = ToolView.new(buf, {
-    max_lines = (tol and tol.other) or 20,
-    keep = "head",
-  })
-  buf:on("click", function()
-    view:toggle()
-  end)
-
-  local ext = path:match("%.([^%.]+)$") or "md"
-  if not view:set_highlight(content, ext) then
-    view:append_text(content)
-  end
-  view:finish()
-  return buf
-end
-
 local function cmd_read(path, dir, ctx)
   local file_path, err = helpers.safe_resolve(dir, path)
   if not file_path then
@@ -123,11 +59,10 @@ local function cmd_read(path, dir, ctx)
     helpers.cap_read_output(helpers.format_read_entry(path, #content, content), helpers.CAP_HINT_REWRITE, ctx)
   return {
     llm_output = formatted,
-    body = render_content(formatted, path, ctx),
   }
 end
 
-local function cmd_write(path, content, tags, dir, ctx)
+local function cmd_write(path, content, tags, dir)
   local file_path, err = helpers.safe_resolve(dir, path)
   if not file_path then
     return nil, err
@@ -154,7 +89,6 @@ local function cmd_write(path, content, tags, dir, ctx)
       .. (#normalized > 0 and table.concat(normalized, ", ") or "none")
       .. ")"
       .. (note and ("; " .. note) or ""),
-    body = render_content(content, path, ctx),
   }
 end
 
@@ -215,7 +149,7 @@ maki.api.register_tool({
     },
   },
 
-  header = function(input)
+  summary = function(input)
     local parts = { input.command or "" }
     if input.path then
       parts[#parts + 1] = input.path
@@ -225,17 +159,12 @@ maki.api.register_tool({
     return table.concat(parts, " ")
   end,
 
-  restore = function(input, output, _is_error, ctx)
-    local content = (input.command == "write" and input.content) or output
-    return render_content(content, input.path or "memory.md", ctx)
-  end,
-
   handler = function(input, ctx)
     if type(input.tags) == "string" then
       input.tags = { input.tags }
     end
     local cmd = input.command
-    local dir, dir_err = resolve_dir(cmd ~= "write" and cmd ~= "delete")
+    local dir, dir_err = helpers.resolve_dir(cmd ~= "write" and cmd ~= "delete")
     local verr = helpers.validate_input(input, dir)
     if verr then
       return { llm_output = "error: " .. verr, is_error = true }
@@ -254,7 +183,7 @@ maki.api.register_tool({
         result, err = cmd_read(input.path, dir, ctx)
       end
     elseif cmd == "write" then
-      result, err = cmd_write(input.path, input.content, input.tags, dir, ctx)
+      result, err = cmd_write(input.path, input.content, input.tags, dir)
     elseif cmd == "delete" then
       result, err = cmd_delete(input.path, dir)
     end
@@ -265,146 +194,5 @@ maki.api.register_tool({
       return with_dir(result, dir)
     end
     return result
-  end,
-})
-
-local function flat_rows(files)
-  local items = {}
-  for i, f in ipairs(files) do
-    items[i] = { label = f.name, detail = helpers.detail_parts(f.size, f.tags) }
-  end
-  return items
-end
-
--- No tags on the row: the section header names the tag, and the tint shows
--- which other sections hold the same file.
-local function grouped_rows(files)
-  local items = {}
-  for _, g in ipairs(helpers.group_by_tag(files)) do
-    for _, f in ipairs(g.files) do
-      items[#items + 1] = {
-        label = f.name,
-        detail = helpers.format_size(f.size),
-        section = g.tag,
-        section_detail = "(" .. #g.files .. ")",
-      }
-    end
-  end
-  return items
-end
-
-local VIEWS = {
-  { id = "flat", rows = flat_rows },
-  { id = "grouped", rows = grouped_rows },
-}
-
--- Remembered across runs, so /memory opens the way you left it. A preference
--- and not project data, so it lives with maki's other state and not in the
--- memories directory.
-local function view_pref_path()
-  local state = maki.env.state_dir()
-  return state and maki.fs.joinpath(state, "memory", VIEW_PREF_FILE)
-end
-
-local function load_view()
-  local path = view_pref_path()
-  local saved = path and maki.fs.read(path)
-  for i, v in ipairs(VIEWS) do
-    if v.id == saved then
-      return i
-    end
-  end
-  return 1
-end
-
-local function save_view(view)
-  local path = view_pref_path()
-  if not path then
-    return
-  end
-  local _, err = maki.fs.mkdir(maki.fs.dirname(path), { parents = true })
-  if not err then
-    _, err = maki.fs.write(path, VIEWS[view].id)
-  end
-  if err then
-    maki.log.warn("memory: cannot save the picker view to " .. path .. ": " .. tostring(err))
-  end
-end
-
-maki.api.register_command({
-  name = "/memory",
-  description = "View, edit, and delete memory files",
-  handler = function()
-    local dir = resolve_dir(true)
-    if not dir then
-      maki.ui.flash("Cannot resolve memory directory")
-      return
-    end
-
-    local view = load_view()
-    -- The only place rows are built, so the two views can never disagree about
-    -- what is on disk.
-    local function build()
-      local files, warnings = helpers.files_with_tags(dir)
-      if #warnings > 0 then
-        notify(#warnings .. " unreadable memory file(s)")
-      end
-      return VIEWS[view].rows(files)
-    end
-
-    local items = build()
-    if #items == 0 then
-      maki.ui.flash("No memories yet")
-      return
-    end
-    local last_cursor = 1
-    while true do
-      local event = ListPicker.open(items, {
-        title = " Memory Files ",
-        cursor = last_cursor,
-        key = function(item)
-          return item.label
-        end,
-        submit_keys = { "<C-o>" },
-        live_keys = {
-          ["<Tab>"] = function()
-            view = view % #VIEWS + 1
-            save_view(view)
-            return build()
-          end,
-        },
-        footer = {
-          { "Enter", "open" },
-          { "Ctrl+O", "edit" },
-          { "Ctrl+D", "delete" },
-          { "Tab", "switch view" },
-        },
-      })
-
-      if event.type == "close" then
-        break
-      end
-
-      last_cursor = event.index
-      if event.type == "choice" then
-        local path = maki.fs.joinpath(dir, event.item.label)
-        if maki.ui.open_editor(path) == 0 then
-          items = build()
-        end
-      elseif event.type == "delete" then
-        local ok, err = maki.fs.rm(maki.fs.joinpath(dir, event.item.label))
-        if ok then
-          notify("Deleted " .. event.item.label)
-          items = build()
-          if #items == 0 then
-            break
-          end
-        else
-          notify("Delete failed: " .. tostring(err))
-        end
-      else
-        break
-      end
-    end
   end,
 })

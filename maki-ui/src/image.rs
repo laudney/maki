@@ -1,11 +1,10 @@
-use std::fs;
-use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::{fs, io};
 
 use base64::Engine;
 use image::{ImageBuffer, RgbaImage};
-use maki_agent::{ImageMediaType, ImageSource};
+use maki_types::message::{ImageMediaType, ImageSource};
 
 pub(crate) const MAX_IMAGE_PIXELS: usize = 8_000_000;
 pub(crate) const MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024;

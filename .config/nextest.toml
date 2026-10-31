@@ -7,9 +7,9 @@ slow-timeout = { period = "60s", terminate-after = 5 }
 [profile.ci]
 test-threads = 64
 
-# 2001-line restore, ~200ms slices that 63 neighbours on 4 cores stretch past the Lua watchdog's 5s.
+# Keep the 2001-line rendering regression clear of other tests' CPU load.
 [[profile.ci.overrides]]
-filter = 'test(=restore_expanded_shows_full_script_beyond_cap)'
+filter = 'test(execution_script_can_expand_beyond_its_initial_cap)'
 threads-required = 'num-test-threads'
 
 # One 64 MiB line goes through a single Lua slice, which 63 neighbours on 4 cores stretch past the Lua watchdog's 5s.

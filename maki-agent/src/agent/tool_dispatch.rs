@@ -1,13 +1,16 @@
 use std::borrow::Cow;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::future::{Future, pending};
+use std::future::{self, Future, pending};
 use std::hash::{Hash, Hasher};
+use std::mem;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use flume::{Receiver, Sender};
 use futures::future::join_all;
+use futures_lite::FutureExt;
 use serde_json::{Value, json};
 use tokio_util::task::AbortOnDropHandle;
 use tracing::{debug, error, warn};
@@ -20,16 +23,18 @@ use crate::mcp::{
 };
 use crate::permissions::{LayerAnswer, PermissionCheck, PromptLayers};
 use crate::tools::hook::{
-    Authority, ChainCut, HookCall, HookStage, OUTPUT_IS_ERROR, OUTPUT_TEXT, Verdict, bounded,
+    Authority, ChainCut, HookCall, HookStage, OUTPUT_IS_ERROR, OUTPUT_TEXT, Verdict, authority_of,
+    bounded,
 };
 use crate::tools::registry::{BoxFuture, InstalledHook, RegisteredTool, Tool, ToolInvocation};
 use crate::tools::{
-    CallOrigin, FileKey, LocalTool, LocalToolFn, MovedCall, MovedLand, PermissionScopes,
-    ToolAudience, ToolContext, ToolExecResult, ToolLive, truncate_bytes,
+    CallOrigin, ExecFuture, FileKey, LocalTool, LocalToolFn, MovedCall, MovedLand, PendingProgress,
+    PermissionScopes, ProgressScope, ToolAudience, ToolContext, ToolExecResult, ToolLive,
+    truncate_bytes,
 };
 use crate::{
-    AgentError, AgentEvent, AgentSeed, CallRecord, TextOutput, ToolDoneEvent, ToolOutput,
-    ToolStartEvent,
+    AgentError, AgentEvent, AgentSeed, CallRecord, DEFAULT_DATA_VERSION, EventSender, TextOutput,
+    ToolChild, ToolData, ToolDoneEvent, ToolOutput, ToolProgressEvent, ToolStartEvent,
 };
 use maki_config::ToolKey;
 use maki_storage::id::SessionRef;
@@ -71,6 +76,10 @@ const DIFF_TIMEOUT: Duration = Duration::from_millis(100);
 /// layer that parks and never comes back has to end somewhere short of "when
 /// the user gives up".
 const HOOK_CHAIN_MAX: Duration = Duration::from_secs(60);
+
+/// How often a running model call's streamed progress is published, the
+/// cadence the ACP host polls live buffers at.
+const PROGRESS_TICK: Duration = Duration::from_millis(100);
 
 pub(super) struct RecentCalls(VecDeque<(String, u64)>);
 
@@ -132,6 +141,93 @@ pub async fn run(
     ctx: &ToolContext,
     origin: CallOrigin,
 ) -> ToolDoneEvent {
+    let Some(scope) = ctx.progress.as_ref().filter(|scope| !scope.is_root()) else {
+        return run_call(id, name, input, ctx, origin).await;
+    };
+    let (live_tx, live_rx) = flume::unbounded();
+    let child_ctx = ToolContext {
+        live_sink: Some(live_tx),
+        ..ctx.clone()
+    };
+    let relay = ChildRelay {
+        scope,
+        caller: ctx.live_sink.as_ref(),
+        live_rx,
+        name,
+        input,
+        settled: false,
+    };
+    let forward = async {
+        while let Ok(live) = relay.live_rx.recv_async().await {
+            relay.relay(live);
+        }
+        future::pending().await
+    };
+    let mut done = run_call(id, name, input, &child_ctx, origin)
+        .or(forward)
+        .await;
+    relay.settle(&mut done);
+    done
+}
+
+/// A nested call's live events on their way to its caller. The tool sends
+/// them to `live_sink`, which only `maki.agent.call_tool` reads, so this is
+/// the one place that sees them all. Whether the call ends or its future is
+/// dropped, such as a `call_tool` in a Lua task cancelled while it waits,
+/// the queue is drained before the record settles, so the record keeps every
+/// event the tool sent.
+struct ChildRelay<'a> {
+    scope: &'a ProgressScope,
+    caller: Option<&'a Sender<ToolLive>>,
+    live_rx: Receiver<ToolLive>,
+    name: &'a str,
+    input: &'a Value,
+    settled: bool,
+}
+
+impl ChildRelay<'_> {
+    fn relay(&self, live: ToolLive) {
+        self.scope.live(&live);
+        if let Some(caller) = self.caller {
+            let _ = caller.send(live);
+        }
+    }
+
+    fn drain(&self) {
+        self.live_rx.drain().for_each(|live| self.relay(live));
+    }
+
+    fn settle(mut self, done: &mut ToolDoneEvent) {
+        self.drain();
+        self.scope.finished(done);
+        self.settled = true;
+    }
+}
+
+impl Drop for ChildRelay<'_> {
+    fn drop(&mut self) {
+        if self.settled {
+            return;
+        }
+        self.drain();
+        self.scope.abandoned(|| {
+            ToolData::new(
+                Arc::from(self.name),
+                DEFAULT_DATA_VERSION,
+                self.input.clone(),
+                self.name.to_owned(),
+            )
+        });
+    }
+}
+
+async fn run_call(
+    id: String,
+    name: &str,
+    input: &Value,
+    ctx: &ToolContext,
+    origin: CallOrigin,
+) -> ToolDoneEvent {
     let resolved = resolve(ctx, name);
     let name = resolved.name;
     let hook = Hook::of(ctx, &resolved, origin);
@@ -158,19 +254,26 @@ pub async fn run(
         }
         Verdict::Denied(reason) => {
             warn!(tool = %name, reason = %reason, "input hook stopped the call");
+            let data = resolved.route.data(name, input);
             return ToolDoneEvent {
                 call: None,
                 id,
-                tool: Arc::from(name),
+                tool: Arc::clone(&data.tool),
                 output: Arc::new(ToolOutput::Plain(reason.into())),
                 is_error: true,
                 annotation: None,
                 written_path: None,
                 backgrounded: false,
+                data: Some(Arc::new(data)),
             };
         }
     };
 
+    let routed =
+        (!matches!(resolved.route, Route::Native(_))).then(|| resolved.route.data(name, &input));
+    if let (Some(scope), Some(data)) = (&ctx.progress, &routed) {
+        scope.started(data);
+    }
     let source = maki_otel::enabled().then(|| resolved.route.source());
     let started = Instant::now();
     let Ran { mut done, moved } = run_inner(
@@ -184,6 +287,9 @@ pub async fn run(
     )
     .await;
     let took = started.elapsed();
+    if done.data.is_none() {
+        done.data = routed.map(Arc::new);
+    }
     let output = OutputPipeline {
         hook,
         ctx,
@@ -225,6 +331,7 @@ fn ran(id: String, tool: Arc<str>, result: ToolExecResult) -> Ran {
         annotation,
         written_path,
         moved,
+        state: _,
     } = result;
     let backgrounded = moved.is_some();
     let done = match output {
@@ -237,10 +344,13 @@ fn ran(id: String, tool: Arc<str>, result: ToolExecResult) -> Ran {
             annotation,
             written_path,
             backgrounded,
+            data: None,
         },
         Err(message) => ToolDoneEvent {
             tool,
             backgrounded,
+            annotation,
+            written_path,
             ..ToolDoneEvent::error(id, message)
         },
     };
@@ -273,9 +383,19 @@ enum Filtered {
 
 impl OutputPipeline<'_> {
     async fn apply(&self, done: &mut ToolDoneEvent, input: &Value, filtered: Filtered) {
-        if let Some(hook) = &self.hook {
-            hook.filter_output(done, input, matches!(filtered, Filtered::Receipt))
-                .await;
+        if let Some(hook) = &self.hook
+            && hook
+                .filter_output(done, input, matches!(filtered, Filtered::Receipt))
+                .await
+            && let Some(data) = &mut done.data
+        {
+            Arc::make_mut(data).mark_rewritten();
+        }
+        if let (Some(data), Some(annotation)) = (&mut done.data, &done.annotation) {
+            let data = Arc::make_mut(data);
+            if !data.annotations.contains(annotation) {
+                data.annotations.push(annotation.clone());
+            }
         }
         if self.origin.is_model() {
             attach_call_instructions(self.ctx, done);
@@ -300,6 +420,7 @@ impl OutputPipeline<'_> {
             source: self.source,
             id: receipt.id.clone(),
             tool: Arc::clone(&receipt.tool),
+            data: receipt.data.clone(),
             input: input.clone(),
             started,
         }
@@ -316,11 +437,41 @@ struct MovedPipeline {
     source: Option<Cow<'static, str>>,
     id: String,
     tool: Arc<str>,
+    data: Option<Arc<ToolData>>,
     input: Value,
     started: Instant,
 }
 
 impl MovedPipeline {
+    fn publish_progress(&self, pending: Vec<PendingProgress>) {
+        let Some(home) = self.ctx.call.as_ref().and_then(|call| call.home()) else {
+            return;
+        };
+        for PendingProgress {
+            path,
+            append,
+            state,
+            child,
+        } in pending
+        {
+            crate::SessionMailbox::task_event(
+                home.chat,
+                Arc::clone(&home.plugin),
+                crate::Envelope {
+                    event: AgentEvent::ToolProgress(Box::new(ToolProgressEvent {
+                        id: self.id.clone(),
+                        path,
+                        append,
+                        state,
+                        child: child.map(Box::new),
+                    })),
+                    subagent: None,
+                    run_id: 0,
+                },
+            );
+        }
+    }
+
     fn output(&self) -> OutputPipeline<'_> {
         OutputPipeline {
             hook: self
@@ -358,17 +509,54 @@ impl MovedPipeline {
     }
 
     async fn land(self, result: BoxFuture<'static, Option<ToolExecResult>>, landing: Landing) {
-        let Some(result) = result.await else {
+        let ticker = async {
+            loop {
+                tokio::time::sleep(PROGRESS_TICK).await;
+                if let Some(scope) = &self.ctx.progress
+                    && self
+                        .ctx
+                        .call
+                        .as_ref()
+                        .and_then(|call| call.home())
+                        .is_some()
+                {
+                    self.publish_progress(scope.take());
+                }
+            }
+        };
+        let result = result.or(ticker).await;
+        let mut closed = self.ctx.progress.as_ref().map(ProgressScope::close);
+        if let Some(closed) = &mut closed {
+            self.publish_progress(mem::take(&mut closed.progress));
+        }
+        let Some(result) = result else {
             warn!(id = %self.id, tool = %self.tool, "moved call ended without a reply");
             landing.land(None);
             return;
         };
+        let state = result.state.clone();
         let mut done = ran(self.id.clone(), Arc::clone(&self.tool), result).done;
+        done.data = self.data.clone();
+        if let Some(data) = &mut done.data {
+            let data = Arc::make_mut(data);
+            data.state = state.unwrap_or_default();
+            if let Some(closed) = closed {
+                data.children = closed.children;
+            }
+        }
         let took = self.started.elapsed();
         self.output()
             .apply(&mut done, &self.input, Filtered::Final(took))
             .await;
         landing.land(Some(done));
+    }
+}
+
+impl Drop for MovedPipeline {
+    fn drop(&mut self) {
+        if let Some(scope) = &self.ctx.progress {
+            scope.close();
+        }
     }
 }
 
@@ -483,9 +671,9 @@ impl<'a> Hook<'a> {
 
     /// Rewrites the finished event in place. Text and error flag move together,
     /// so a hook that cannot reach the text cannot flip the flag either.
-    async fn filter_output(&self, done: &mut ToolDoneEvent, input: &Value, receipt: bool) {
+    async fn filter_output(&self, done: &mut ToolDoneEvent, input: &Value, receipt: bool) -> bool {
         if !self.layer.installed.wraps(self.tool, HookStage::Output) {
-            return;
+            return false;
         }
         let was_error = done.is_error;
         // The output has not reached the session or the UI yet, so `make_mut`
@@ -502,20 +690,20 @@ impl<'a> Hook<'a> {
                 tool = %self.tool,
                 "output hook skipped: this output renders from fields, not prose"
             );
-            return;
+            return false;
         };
         let value = json!({ OUTPUT_TEXT: &*text, OUTPUT_IS_ERROR: was_error });
         let call = HookCall {
             receipt,
             ..self.call(HookStage::Output, &done.id, Some(input))
         };
-        let (rewritten, is_error) = match self
+        let (rewritten, is_error, denied) = match self
             .fire(HookStage::Output, call, value, Verdict::Unchanged)
             .await
         {
-            Verdict::Unchanged | Verdict::Ask { .. } => return,
+            Verdict::Unchanged | Verdict::Ask { .. } => return false,
             // Nothing left to stop, so the reason becomes what the model reads.
-            Verdict::Denied(reason) => (reason, true),
+            Verdict::Denied(reason) => (reason, true, true),
             Verdict::Replaced(value) => match value.get(OUTPUT_TEXT).and_then(Value::as_str) {
                 Some(replaced) => (
                     replaced.to_owned(),
@@ -523,6 +711,7 @@ impl<'a> Hook<'a> {
                         .get(OUTPUT_IS_ERROR)
                         .and_then(Value::as_bool)
                         .unwrap_or(was_error),
+                    false,
                 ),
                 None => {
                     warn!(
@@ -530,13 +719,17 @@ impl<'a> Hook<'a> {
                         field = OUTPUT_TEXT,
                         "output hook replaced the output without a text field, leaving it alone"
                     );
-                    return;
+                    return false;
                 }
             },
         };
+        // A denial voids the output even when it repeats the text, so no
+        // state the tool kept for it may be drawn.
+        let changed = denied || *text != rewritten;
         *text = rewritten;
         done.is_error = is_error;
-        debug!(tool = %self.tool, "output hook rewrote the output");
+        debug!(tool = %self.tool, changed, "output hook rewrote the output");
+        changed
     }
 
     /// Cancellation outranks a hook: nobody is left to read the verdict, so
@@ -580,6 +773,7 @@ impl<'a> Hook<'a> {
         input: Option<&'b Value>,
     ) -> HookCall<'b> {
         HookCall {
+            working_dir: &self.ctx.working_dir,
             tool: self.tool,
             tool_id,
             tool_kind: self.layer.native.as_deref().and_then(Tool::tool_kind),
@@ -645,7 +839,7 @@ impl Route<'_> {
     /// tells whoever reads the metric nothing.
     fn source(&self) -> Cow<'static, str> {
         match self {
-            Self::Native(entry) => entry.source.as_log_field(),
+            Self::Native(entry) => Cow::Owned(entry.source()),
             Self::Local(_) => Cow::Borrowed(SOURCE_LOCAL),
             Self::Mcp(..) => Cow::Borrowed(SOURCE_MCP),
             Self::ToolSearch(_) => Cow::Borrowed(TOOL_SEARCH_TOOL_NAME),
@@ -660,12 +854,28 @@ impl Route<'_> {
     /// likes.
     fn authority(&self) -> Option<Authority> {
         match self {
-            Self::Native(entry) => Some(Authority::from(entry.tool.reach())),
+            Self::Native(entry) => Some(authority_of(entry.tool.reach())),
             Self::ToolSearch(_) | Self::Local(_) | Self::Mcp(..) => Some(Authority::Unbounded),
             // A rewrite cannot make the name exist, so firing here would hand
             // out a tool's authority without the tool.
             Self::Unknown => None,
         }
+    }
+
+    /// The data of a call that dispatch, not a tool, describes: the summary
+    /// its start showed and no state. A registry tool fills its own, so here
+    /// it only covers a call an input hook stopped.
+    fn data(&self, name: &str, input: &Value) -> ToolData {
+        let (tool, summary) = match self {
+            Self::Native(_) | Self::Local(_) => (Arc::from(name), name.to_owned()),
+            Self::ToolSearch(_) => (
+                Arc::from(TOOL_SEARCH_TOOL_NAME),
+                RoutedView::tool_search(input).summary,
+            ),
+            Self::Mcp(_, qualified) => (Arc::clone(qualified), RoutedView::mcp(qualified).summary),
+            Self::Unknown => (Arc::from(UNKNOWN_MCP), name.to_owned()),
+        };
+        ToolData::new(tool, DEFAULT_DATA_VERSION, input.clone(), summary)
     }
 }
 
@@ -880,6 +1090,7 @@ async fn run_inner(
                 annotation: None,
                 written_path: None,
                 backgrounded: false,
+                data: None,
             }
             .into()
         }
@@ -900,10 +1111,17 @@ async fn run_native_tool(
 ) -> Ran {
     let tool_id: Arc<str> = Arc::from(entry.tool.name());
     let started = Instant::now();
+    let mut data = ToolData::new(
+        Arc::clone(&tool_id),
+        DEFAULT_DATA_VERSION,
+        input.clone(),
+        tool_id.to_string(),
+    );
 
-    let done_error = |msg: String| -> Ran {
+    let done_error = |msg: String, data: ToolData| -> Ran {
         ToolDoneEvent {
             tool: Arc::clone(&tool_id),
+            data: Some(Arc::new(data)),
             ..ToolDoneEvent::error(id.clone(), msg)
         }
         .into()
@@ -914,47 +1132,59 @@ async fn run_native_tool(
         Err(e) => {
             warn!(
                 tool = %name,
-                source = %entry.source.as_log_field(),
+                source = %entry.source(),
                 input_preview = %crate::tools::schema::preview(&input.to_string()),
                 error = %e,
                 "tool input parse failed"
             );
-            return done_error(e.to_string());
+            return done_error(e.to_string(), data);
         }
     };
+    if let Some(validated) = invocation.validated_input() {
+        data.input.clone_from(validated);
+    }
 
     // The one declaration a file-mutating tool makes, and the only place its
     // four consequences live: plan-mode block, boundary block, write
     // serialization, and the stale-read check. Keyed once so all four agree on
     // what "the same file" means.
-    let mutated = invocation.mutable_path().map(FileKey::new);
+    let mutated = invocation
+        .mutable_path()
+        .map(|path| FileKey::new(&ctx.resolve_path(path)));
 
     if let Some(key) = &mutated
         && let Some(reason) = mutation_block(ctx, name, key)
     {
-        return done_error(reason);
+        return done_error(reason, data);
     }
 
-    let header_result = invocation.start_header().await;
+    let summary = invocation
+        .start_summary()
+        .await
+        .unwrap_or_else(|| tool_id.to_string());
+    let annotation = invocation.start_annotation();
+    data.summary.clone_from(&summary);
+    data.annotations.extend(annotation.clone());
+    if let Some(scope) = &ctx.progress {
+        scope.started(&data);
+    }
     let start = ToolStartEvent {
         id: id.clone(),
         tool: Arc::clone(&tool_id),
-        summary: header_result.text(),
-        render_header: header_result.snapshot(),
-        annotation: invocation.start_annotation(),
+        data_version: DEFAULT_DATA_VERSION,
+        summary,
+        annotation,
         input: None,
         raw_input: Some(input.clone()),
-        output: invocation.start_output(ctx),
+        output: None,
     };
     if origin.is_model() {
         let _ = ctx.event_tx.send(AgentEvent::ToolStart(Box::new(start)));
     }
 
-    invocation.start(ctx).await;
-
     if let Err(e) = enforce_permission(invocation.as_ref(), name, input, ctx, &id, ask, hook).await
     {
-        return done_error(e);
+        return done_error(e, data);
     }
 
     // Taken after the permission gate, so a pending approval prompt never
@@ -970,14 +1200,22 @@ async fn run_native_tool(
             if ctx.config.stale_read_check
                 && let Err(message) = ctx.file_access.check_before_edit(key)
             {
-                return done_error(message);
+                return done_error(message, data);
             }
             Some(guard)
         }
         None => None,
     };
 
-    let result = invocation.execute(ctx).await;
+    let exec = invocation.execute(ctx);
+    let mut result = match ctx.progress.as_ref().filter(|_| origin.is_model()) {
+        Some(scope) => {
+            let (result, children) = execute_streaming(exec, scope, &ctx.event_tx, &id).await;
+            data.children = children;
+            result
+        }
+        None => exec.await,
+    };
 
     // Nothing else could have touched the file while the guard was held, so the
     // mtime is refreshed here instead of by each write plugin remembering to.
@@ -995,20 +1233,77 @@ async fn run_native_tool(
     match &result.output {
         Ok(_) => debug!(
             tool = %name,
-            source = %entry.source.as_log_field(),
+            source = %entry.source(),
             elapsed_ms,
             backgrounded = result.moved.is_some(),
             "tool ok"
         ),
         Err(message) => warn!(
             tool = %name,
-            source = %entry.source.as_log_field(),
+            source = %entry.source(),
             elapsed_ms,
             error = %message,
             "tool failed"
         ),
     }
-    ran(id, tool_id, result)
+    data.state = result.state.take().unwrap_or_default();
+    let mut completed = ran(id, tool_id, result);
+    completed.done.data = Some(Arc::new(data));
+    completed
+}
+
+/// Drains progress before the result is published. A moved receipt transfers
+/// the open scope to its continuation; a final result or dropped call closes it.
+async fn execute_streaming(
+    exec: ExecFuture<'_>,
+    scope: &ProgressScope,
+    event_tx: &EventSender,
+    id: &str,
+) -> (ToolExecResult, Vec<ToolChild>) {
+    let mut closer = CloseOnDrop(Some(scope));
+    let ticker = async {
+        loop {
+            tokio::time::sleep(PROGRESS_TICK).await;
+            publish_progress(scope.take(), event_tx, id);
+        }
+    };
+    let result = exec.or(ticker).await;
+    let closed = if result.moved.is_some() {
+        closer.0 = None;
+        scope.checkpoint()
+    } else {
+        scope.close()
+    };
+    publish_progress(closed.progress, event_tx, id);
+    (result, closed.children)
+}
+
+struct CloseOnDrop<'a>(Option<&'a ProgressScope>);
+
+impl Drop for CloseOnDrop<'_> {
+    fn drop(&mut self) {
+        if let Some(scope) = self.0 {
+            scope.close();
+        }
+    }
+}
+
+fn publish_progress(pending: Vec<PendingProgress>, event_tx: &EventSender, id: &str) {
+    for PendingProgress {
+        path,
+        append,
+        state,
+        child,
+    } in pending
+    {
+        let _ = event_tx.send(AgentEvent::ToolProgress(Box::new(ToolProgressEvent {
+            id: id.to_owned(),
+            path,
+            append,
+            state,
+            child: child.map(Box::new),
+        })));
+    }
 }
 
 /// Header summary and body format of a call the registry cannot describe
@@ -1074,8 +1369,8 @@ fn emit_raw_start(
     let start = ToolStartEvent {
         id: id.to_owned(),
         tool: Arc::clone(tool),
+        data_version: DEFAULT_DATA_VERSION,
         summary,
-        render_header: None,
         annotation: None,
         input: None,
         raw_input: Some(input.clone()),
@@ -1110,6 +1405,7 @@ fn run_tool_search(
         annotation: None,
         written_path: None,
         backgrounded: false,
+        data: None,
     }
 }
 
@@ -1147,7 +1443,9 @@ fn mutation_block(ctx: &ToolContext, name: &str, key: &FileKey) -> Option<String
 /// on, and no call to hand an input hook that could rewrite, deny or
 /// escalate it. A rule or YOLO must already allow it.
 pub fn silent_mutation_check(ctx: &ToolContext, tool: &str, path: &str) -> Result<(), String> {
-    if let Some(reason) = mutation_block(ctx, tool, &FileKey::new(Path::new(path))) {
+    let path = ctx.resolve_path(Path::new(path));
+    let path = path.to_string_lossy();
+    if let Some(reason) = mutation_block(ctx, tool, &FileKey::new(Path::new(&*path))) {
         return Err(reason);
     }
     if ctx
@@ -1161,7 +1459,7 @@ pub fn silent_mutation_check(ctx: &ToolContext, tool: &str, path: &str) -> Resul
     }
     match ctx
         .permissions
-        .check(&ToolKey::native(tool), path, ctx.mode.plan_path())
+        .check(&ToolKey::native(tool), &path, ctx.mode.plan_path())
     {
         PermissionCheck::Allowed => Ok(()),
         PermissionCheck::Denied(reason) => Err(reason),
@@ -1199,6 +1497,7 @@ async fn run_local_tool(
         annotation: None,
         written_path: None,
         backgrounded: false,
+        data: None,
     }
 }
 
@@ -1220,7 +1519,7 @@ async fn enforce_permission(
             "enforce_permission called with dotted name: {name}"
         ));
     }
-    match (inv.permission_scopes().await, ask) {
+    match (inv.permission_scopes(ctx).await, ask) {
         (Some(scopes), ask) => {
             gate(ctx, &ToolKey::native(name), &scopes, id, input, ask, hook).await
         }
@@ -1349,6 +1648,7 @@ async fn execute_mcp_tool(
         annotation: None,
         written_path: None,
         backgrounded: false,
+        data: None,
     };
 
     let perm_tool = match ToolKey::parse(&tool) {
@@ -1412,13 +1712,18 @@ pub(super) async fn process_tool_calls(
         recent_calls.record(name, &input);
     }
 
+    let capture = history.call_capture();
     for err in &immediate_errors {
+        if let Some(capture) = &capture {
+            capture.record(err);
+        }
         event_tx.try_send(AgentEvent::ToolDone(Box::new(err.clone())));
     }
 
     let mut ids = Vec::with_capacity(runnable.len());
     let mut calls = Vec::with_capacity(runnable.len());
     for (id, name, input) in runnable {
+        let capture = capture.clone();
         let event_tx_clone = ctx.event_tx.clone();
         let scope = Arc::new(CallScope::new(id.clone(), &ctx.cancel));
         let tool_ctx = ToolContext {
@@ -1426,6 +1731,7 @@ pub(super) async fn process_tool_calls(
             call_instructions: CallInstructions::default(),
             cancel: scope.cancel().clone(),
             call: Some(Arc::clone(&scope)),
+            progress: Some(ProgressScope::default()),
             ..ctx.clone()
         };
         let guard = CallGuard::new(scope);
@@ -1434,6 +1740,9 @@ pub(super) async fn process_tool_calls(
         calls.push(AbortOnDropHandle::new(tokio::spawn(async move {
             let _guard = guard;
             let done = run(id, &name, &input, &tool_ctx, CallOrigin::Model).await;
+            if let Some(capture) = &capture {
+                capture.record(&done);
+            }
             event_tx_clone.try_send(AgentEvent::ToolDone(Box::new(done.clone())));
             done
         })));
@@ -1541,7 +1850,6 @@ mod tests {
     use std::pin::pin;
     use std::sync::Arc;
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicBool, Ordering};
 
     use flume::Receiver;
     use futures::FutureExt;
@@ -1565,20 +1873,25 @@ mod tests {
         PERMISSION_DENIED_PREFIX, PermissionAnswer, PermissionManager, TaggedAnswer,
     };
     use crate::template::Vars;
-    use crate::tools::registry::{ToolRegistry, ToolSource};
+    use crate::tools::registry::ToolRegistry;
     use crate::tools::schema::{JsonPath, ToolInputErrorKind};
     use crate::tools::test_support::{
         GUARDED_TOOL_NAME, GuardedMock, mock_tool, mock_tool_with_schema, stub_ctx, stub_ctx_with,
         stub_ctx_with_permissions, stub_seed,
     };
     use crate::tools::{
-        BackgroundFor, BoxFuture, Deadline, DescriptionContext, ExecFuture, HeaderFuture,
-        HeaderResult, MovedCall, ParseError, PermissionScopes, RequestTools, TOOL_NAME_FIELD, Tool,
-        ToolAudience, ToolExecResult, ToolFilter, ToolHook, ToolReach, local_tool,
+        BackgroundFor, BoxFuture, Deadline, DescriptionContext, ExecFuture, MovedCall, ParseError,
+        PermissionScopes, RequestTools, TOOL_NAME_FIELD, Tool, ToolAudience, ToolExecResult,
+        ToolFilter, ToolHook, ToolReach, local_tool,
     };
     use crate::{AgentMode, Envelope, EventSender, InstructionBlock};
 
     const TEST_ID: &str = "t1";
+    const UNKNOWN_NAME: &str = "nope";
+    const QUICK_TOOL: &str = "quick";
+    const GATED_TOOL: &str = "gated";
+    const QUICK_ID: &str = "quick-call";
+    const GATED_ID: &str = "gated-call";
     const PROBE_WIRE: &str = "srv__probe";
     const PROBE_QUALIFIED: &str = "srv.probe";
     const OTHER_WIRE: &str = "srv__other";
@@ -1605,9 +1918,11 @@ mod tests {
     const HOOK_DIFF_COMMAND: &str = "apply";
     const HOOK_DIFF_PATH: &str = "/tmp/diffed.txt";
     const HOOK_DIFF_SUMMARY: &str = "1 file changed";
+    /// Answers with a reply state, as a tool whose state lives in its data.
+    const HOOK_STATEFUL_COMMAND: &str = "count";
+    const HOOK_STATE_KEY: &str = "lines";
     const HOOK_ESCAPED_PATH: &str = "/tmp/not-the-plan.md";
     const TEST_PLUGIN_SOURCE: &str = "lua:test";
-    const START_PROBE_NAME: &str = "start_probe";
     /// Allowed by the shared stub permissions; nothing is ever written here.
     const TEST_ROOT: &str = "/tmp";
     const PLAN_PATH: &str = "/tmp/plan.md";
@@ -1665,6 +1980,67 @@ mod tests {
         );
     }
 
+    /// A call that ended lands in the capture before its `ToolDone` goes
+    /// out, so a turn dropped while a sibling still runs keeps it.
+    #[test]
+    fn a_finished_call_is_captured_while_its_sibling_still_runs() {
+        let (tx, event_rx) = flume::unbounded();
+        let event_tx = EventSender::new(tx, 0);
+        let mut ctx = stub_ctx_with(&AgentMode::Build, Some(&event_tx), None);
+        ctx.local_tools = Arc::new(HashMap::from([
+            (
+                QUICK_TOOL.to_owned(),
+                local_tool(ToolAudience::all(), |_, _| {
+                    Box::pin(async { Ok(String::new()) })
+                }),
+            ),
+            (
+                GATED_TOOL.to_owned(),
+                local_tool(ToolAudience::all(), |_, _| Box::pin(std::future::pending())),
+            ),
+        ]));
+        let response = StreamResponse {
+            message: Message {
+                role: Role::Assistant,
+                content: vec![
+                    ContentBlock::tool_use(QUICK_ID, QUICK_TOOL, json!({})),
+                    ContentBlock::tool_use(GATED_ID, GATED_TOOL, json!({})),
+                ],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut history = History::new(Vec::new()).capturing_calls();
+
+        crate::test_block_on(futures_lite::future::or(
+            async {
+                let _ = process_tool_calls(
+                    response,
+                    &mut RecentCalls::new(),
+                    &mut history,
+                    &event_tx,
+                    &ctx,
+                )
+                .await;
+            },
+            async {
+                while let Ok(envelope) = event_rx.recv_async().await {
+                    if matches!(&envelope.event, AgentEvent::ToolDone(done) if done.id == QUICK_ID)
+                    {
+                        return;
+                    }
+                }
+            },
+        ));
+
+        let ids: Vec<_> = history
+            .take_calls()
+            .into_iter()
+            .map(|(id, ..)| id)
+            .collect();
+        assert_eq!(ids, [QUICK_ID]);
+    }
+
     fn local_ctx(
         name: &str,
         f: impl Fn(&Value) -> Result<String, String> + Send + Sync + 'static,
@@ -1710,14 +2086,7 @@ mod tests {
     }
 
     fn register(registry: &ToolRegistry, tool: Arc<dyn Tool>) {
-        registry
-            .register(
-                tool,
-                ToolSource::Lua {
-                    plugin: TEST_PLUGIN.into(),
-                },
-            )
-            .unwrap();
+        registry.register(tool, TEST_PLUGIN.into()).unwrap();
     }
 
     fn registry_with(names: &[&str]) -> Arc<ToolRegistry> {
@@ -1768,10 +2137,7 @@ mod tests {
     struct HookMockInvocation(String);
 
     impl ToolInvocation for HookMockInvocation {
-        fn start_header(&self) -> HeaderFuture {
-            HeaderFuture::Ready(HeaderResult::plain(HOOK_TOOL_NAME.into()))
-        }
-        fn permission_scopes(&self) -> BoxFuture<'_, Option<PermissionScopes>> {
+        fn permission_scopes(&self, _ctx: &ToolContext) -> BoxFuture<'_, Option<PermissionScopes>> {
             Box::pin(std::future::ready(Some(PermissionScopes::single(
                 self.0.clone(),
             ))))
@@ -1784,13 +2150,20 @@ mod tests {
                 if self.0 == HOOK_SLOW_COMMAND {
                     sleep(HOOK_SLOW_RUN).await;
                 }
-                Ok(output_of(&self.0)).into()
+                ToolExecResult {
+                    state: (self.0 == HOOK_STATEFUL_COMMAND).then(hook_state),
+                    ..ToolExecResult::from(Ok(output_of(&self.0)))
+                }
             })
         }
     }
 
     fn ran(command: &str) -> String {
         format!("ran {command}")
+    }
+
+    fn hook_state() -> Value {
+        json!({ HOOK_STATE_KEY: 1 })
     }
 
     /// One command answers with a shape the UI renders from fields, the one
@@ -2302,6 +2675,58 @@ mod tests {
         assert_eq!(done.output.as_text(), expected);
     }
 
+    fn restate_the_output(stage: HookStage, _value: &Value) -> Verdict {
+        match stage {
+            HookStage::Input => Verdict::Unchanged,
+            HookStage::Output => {
+                Verdict::Replaced(json!({ OUTPUT_TEXT: ran(HOOK_STATEFUL_COMMAND) }))
+            }
+        }
+    }
+
+    fn deny_with_the_same_text(stage: HookStage, _value: &Value) -> Verdict {
+        match stage {
+            HookStage::Input => Verdict::Unchanged,
+            HookStage::Output => Verdict::Denied(ran(HOOK_STATEFUL_COMMAND)),
+        }
+    }
+
+    /// A hook that changed the text or denied the call leaves the call's
+    /// data no state to draw from and marks it, so nothing draws its state
+    /// over the new text; one that left the text as it was keeps both. A call made by a tool, whose
+    /// record its parent keeps, gets the same.
+    #[test_case(replace_the_output,              CallOrigin::Model,  true  ; "a_replacement_rewrites")]
+    #[test_case(deny_the_output,                 CallOrigin::Model,  true  ; "a_denial_rewrites")]
+    #[test_case(replace_the_output_without_text, CallOrigin::Model,  false ; "a_replacement_without_text_keeps")]
+    #[test_case(restate_the_output,              CallOrigin::Model,  false ; "the_same_text_keeps")]
+    #[test_case(deny_with_the_same_text,         CallOrigin::Model,  true  ; "a_denial_of_the_same_text_rewrites")]
+    #[test_case(replace_the_output,              CallOrigin::Nested, true  ; "a_child_replacement_rewrites")]
+    #[test_case(deny_with_the_same_text,         CallOrigin::Nested, true  ; "a_child_denial_of_the_same_text_rewrites")]
+    #[test_case(restate_the_output,              CallOrigin::Nested, false ; "the_same_child_text_keeps")]
+    fn a_changed_output_leaves_no_state(
+        answer: fn(HookStage, &Value) -> Verdict,
+        origin: CallOrigin,
+        rewritten: bool,
+    ) {
+        crate::test_block_on(async {
+            let (mut ctx, _hook) = plain_hooked_ctx(RecordingHook::answering(answer));
+            let root = ProgressScope::default();
+            if origin == CallOrigin::Nested {
+                ctx.progress = Some(root.child());
+            }
+            let input = call_input(HOOK_STATEFUL_COMMAND);
+            let done = run(TEST_ID.into(), HOOK_TOOL_NAME, &input, &ctx, origin).await;
+
+            let state = (!rewritten).then(hook_state).unwrap_or_default();
+            let data = done.data.expect("a registry tool has data");
+            assert_eq!((data.rewritten, &data.state), (rewritten, &state));
+            if origin == CallOrigin::Nested {
+                let record = &root.close().children[0].data;
+                assert_eq!((record.rewritten, &record.state), (rewritten, &state));
+            }
+        });
+    }
+
     /// An output the UI renders from fields carries no prose to lend, and
     /// editing it would desync the fields from the text.
     #[tokio::test]
@@ -2353,8 +2778,8 @@ mod tests {
     struct MovedMockInvocation(MovedMock);
 
     impl ToolInvocation for MovedMockInvocation {
-        fn start_header(&self) -> HeaderFuture {
-            HeaderFuture::Ready(HeaderResult::plain(MOVED_TOOL_NAME.into()))
+        fn start_summary(&self) -> BoxFuture<'_, Option<String>> {
+            Box::pin(std::future::ready(Some(MOVED_TOOL_NAME.into())))
         }
         fn execute<'a>(self: Box<Self>, ctx: &'a ToolContext) -> ExecFuture<'a> {
             let MovedMock { landed, ending } = self.0;
@@ -2421,6 +2846,83 @@ mod tests {
 
         let receipt = dispatch(&ctx, MOVED_TOOL_NAME, &json!({})).await;
         (receipt, landed_rx, scope, hook)
+    }
+
+    #[tokio::test]
+    async fn a_moved_call_streams_progress_until_its_final_result() {
+        const PROGRESS: &str = "still building";
+        let session = maki_storage::id::MakiId::generate();
+        let mailbox = crate::SessionMailbox::register(session);
+        let (guard, mut events) = crate::event_stream();
+        mailbox.publish_events(guard.sender(0));
+        let scope = Arc::new(CallScope::new(TEST_ID.into(), &CancelToken::none()));
+        let _stop = scope
+            .move_to(crate::TaskHome {
+                chat: session,
+                id: TEST_ID.into(),
+                plugin: TEST_PLUGIN.into(),
+            })
+            .unwrap();
+        let progress = ProgressScope::default();
+        let mut ctx = build_ctx();
+        ctx.call = Some(scope);
+        ctx.progress = Some(progress.clone());
+        let (release, released) = flume::bounded::<()>(1);
+        let (landed, landing) = flume::bounded(1);
+        let live = progress.clone();
+        let result = Box::pin(async move {
+            live.stream(PROGRESS);
+            live.set_state(json!({ "running": true }));
+            released.recv_async().await.unwrap();
+            let mut result = ToolExecResult::from(Ok(ToolOutput::Plain(MOVED_FINAL.into())));
+            result.state = Some(json!({ "running": false }));
+            Some(result)
+        });
+        let mut receipt = ToolExecResult::from(Ok(ToolOutput::Plain(MOVED_RECEIPT.into())));
+        receipt.moved = Some(MovedCall {
+            result,
+            land: Box::new(move |done| {
+                let _ = landed.send(done);
+            }),
+        });
+        let (receipt, _) = execute_streaming(
+            Box::pin(async { receipt }),
+            &progress,
+            &ctx.event_tx,
+            TEST_ID,
+        )
+        .await;
+        let Ran { mut done, moved } = super::ran(TEST_ID.into(), MOVED_TOOL_NAME.into(), receipt);
+        done.data = Some(Arc::new(ToolData::new(
+            MOVED_TOOL_NAME.into(),
+            DEFAULT_DATA_VERSION,
+            json!({}),
+            MOVED_TOOL_NAME.into(),
+        )));
+        let pipeline = OutputPipeline {
+            hook: None,
+            ctx: &ctx,
+            origin: CallOrigin::Model,
+            tool: MOVED_TOOL_NAME,
+            source: None,
+        };
+        pipeline
+            .detach(&done, &json!({}), Instant::now())
+            .publish(&mut done, moved.unwrap())
+            .await;
+        let envelope = events.next().await.unwrap();
+        let AgentEvent::PluginTask { envelope, .. } = envelope.event else {
+            panic!("expected task progress")
+        };
+        let AgentEvent::ToolProgress(progress) = envelope.event else {
+            panic!("expected streamed progress")
+        };
+        assert_eq!(progress.append, PROGRESS);
+        assert_eq!(progress.state, Some(json!({ "running": true })));
+        assert!(landing.is_empty());
+        release.send(()).unwrap();
+        let done = landing.recv_async().await.unwrap().unwrap();
+        assert_eq!(done.data.unwrap().state, json!({ "running": false }));
     }
 
     fn redact_the_output(stage: HookStage, _value: &Value) -> Verdict {
@@ -2628,6 +3130,22 @@ mod tests {
         let done = dispatch(&ctx, HOOK_TOOL_NAME, &call_input(command)).await;
 
         assert_eq!(done.call.map(|c| c.input), expected.map(call_input));
+    }
+
+    /// A renderer draws what ran, so the data keeps the rewrite; a stopped
+    /// call keeps the input it was stopped on.
+    #[test_case(HOOK_PLAIN,          HOOK_PLAIN        ; "an_untouched_call_stores_its_input")]
+    #[test_case(HOOK_REWRITTEN_FROM, HOOK_REWRITTEN_TO ; "a_rewritten_call_stores_the_rewrite")]
+    #[test_case(HOOK_DENIED,         HOOK_DENIED       ; "a_stopped_call_stores_what_it_was_stopped_on")]
+    fn the_data_holds_the_input_that_ran(command: &str, expected: &str) {
+        crate::test_block_on(async {
+            let (ctx, _hook) = hooked_ctx(build_ctx());
+            let done = dispatch(&ctx, HOOK_TOOL_NAME, &call_input(command)).await;
+
+            let data = done.data.expect("every dispatched call has data");
+            assert_eq!(data.input, call_input(expected));
+            assert_eq!(data.version, DEFAULT_DATA_VERSION);
+        });
     }
 
     /// A layer judging a result sees the call that produced it, not the one
@@ -3070,7 +3588,38 @@ mod tests {
             })
             .expect("ToolStart is emitted");
         assert_eq!(start.summary, view.summary);
+        assert_eq!(start.data_version, DEFAULT_DATA_VERSION);
         assert_eq!(done.output.is_markdown(), view.markdown);
+        let data = done.data.expect("a routed call has data");
+        assert_eq!(
+            (data.summary.as_str(), data.version, &data.state),
+            (summary, DEFAULT_DATA_VERSION, &Value::Null)
+        );
+    }
+
+    /// No tool describes these calls, so their data is the default: version 1,
+    /// no state, and the summary a start would show.
+    #[test_case(host_route_ctx, CLIENT_NAME,    CLIENT_NAME ; "a_host_tool")]
+    #[test_case(build_ctx,      UNKNOWN_NAME,   UNKNOWN_MCP ; "an_unknown_name")]
+    fn a_call_no_tool_describes_has_default_data(
+        build: fn() -> ToolContext,
+        name: &str,
+        tool: &str,
+    ) {
+        let input = call_input(HOOK_PLAIN);
+        let done = crate::test_block_on(dispatch(&build(), name, &input));
+
+        let data = done.data.expect("every dispatched call has data");
+        let expected = ToolData::new(
+            Arc::from(tool),
+            DEFAULT_DATA_VERSION,
+            input,
+            name.to_owned(),
+        );
+        assert_eq!(
+            serde_json::to_value(&*data).unwrap(),
+            serde_json::to_value(expected).unwrap()
+        );
     }
 
     #[tokio::test]
@@ -3496,77 +4045,6 @@ mod tests {
         assert!(
             moved - at >= PROMPT_THINK_TIME,
             "the prompt ate into the call's budget"
-        );
-    }
-
-    #[derive(Default)]
-    struct StartProbe {
-        started: Arc<AtomicBool>,
-        executed: Arc<AtomicBool>,
-    }
-
-    struct StartProbeInvocation {
-        started: Arc<AtomicBool>,
-        executed: Arc<AtomicBool>,
-    }
-
-    impl ToolInvocation for StartProbeInvocation {
-        fn start_header(&self) -> HeaderFuture {
-            HeaderFuture::Ready(HeaderResult::plain("probe".into()))
-        }
-        fn start<'a>(&'a self, _ctx: &'a ToolContext) -> BoxFuture<'a, ()> {
-            self.started.store(true, Ordering::SeqCst);
-            Box::pin(std::future::ready(()))
-        }
-        fn permission_scopes(&self) -> BoxFuture<'_, Option<PermissionScopes>> {
-            Box::pin(std::future::ready(Some(PermissionScopes::single(
-                "probe".into(),
-            ))))
-        }
-        fn execute<'a>(self: Box<Self>, _ctx: &'a ToolContext) -> ExecFuture<'a> {
-            self.executed.store(true, Ordering::SeqCst);
-            Box::pin(async {
-                ToolExecResult::from(Ok::<_, String>(ToolOutput::Plain("ok".into())))
-            })
-        }
-    }
-
-    impl Tool for StartProbe {
-        fn name(&self) -> &str {
-            START_PROBE_NAME
-        }
-        fn description(&self, _ctx: &DescriptionContext) -> std::borrow::Cow<'_, str> {
-            "start probe".into()
-        }
-        fn schema(&self) -> Value {
-            serde_json::json!({"type": "object", "properties": {}, "additionalProperties": false})
-        }
-        fn parse(&self, _input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
-            Ok(Box::new(StartProbeInvocation {
-                started: Arc::clone(&self.started),
-                executed: Arc::clone(&self.executed),
-            }))
-        }
-    }
-
-    /// A denied tool should still get its preview, but never its `execute`.
-    #[tokio::test]
-    async fn start_runs_before_permission_denial_blocks_execute() {
-        let mut ctx = denying_ctx(ToolKey::native(START_PROBE_NAME));
-        let probe = StartProbe::default();
-        let (started, executed) = (Arc::clone(&probe.started), Arc::clone(&probe.executed));
-        ctx.registry = registered(Arc::new(probe));
-
-        let done = dispatch(&ctx, START_PROBE_NAME, &serde_json::json!({})).await;
-
-        assert!(done.is_error, "denial must error");
-        assert!(
-            started.load(Ordering::SeqCst),
-            "start must run before permission enforcement"
-        );
-        assert!(
-            !executed.load(Ordering::SeqCst),
-            "execute must not run after denial"
         );
     }
 

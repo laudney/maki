@@ -1,15 +1,16 @@
 use std::collections::HashMap;
 use std::fmt::Display;
-use std::io::{BufRead, Read, Write};
 use std::marker::PhantomData;
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use maki_agent::cancel::CancelToken;
 use maki_lua_macro::{lua_fn, lua_table};
 use maki_providers::AgentError;
-use maki_providers::plugin::{self, Hook, ProviderDecl, ProviderHooks, Registration};
+use maki_providers::plugin::{
+    self, DeclAuthority, Hook, ProviderDecl, ProviderHooks, Registration,
+};
 use maki_providers::provider::BoxFuture;
 use maki_storage::StateDir;
 use maki_storage::auth::{
@@ -25,10 +26,10 @@ use serde_json::Value;
 use tokio::task::spawn_blocking;
 use tokio::time::timeout;
 
-use crate::api::Owner;
 use crate::api::net::{self, NetError, ResponseData};
 use crate::api::util::convert::{TableExt, json_to_lua, lua_to_json, lua_to_json_within};
 use crate::api::util::pair::{Pair, try_pair};
+use crate::domains::agent::CallProviderHook;
 use crate::plugin_permissions::{NetEgress, OwnedSlugs, Permission, PluginPermissions};
 use crate::runtime::{DeferredCallback, Request, host_senders};
 
@@ -75,7 +76,17 @@ const NO_NET_HOSTS: &str = "declare the hosts this provider talks to as `net_hos
      `[permissions]` in plugin.toml before registering";
 const API_KEY_ENV_NEEDS_ENV: &str = "`api_key_env` reads the environment, which needs `env = true` \
      under `[permissions]` in plugin.toml";
-const SECRET_MASK: char = '*';
+
+/// Who a `maki` global belongs to: the name everything it registers is filed
+/// under, whether that code shipped inside the binary, and the slugs the trust
+/// layer granted this load to register. One value, so a call site cannot hand
+/// over the name and forget the authority behind it.
+#[derive(Clone)]
+pub(crate) struct Owner {
+    pub name: Arc<str>,
+    pub authority: DeclAuthority,
+    pub granted_providers: Arc<[String]>,
+}
 
 /// One plugin-supplied provider callback, named the way the registry names it.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -232,7 +243,7 @@ where
             let (_abandon, cancel) = CancelToken::new();
             self.keys
                 .requests
-                .send(Request::CallProviderHook {
+                .send(Request::domain(CallProviderHook {
                     hook: Arc::clone(&self.keys),
                     slot: self.slot,
                     payload,
@@ -245,7 +256,7 @@ where
                                 .and_then(|returned| decode::<Out>(lua, returned)),
                         );
                     }),
-                })
+                }))
                 .map_err(|_| AgentError::Channel)?;
             let answered = async { answer.recv_async().await.map_err(|_| AgentError::Channel) };
             let value = match self.timeout {
@@ -538,58 +549,18 @@ fn add_stdio(lua: &Lua, ctx: &Table) -> LuaResult<()> {
     )
 }
 
-/// Reads one line of an answer from the terminal, off the Lua thread so a slow
-/// typist does not trip the 5s watchdog.
-///
-/// A secret is read with the terminal in raw mode so the characters never reach
-/// the scrollback, and echoed as mask characters so there is still feedback
-/// that a key landed. Raw mode is given back whatever the read did.
-fn read_answer(label: &str, secret: bool) -> Pair<String> {
-    print!("{label}");
-    if std::io::stdout().flush().is_err() {
-        return (None, Some("cannot write to the terminal".to_owned()));
-    }
-    if !secret {
-        let mut line = String::new();
-        return match std::io::stdin().lock().read_line(&mut line) {
-            Ok(_) => (Some(line.trim_end().to_owned()), None),
-            Err(e) => (None, Some(e.to_string())),
-        };
-    }
-    if let Err(e) = crossterm::terminal::enable_raw_mode() {
-        return (None, Some(e.to_string()));
-    }
-    let answer = read_masked();
-    let _ = crossterm::terminal::disable_raw_mode();
-    println!();
-    answer
+type TerminalPrompt = fn(&str, bool) -> (Option<String>, Option<String>);
+static TERMINAL_PROMPT: OnceLock<TerminalPrompt> = OnceLock::new();
+
+pub fn set_terminal_prompt(prompt: TerminalPrompt) {
+    let _ = TERMINAL_PROMPT.set(prompt);
 }
 
-/// Raw mode hands over bytes, so the answer is gathered as bytes and decoded
-/// once at the end. Taking each one for a char would turn a typed accented
-/// letter into two wrong ones.
-fn read_masked() -> Pair<String> {
-    const BACKSPACE: u8 = 0x7f;
-    const CTRL_C: u8 = 0x03;
-    let mut answer = Vec::new();
-    for byte in std::io::stdin().lock().bytes() {
-        match byte {
-            Ok(b'\r' | b'\n') => break,
-            Ok(CTRL_C) => return (None, Some("cancelled".to_owned())),
-            Ok(BACKSPACE) => {
-                if answer.pop().is_some() {
-                    print!("\u{8} \u{8}");
-                }
-            }
-            Ok(byte) => {
-                answer.push(byte);
-                print!("{SECRET_MASK}");
-            }
-            Err(e) => return (None, Some(e.to_string())),
-        }
-        let _ = std::io::stdout().flush();
+fn read_answer(label: &str, secret: bool) -> Pair<String> {
+    match TERMINAL_PROMPT.get() {
+        Some(prompt) => prompt(label, secret),
+        None => (None, Some("Run terminal login through maki auth".into())),
     }
-    (Some(String::from_utf8_lossy(&answer).into_owned()), None)
 }
 
 fn owned(slugs: &OwnedSlugs, slug: &str) -> LuaResult<()> {
@@ -614,7 +585,7 @@ fn owned(slugs: &OwnedSlugs, slug: &str) -> LuaResult<()> {
 /// @param slug string Provider name.
 /// @return boolean
 #[lua_fn]
-fn is_selected(_lua: &Lua, #[ctx] owner: crate::api::Owner, slug: String) -> LuaResult<bool> {
+fn is_selected(_lua: &Lua, #[ctx] owner: Owner, slug: String) -> LuaResult<bool> {
     Ok(owner.granted_providers.contains(&slug))
 }
 
@@ -783,12 +754,12 @@ fn is_selected(_lua: &Lua, #[ctx] owner: crate::api::Owner, slug: String) -> Lua
 #[lua_fn(guard = Net)]
 fn register(
     lua: &Lua,
-    #[ctx] owner: crate::api::Owner,
+    #[ctx] owner: Owner,
     #[ctx] egress: NetEgress,
     #[ctx] grants: PluginPermissions,
     spec: Table,
 ) -> LuaResult<()> {
-    let crate::api::Owner {
+    let Owner {
         name: plugin,
         authority,
         granted_providers: granted,
@@ -1054,7 +1025,7 @@ lua_table! {
     ///   models = { { prefixes = { "acme-large" }, tier = "strong" } },
     /// })
     /// ```
-    "maki.provider" => pub(crate) fn create_provider_table(perms: &PluginPermissions, owner: crate::api::Owner, egress: NetEgress, grants: PluginPermissions), DOCS [
+    "maki.provider" => pub(crate) fn create_provider_table(perms: &PluginPermissions, owner: Owner, egress: NetEgress, grants: PluginPermissions), DOCS [
         register(perms, owner, egress, grants),
         is_selected(owner),
         http_error,
@@ -1315,13 +1286,17 @@ mod tests {
             _types: PhantomData,
         };
         let host = async {
-            let Ok(Request::CallProviderHook {
+            let Some(CallProviderHook {
                 hook,
                 slot,
                 payload,
                 answer,
                 ..
-            }) = served.recv_async().await
+            }) = served
+                .recv_async()
+                .await
+                .ok()
+                .and_then(Request::into_domain)
             else {
                 panic!("{HOOK_NEVER_CALLED}");
             };
@@ -1492,7 +1467,7 @@ mod tests {
         let table = create_provider_table(
             &lua,
             &PluginPermissions::trusted(),
-            crate::api::Owner {
+            Owner {
                 name: Arc::from(PLUGIN),
                 authority: DeclAuthority::ThirdParty,
                 granted_providers: Arc::from(vec![SLUG_NAME.to_owned()]),

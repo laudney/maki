@@ -7,66 +7,70 @@
 //! waits on every event source at once and wakes the moment a plugin action,
 //! agent event, or keypress arrives instead of sleeping in `event::poll`.
 
+use std::cell::Cell;
 use std::mem;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use arc_swap::{ArcSwap, ArcSwapOption};
 use color_eyre::Result;
-use color_eyre::eyre::{Context, eyre};
+use color_eyre::eyre::eyre;
+use tokio::runtime::Handle;
 
+use crate::EventHandle;
 use crossterm::event::{
     Event, KeyEvent, KeyEventKind, MouseButton, MouseEvent as CtMouseEvent, MouseEventKind,
 };
-use maki_agent::agent::SessionExport;
-use maki_agent::command::CustomCommand;
-use maki_agent::permissions::PermissionManager;
-use maki_agent::session::Resumed;
-use maki_agent::{
-    AgentConfig, AgentEvent, CancelToken, Envelope, McpCommand, McpConfigErrors, McpHandle,
-    SessionMailbox, Transcript, mcp,
-};
+use maki_config::AgentConfig;
 use maki_config::project::TrustQuestion;
-use maki_config::{ModelPolicy, ProjectConfig, UiConfig};
-use maki_lua::agent_autocmd::HostEvent;
-use maki_lua::session_snapshot::{
-    MODE_BUILD, MODE_PLAN, STATUS_IDLE, STATUS_NEEDS_INPUT, STATUS_WORKING, SessionQueueSnapshot,
-    SessionSnapshot,
+use maki_config::{ProjectConfig, UiConfig};
+use maki_lua_core::agent_autocmd::HostEvent;
+use maki_lua_core::pack::{PackCommand, PackContext, PackPreparation};
+use maki_lua_ui::{
+    HintReader, InputMode, InputRequest, InputRulesReader, Key, KeymapReader, LuaCommandReader,
+    ModelRequest, PlanRequest, SessionRequest, TabRef, TaskRequest, UiAction, UiAttachment,
+    UiReply, WinEvent,
 };
-use maki_lua::{
-    EventHandle, HintReader, InputMode, InputRequest, InputRulesReader, Key, KeymapReader,
-    LuaCommandReader, ModelRequest, PackCommand, PackPreparation, PlanRequest, SessionEndReason,
-    SessionRequest, TaskRequest, UiAction, UiAttachment, UiReply, WinEvent,
-};
-use maki_providers::Timeouts;
-use maki_providers::models_cache::{ModelList, fetch_all_models_cached};
-use maki_providers::provider::{Provider, from_model};
-use maki_providers::{Message, Model};
+use maki_types::message::Message;
+use maki_types::thinking::ThinkingConfig;
+
 use maki_storage::StateDir;
-use maki_storage::id::{MakiId, MakiIdParseError, SessionRef};
+use maki_storage::id::{MakiId, MakiIdParseError};
+use maki_storage::input_history::InputHistory;
 use maki_storage::model::persist_model;
 use maki_storage::sessions::normalize_title;
+use maki_types::cancel::CancelToken;
+use maki_types::command::CustomCommand;
+use maki_types::event::{AgentEvent, Envelope, SessionEndReason};
+use maki_types::session_snapshot::{
+    MODE_BUILD, MODE_PLAN, STATUS_IDLE, STATUS_NEEDS_INPUT, STATUS_WORKING,
+};
+use maki_types::transcript::{SessionExport, Transcript};
+use maki_wire::client::ClientEvent;
+use maki_wire::configuration::Key as ConfigurationKey;
+use maki_wire::methods::MODEL_CONFIG_ID;
+use maki_wire::session::SessionOperation;
 use ratatui::backend::Backend;
 use ratatui::layout::Rect;
-use serde_json::json;
-use tokio::runtime::Handle;
-use tokio::task::{JoinHandle, spawn_blocking};
-use tokio_util::task::AbortOnDropHandle;
+use serde_json::{Value, json};
 use tracing::{debug, info, warn};
 
+use crate::agent::capabilities::{AgentBackend, Feature, UNAVAILABLE_REMOTE};
+use crate::agent::remote_facade;
+use crate::agent::remote_settings::Setting;
 use crate::agent::{
-    AgentHandles, ModelSlot, ModelSlots, Respawn,
+    AgentHandles,
     shared_queue::{Compaction, QueueItem, QueuedInput},
 };
+use crate::agent::{RemoteAgent, remote_replay, spawn_remote};
 use crate::app::mode::Mode;
+use crate::app::remote_drafts::RemoteDrafts;
 use crate::app::shell::{ShellEvent, spawn_shell};
 use crate::app::tasks::TaskWatch;
 use crate::app::{App, Msg, Notification, QueuedMessage, SubmitOutcome, turn_response};
 use crate::color_compat;
 use crate::components::input::Submission;
 use crate::components::keybindings::key;
-use crate::components::usage_modal::UsageFetchState;
 use crate::components::{Action, ExitRequest, Status};
 use crate::decor_worker;
 use crate::input::InputReader;
@@ -74,15 +78,17 @@ use crate::repaint::{Dirty, IDLE_POLL};
 use crate::theme;
 use crate::{AppSession, OpenSession};
 
-use crate::storage_writer::StorageWriter;
 use crate::terminal;
 
 /// Max events handled per frame so a flood cannot starve rendering.
 const DRAIN_BUDGET: usize = 256;
 const AGENT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
-const DELETE_FOCUSED_ERR: &str = "cannot delete the focused session";
+
 const NOT_LIVE_ERR: &str = "session not live";
 const PACK_PREPARING: &str = "Checking packages...";
+const LOGIN_DONE: &str = "Logged in: the agent uses it from the next prompt";
+const LOGIN_UNANNOUNCED: &str = "The agent could not be told the login ran";
+const LOGIN_FAILED: &str = "The agent's login did not finish";
 const PACK_BUSY_ERR: &str = "a package command is already running";
 const UNKNOWN_MODE_ERR: &str = "unknown mode; expected \"build\" or \"plan\"";
 const PACK_PANIC_ERR: &str = "the package command stopped unexpectedly";
@@ -98,14 +104,16 @@ pub(crate) struct ShutdownReport {
     /// after dropping the terminal guard, so the line is not lost with the
     /// alternate screen.
     pub unsaved: Vec<MakiId>,
-    /// A result that settled but no run drained yet lives only in its
-    /// session's mailbox. `/reload` carries these over so the next generation
-    /// finds it there instead of reporting the work lost.
-    pub mailboxes: Vec<SessionMailbox>,
 }
 
+pub type AgentFactory = Arc<dyn Fn(&OpenSession) -> Result<RemoteAgent> + Send + Sync>;
+
+pub type PackPreparer = Arc<dyn Fn(&PackCommand, PackContext) -> PackPreparation + Send + Sync>;
+
 pub struct EventLoopParams {
-    pub model: Model,
+    pub agent_factory: Option<AgentFactory>,
+    /// Native maki reviews packages with both runtimes before reloading them.
+    pub prepare_pack: PackPreparer,
     pub needs_login: bool,
     pub commands: Vec<CustomCommand>,
     pub sessions: Vec<OpenSession>,
@@ -118,8 +126,7 @@ pub struct EventLoopParams {
     pub config: AgentConfig,
     pub ui_config: UiConfig,
     pub input_history_size: usize,
-    pub permissions: Arc<PermissionManager>,
-    pub timeouts: Timeouts,
+    pub yolo: bool,
     pub exit_on_done: bool,
     /// How long `exit_on_done` waits for background work, `None` for not at all.
     pub background_wait: Option<Duration>,
@@ -131,14 +138,17 @@ pub struct EventLoopParams {
     pub ui_wake_rx: flume::Receiver<()>,
     pub ui_attachment: UiAttachment,
     pub lua_event_handle: EventHandle,
-    pub model_policy: Arc<ModelPolicy>,
+    pub login_catalog: Option<crate::LoginCatalog>,
     pub project_config: ProjectConfig,
     /// What `/trust` would grant and what the `[restricted]` indicator reports.
     /// `None` when the folder is trusted or has nothing to ask about.
     pub trust_question: Option<TrustQuestion>,
-    /// The mailboxes the generation before handed over, held until this one
-    /// registered its own.
-    pub handed_over: Vec<SessionMailbox>,
+    /// Where `/trust` records its grant: {storage} in maki, the user's own
+    /// store in a client, whose {storage} is scratch.
+    pub trust_store: StateDir,
+    /// The first tab's agent runs elsewhere over this connection. No local
+    /// provider, MCP server or session store serves it.
+    pub remote: Option<RemoteAgent>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -355,6 +365,60 @@ fn parse_session_id(id: &str) -> Result<MakiId, String> {
     id.parse().map_err(|e: MakiIdParseError| e.to_string())
 }
 
+/// A remote tab answers to its agent's session id, which is tried before
+/// {id} is read as a local one. `Ok(Err(id))` is a local id no tab has open.
+fn find_tab(sessions: &[SessionRuntime], id: &str) -> Result<Result<usize, MakiId>, String> {
+    if let Some(idx) = sessions
+        .iter()
+        .position(|rt| rt.app.remote_session_id().as_deref() == Some(id))
+    {
+        return Ok(Ok(idx));
+    }
+    let id = parse_session_id(id)?;
+    Ok(sessions.iter().position(|rt| rt.id() == id).ok_or(id))
+}
+
+/// No session means the focused tab. A session that is open in no tab
+/// has none, and the request should not land on some other tab instead.
+fn tab_of(sessions: &[SessionRuntime], focused: usize, session: Option<&TabRef>) -> Option<usize> {
+    match session {
+        None => Some(focused),
+        Some(TabRef(name)) => find_tab(sessions, name).ok()?.ok(),
+    }
+}
+
+/// A plugin holding the id of a tab that has since closed gets
+/// `session not live` back, so it knows to stop.
+fn resolve_tab(
+    sessions: &[SessionRuntime],
+    focused: usize,
+    id: Option<&str>,
+) -> Result<usize, String> {
+    match id {
+        None => Ok(focused),
+        Some(id) => find_tab(sessions, id)?.map_err(|_| NOT_LIVE_ERR.into()),
+    }
+}
+
+/// Route a plan-surface request to the session it names, or the focused
+/// one when it names none. Plan state is per session, so a plugin woken by a
+/// background tab's `PlanReady` would otherwise read the wrong plan.
+fn plan_reply(sessions: &[SessionRuntime], focused: usize, req: PlanRequest) -> UiReply {
+    let idx = resolve_tab(sessions, focused, req.session.as_deref())?;
+    Ok(sessions[idx].app.plan_snapshot())
+}
+
+/// What a remote tab cannot answer until the agent can be asked for it:
+/// the agent owns its sessions, so the tab speaks only for itself.
+fn remote_refuses(req: &SessionRequest) -> bool {
+    matches!(
+        req,
+        SessionRequest::Delete { .. }
+            | SessionRequest::SetTitle { .. }
+            | SessionRequest::New { .. }
+    )
+}
+
 fn parse_mode(mode: &str) -> Result<Mode, String> {
     match mode {
         MODE_BUILD => Ok(Mode::Build),
@@ -372,16 +436,18 @@ struct SessionRuntime {
     last_title: String,
     last_tasks: TaskWatch,
     notifications: RunNotificationState,
-    /// This session's model and provider, one cell per runtime and never
-    /// shared. The agent loop reads it at the start of every turn, and a
-    /// background tab must not get dragged onto the model another tab just
-    /// picked. Only `apply_model` writes it, on the UI thread.
-    slot: Arc<ArcSwap<ModelSlot>>,
 }
 
 impl SessionRuntime {
     fn id(&self) -> MakiId {
         self.app.state.session.id
+    }
+
+    /// What the facade calls the tab: its agent's session id when remote.
+    fn name(&self) -> String {
+        self.app
+            .remote_session_id()
+            .unwrap_or_else(|| self.id().to_string())
     }
 
     /// New work cancels an `exit_on_done` exit still waiting on its drain.
@@ -391,99 +457,138 @@ impl SessionRuntime {
         }
         self.notifications.reset();
     }
-
-    /// A wake may only start a background run when the session is fully
-    /// quiescent. Idle status alone is not enough: restored queue items start
-    /// runs without `start_run` (the app only learns of them via
-    /// `QueueItemConsumed`), and `start_run` destroys text held for recovery
-    /// after an agent error.
-    fn quiescent(&self) -> bool {
-        SessionStatus::of(&self.app) == SessionStatus::Idle
-            && self.handles.queue.is_empty()
-            && !self.app.holds_recovery_text()
-            && self.app.takes_mailbox_runs()
-    }
 }
 
 /// Everything needed to bring up a new session runtime after startup.
 struct SpawnCtx {
+    agent_factory: Option<AgentFactory>,
+    prepare_pack: PackPreparer,
     storage: StateDir,
     config: AgentConfig,
     ui_config: UiConfig,
     input_history_size: usize,
-    /// Prototype only: every runtime forks its own manager so session rules
-    /// stay per-session. `App::new` then restates the fork from the session's
-    /// meta, so a toggle the prototype never heard about still holds.
-    permissions: Arc<PermissionManager>,
-    timeouts: Timeouts,
+    yolo: bool,
     custom_commands: Arc<[CustomCommand]>,
     lua_command_reader: LuaCommandReader,
     keymap_reader: KeymapReader,
     hint_reader: HintReader,
     input_rules_reader: InputRulesReader,
     lua_event_handle: EventHandle,
-    mcp_handle: Option<McpHandle>,
-    mcp_config_errors: McpConfigErrors,
-    available_models: Arc<ArcSwapOption<ModelList>>,
-    storage_writer: Arc<StorageWriter>,
-    model_policy: Arc<ModelPolicy>,
+    login_catalog: Option<crate::LoginCatalog>,
     trust_question: Option<TrustQuestion>,
+    trust_store: StateDir,
+    /// Taken by the first runtime. A remote connection serves one tab.
+    remote: Cell<Option<RemoteAgent>>,
 }
 
 impl SpawnCtx {
-    fn spawn_runtime(&self, open: OpenSession, slot: Arc<ModelSlot>) -> SessionRuntime {
+    fn spawn_runtime(&self, open: OpenSession) -> Result<SessionRuntime> {
         let session = &open.session;
         let resumed = !session.messages().is_empty();
-        let permissions = Arc::new(self.permissions.fork());
-        let cell = Arc::new(ArcSwap::from(Arc::clone(&slot)));
-        let handles = AgentHandles::spawn(
-            &cell,
-            Resumed {
-                id: SessionRef::from(session.id),
-                history: session.messages().to_vec(),
-                context_size: session.meta.context_size,
-                frame: session.frame().cloned(),
-                // The tab owns the session and persists it through
-                // `StorageWriter`, so the agent only gets the transcript and
-                // the frame it was sent under.
-                session: None,
-            },
-            self.config.clone(),
-            self.ui_config.tool_output_lines,
-            &permissions,
-            self.timeouts,
+        let yolo = self.yolo;
+        let remote = match self.remote.take() {
+            Some(remote) => Some(remote),
+            None => self
+                .agent_factory
+                .as_ref()
+                .map(|open_agent| open_agent(&open))
+                .transpose()?,
+        };
+        let mut remote = remote.ok_or_else(|| eyre!("no agent connection"))?;
+        let input = remote.input.take();
+        let mut snapshot = None;
+        if remote.extensions.sessions {
+            for event in mem::take(&mut remote.early) {
+                match event {
+                    ClientEvent::Restored(session) => snapshot = Some(session),
+                    event => remote.early.push(event),
+                }
+            }
+        }
+        let replay = snapshot.is_none().then(|| {
+            (
+                mem::take(&mut remote.replay),
+                remote.extensions.clone(),
+                remote.unreadable,
+            )
+        });
+        let backend = AgentBackend::Remote {
+            native: self.agent_factory.is_some(),
+            host: remote.extensions.sessions,
+            images: remote.images,
+            plan: remote.plan_modes,
+            settings: remote.extensions.settings,
+            btw: remote.extensions.btw,
+            usage_ledger: remote.extensions.usage_ledger,
+            login: remote.login.is_some() && remote.extensions.login,
+            plan_file: remote.extensions.plan,
+            reload: remote.reload,
+        };
+        let handles = spawn_remote(
+            remote,
+            replay
+                .as_ref()
+                .and_then(|(replay, extensions, _)| remote_replay::seed(replay, extensions)),
+            session.cwd.clone().into(),
             self.lua_event_handle.clone(),
-            self.mcp_handle.clone(),
-            self.mcp_config_errors.clone(),
-            Arc::clone(&self.model_policy),
         );
         let mut app = App::new(
-            &slot.model,
             open,
             self.storage.clone(),
-            Arc::clone(&self.available_models),
-            handles.mcp_reader(),
-            handles.mcp_config_errors.clone(),
+            maki_types::mcp::McpSnapshotReader::empty(),
             self.lua_command_reader.clone(),
             self.keymap_reader.clone(),
             self.hint_reader.clone(),
             self.input_rules_reader.clone(),
-            Arc::clone(&self.storage_writer),
             self.ui_config.clone(),
             self.input_history_size,
-            permissions,
+            yolo,
             Arc::clone(&self.custom_commands),
             self.lua_event_handle.clone(),
-            Arc::clone(&self.model_policy),
+            self.login_catalog.clone(),
         );
         app.trust_question = self.trust_question.clone();
+        app.trust_store = self.trust_store.clone();
+        app.backend = backend;
         handles.apply_to_app(&mut app);
+        app.seed_remote_settings();
+        if let Some(input) = input {
+            let max_entries = app.input_box.history().max_entries();
+            app.input_box
+                .set_history(InputHistory::load_file(input.history, max_entries));
+            app.remote_drafts = Some(RemoteDrafts::new(
+                input.store,
+                handles.remote_link.clone(),
+                input.resumed,
+            ));
+        }
+        if self.agent_factory.is_some() {
+            let meta = &app.state.session.meta;
+            app.remote_drafts = Some(RemoteDrafts::native(
+                maki_storage::remote_drafts::RemoteStore::open(&self.storage, "maki"),
+                handles.remote_link.clone(),
+                maki_storage::remote_drafts::RemoteDraft {
+                    input_draft: meta.input_draft.clone(),
+                    input_draft_writers: meta.input_draft_writers,
+                    queued_messages: Vec::new(),
+                },
+            ));
+        }
         if resumed {
-            app.restore_resumed_session();
+            app.restore_display();
+        }
+        if let Some(snapshot) = snapshot {
+            app.restore_remote_transcript(*snapshot);
+        }
+        if let Some((replay, extensions, unreadable)) = replay {
+            app.draw_remote_replay(replay, &extensions, unreadable);
+        }
+        if let Some(draft) = app.remote_drafts.as_ref().map(RemoteDrafts::restored) {
+            app.restore_remote_input(draft);
         }
         let (shell_tx, shell_rx) = flume::unbounded::<ShellEvent>();
         let last_title = app.state.session.title.clone();
-        SessionRuntime {
+        Ok(SessionRuntime {
             app,
             handles,
             shell_tx,
@@ -492,8 +597,7 @@ impl SpawnCtx {
             last_title,
             last_tasks: TaskWatch::default(),
             notifications: RunNotificationState::default(),
-            slot: cell,
-        }
+        })
     }
 }
 
@@ -508,12 +612,7 @@ pub(crate) struct EventLoop<'t> {
     focus: Focus,
     notifier: Option<terminal::TerminalNotifier>,
     ctx: SpawnCtx,
-    slots: ModelSlots,
     input: InputReader,
-    warn_rx: flume::Receiver<String>,
-    warn_tx: flume::Sender<String>,
-    models_rx: flume::Receiver<()>,
-    models_tx: flume::Sender<()>,
     ui_action_rx: flume::Receiver<UiAction>,
     ui_wake_rx: flume::Receiver<()>,
     ui_attachment: UiAttachment,
@@ -523,7 +622,6 @@ pub(crate) struct EventLoop<'t> {
     /// without this a second `/packupdate` would race the first over the same
     /// clones and locks.
     pack_running: bool,
-    _model_fetch_task: AbortOnDropHandle<()>,
 }
 
 /// One item from any of the event loop's sources; `None` from `next_wake`
@@ -538,63 +636,9 @@ enum Wake {
     /// Nothing to handle either. The tick takes in what the worker finished
     /// for the chat input.
     Decor,
-    Agent(usize, Box<maki_agent::Envelope>),
+    Agent(usize, Box<maki_types::event::Envelope>),
     Shell(usize, ShellEvent),
-    Warn(String),
     Pack(Box<PackPreparation>),
-    ModelsDiscovered,
-}
-
-struct BackgroundModels {
-    available: Arc<ArcSwapOption<ModelList>>,
-    warn_rx: flume::Receiver<String>,
-    warn_tx: flume::Sender<String>,
-    models_rx: flume::Receiver<()>,
-    models_tx: flume::Sender<()>,
-    task: AbortOnDropHandle<()>,
-}
-
-/// The one way discovery starts, so startup and `/models refresh` cannot drift
-/// apart. It only reports that it finished and leaves rebuilding to the UI
-/// thread, over a channel so the loop wakes on it instead of noticing at the
-/// next tick. The channel holds one slot, which collapses overlapping fetches
-/// into a single rebuild.
-fn fetch_models(
-    available: Arc<ArcSwapOption<ModelList>>,
-    policy: Arc<ModelPolicy>,
-    warn_tx: flume::Sender<String>,
-    models_tx: flume::Sender<()>,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        fetch_all_models_cached(&policy, |list, warnings| {
-            for w in warnings {
-                let _ = warn_tx.try_send(w);
-            }
-            available.store(Some(Arc::new(list)));
-        })
-        .await;
-        let _ = models_tx.try_send(());
-    })
-}
-
-fn spawn_model_fetch(policy: Arc<ModelPolicy>) -> BackgroundModels {
-    let available: Arc<ArcSwapOption<ModelList>> = Arc::new(ArcSwapOption::empty());
-    let (warn_tx, warn_rx) = flume::unbounded::<String>();
-    let (models_tx, models_rx) = flume::bounded::<()>(1);
-    let task = AbortOnDropHandle::new(fetch_models(
-        Arc::clone(&available),
-        policy,
-        warn_tx.clone(),
-        models_tx.clone(),
-    ));
-    BackgroundModels {
-        available,
-        warn_rx,
-        warn_tx,
-        models_rx,
-        models_tx,
-        task,
-    }
 }
 
 impl<'t> EventLoop<'t> {
@@ -603,7 +647,6 @@ impl<'t> EventLoop<'t> {
         params: EventLoopParams,
     ) -> Result<Self> {
         let EventLoopParams {
-            mut model,
             needs_login,
             commands,
             sessions,
@@ -615,8 +658,7 @@ impl<'t> EventLoop<'t> {
             config,
             ui_config,
             input_history_size,
-            permissions,
-            timeouts,
+            yolo,
             exit_on_done,
             background_wait,
             lua_command_reader,
@@ -627,10 +669,13 @@ impl<'t> EventLoop<'t> {
             ui_wake_rx,
             ui_attachment,
             lua_event_handle,
-            model_policy,
-            project_config,
+            login_catalog,
+            project_config: _,
             trust_question,
-            handed_over,
+            trust_store,
+            remote,
+            agent_factory,
+            prepare_pack,
         } = params;
         // A `/reload` generation inherits the handles of the one before it,
         // so every loop has to claim the UI back for itself.
@@ -655,59 +700,31 @@ impl<'t> EventLoop<'t> {
             crate::update::spawn_check();
         });
 
-        let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
-        let (mcp_handle, mcp_config_errors) =
-            Handle::current().block_on(mcp::start(&cwd, project_config));
-
-        let provider: Arc<dyn Provider> = if needs_login {
-            Arc::from(maki_providers::provider::from_model_fallback(
-                &mut model, timeouts,
-            ))
-        } else {
-            Arc::from(from_model(&mut model, timeouts).context("create provider")?)
-        };
-        let startup_slot = Arc::new(ModelSlot {
-            model: model.clone(),
-            provider,
-        });
-        let mut slots = ModelSlots::new(startup_slot, Arc::clone(&model_policy), timeouts);
-        let bg = spawn_model_fetch(Arc::clone(&model_policy));
-        let storage_writer = Arc::new(StorageWriter::new(storage.clone(), bg.warn_tx.clone()));
-
         let notifier = terminal::TerminalNotifier::new(ui_config.notifications);
         let ctx = SpawnCtx {
+            agent_factory,
+            prepare_pack,
             storage,
             config,
             ui_config,
             input_history_size,
-            permissions,
-            timeouts,
+            yolo,
             custom_commands: Arc::from(commands),
             lua_command_reader,
             keymap_reader,
             hint_reader,
             input_rules_reader,
             lua_event_handle,
-            mcp_handle,
-            mcp_config_errors,
-            available_models: bg.available,
-            storage_writer,
-            model_policy,
+            login_catalog,
             trust_question,
+            trust_store,
+            remote: Cell::new(remote),
         };
 
         let mut runtimes: Vec<SessionRuntime> = sessions
             .into_iter()
-            .map(|open| {
-                let (slot, reason) = slots.get_or_fallback(&open.session.model);
-                let mut rt = ctx.spawn_runtime(open, slot);
-                if let Some(reason) = reason {
-                    rt.app.flash(reason);
-                }
-                rt
-            })
-            .collect();
-        drop(handed_over);
+            .map(|open| ctx.spawn_runtime(open))
+            .collect::<Result<_>>()?;
         if runtimes.is_empty() {
             return Err(eyre!("event loop needs at least one session"));
         }
@@ -718,10 +735,7 @@ impl<'t> EventLoop<'t> {
         if needs_login {
             app.login_picker.open(app.storage.clone());
         }
-        if !ctx.mcp_config_errors.is_empty() {
-            let msg = format!("MCP config error: {}", ctx.mcp_config_errors);
-            app.queue_flash(msg);
-        }
+
         if let Some(notice) = startup_notice {
             app.queue_flash(notice);
         }
@@ -742,19 +756,13 @@ impl<'t> EventLoop<'t> {
             focus: Focus::default(),
             notifier,
             ctx,
-            slots,
             input: InputReader::spawn(),
-            warn_rx: bg.warn_rx,
-            warn_tx: bg.warn_tx,
-            models_rx: bg.models_rx,
-            models_tx: bg.models_tx,
             ui_action_rx,
             ui_wake_rx,
             ui_attachment,
             pack_tx,
             pack_rx,
             pack_running: false,
-            _model_fetch_task: bg.task,
         })
     }
 
@@ -806,9 +814,6 @@ impl<'t> EventLoop<'t> {
                 Err(e) => break Err(e),
             }
             self.checkpoint_all();
-            for rt in &self.sessions {
-                rt.handles.publish_chat_settings(&rt.app);
-            }
             if dirty.take()
                 && let Err(e) = self.paint()
             {
@@ -823,9 +828,6 @@ impl<'t> EventLoop<'t> {
                 // A result settling since the drain above both clears its
                 // receipt and wakes the session, so the wake is claimed after
                 // the read: its run goes first, and that run's drain exits.
-                if self.sessions[i].app.exit_on_done {
-                    dirty |= self.start_mailbox_runs();
-                }
                 if self.sessions[i].app.exit_request != ExitRequest::None {
                     // A backgrounded session can finish an `exit_on_done` turn.
                     // Focus it so shutdown reports its exit code and id.
@@ -857,7 +859,8 @@ impl<'t> EventLoop<'t> {
         // Fatal errors still save every session, kill MCP process groups,
         // and drain the storage writer before the process exits.
         let report = self.shutdown();
-        result.map(|()| report)
+        result?;
+        report
     }
 
     /// Wait for the next event from any source, or time out so animations
@@ -877,11 +880,8 @@ impl<'t> EventLoop<'t> {
             });
         }
         sel = sel.recv(decor_worker::wakes(), |res| res.ok().map(|()| Wake::Decor));
-        sel = sel.recv(&self.warn_rx, |res| res.ok().map(Wake::Warn));
         sel = sel.recv(&self.pack_rx, |res| res.ok().map(Wake::Pack));
-        sel = sel.recv(&self.models_rx, |res| {
-            res.ok().map(|()| Wake::ModelsDiscovered)
-        });
+
         for (i, rt) in self.sessions.iter().enumerate() {
             if !rt.handles.agent_rx.is_disconnected() {
                 sel = sel.recv(&rt.handles.agent_rx, move |res| {
@@ -903,9 +903,8 @@ impl<'t> EventLoop<'t> {
             Wake::PluginWindow | Wake::Decor => {}
             Wake::Agent(i, envelope) => self.handle_agent(i, envelope),
             Wake::Shell(i, event) => self.sessions[i].app.handle_shell_event(event),
-            Wake::Warn(warning) => self.focused_app().flash(warning),
+
             Wake::Pack(preparation) => self.finish_pack(*preparation),
-            Wake::ModelsDiscovered => self.rebuild_models(),
         }
         Ok(())
     }
@@ -952,7 +951,7 @@ impl<'t> EventLoop<'t> {
         dirty
     }
 
-    fn handle_agent(&mut self, idx: usize, envelope: Box<maki_agent::Envelope>) {
+    fn handle_agent(&mut self, idx: usize, envelope: Box<maki_types::event::Envelope>) {
         let rt = &mut self.sessions[idx];
         let current = is_current_top_level(rt.app.run_id, &envelope);
         match &envelope.event {
@@ -1003,7 +1002,6 @@ impl<'t> EventLoop<'t> {
         self.sessions[self.focused]
             .app
             .announce_mode(&mut self.last_mode);
-        dirty |= self.start_mailbox_runs();
         self.emit_status_changes();
         self.emit_title_changes();
         for rt in &mut self.sessions {
@@ -1011,6 +1009,17 @@ impl<'t> EventLoop<'t> {
         }
         self.emit_task_changes();
         self.emit_notifications();
+        // A remote agent's task ends only when its link does. Its last
+        // events are drained first, so they still reach the transcript.
+        for rt in &mut self.sessions {
+            if rt.app.backend.accepts_prompts()
+                && rt.handles.is_finished()
+                && rt.handles.agent_rx.is_empty()
+            {
+                rt.app.connection_lost();
+                dirty = Dirty::YES;
+            }
+        }
         // An `exit_on_done` exit waits on `QueueDrained`; a dead agent loop
         // can never send it, so fail instead of hanging forever.
         if let Some(runtime) = self.sessions.iter().find(|rt| {
@@ -1049,7 +1058,7 @@ impl<'t> EventLoop<'t> {
                 event_tx,
                 cmd_rx,
             } => {
-                let Some(idx) = self.tab_of(session) else {
+                let Some(idx) = tab_of(&self.sessions, self.focused, session.as_ref()) else {
                     debug!(session = ?session, "open_win for a session open in no tab, closed");
                     let _ = event_tx.try_send(WinEvent::Close);
                     return;
@@ -1063,15 +1072,17 @@ impl<'t> EventLoop<'t> {
             UiAction::Session { req, reply_tx } => {
                 self.handle_session_request(req, reply_tx);
             }
-            UiAction::ExportSession { id, reply_tx } => match self.position(id) {
-                Some(idx) => {
-                    let _ = reply_tx.send(Ok(self.sessions[idx].app.export()));
-                }
-                None => self
-                    .answer_from_disk(id, reply_tx, |session| Ok(SessionExport::stored(session))),
-            },
+            UiAction::ExportSession { id, reply_tx } => {
+                let result = self.sessions[self.focused]
+                    .handles
+                    .remote_link
+                    .request::<AppSession>(|_| SessionOperation::Snapshot {
+                        session_id: id.into(),
+                    });
+                let _ = reply_tx.send(result.map(SessionExport::stored));
+            }
             UiAction::Model { req, reply_tx } => {
-                let _ = reply_tx.send(self.handle_model_request(req));
+                self.handle_remote_model_request(req, reply_tx);
             }
             UiAction::Input { req, reply_tx } => {
                 let (reply, actions) = self.handle_input_request(req);
@@ -1082,7 +1093,7 @@ impl<'t> EventLoop<'t> {
                 let _ = reply_tx.send(self.handle_task_request(req));
             }
             UiAction::Plan { req, reply_tx } => {
-                let _ = reply_tx.send(self.handle_plan_request(req));
+                let _ = reply_tx.send(plan_reply(&self.sessions, self.focused, req));
             }
             UiAction::WinSaveView { reply_tx } => {
                 let _ = reply_tx.send(self.focused_app().win_view());
@@ -1136,36 +1147,29 @@ impl<'t> EventLoop<'t> {
                     }
                 }
             }
-            UiAction::PluginTaskEvent {
-                session,
-                plugin,
-                envelope,
-            } => {
-                // A straggler after `/new` finds no tab and is dropped.
-                if let Some(idx) = self.sessions.iter().position(|rt| rt.id() == session) {
-                    let actions = self.sessions[idx].app.deliver(*envelope, Some(plugin));
-                    self.dispatch(idx, actions);
-                }
-            }
-            UiAction::PluginTaskOpened {
-                session,
-                plugin,
-                info,
-            } => {
-                if let Some(rt) = self.sessions.iter_mut().find(|rt| rt.id() == session) {
-                    rt.app.open_plugin_task(&info, plugin);
-                }
-            }
-            UiAction::PluginTaskEnded { session, id, end } => {
-                if let Some(rt) = self.sessions.iter_mut().find(|rt| rt.id() == session) {
-                    rt.app.end_task(&id, end.into());
-                }
-            }
         }
     }
 
     /// Exits with the editor's status code; `-1` (flashed on the session's
     /// app) when the editor could not be launched.
+    /// The agent's plan, edited as a copy here and saved back at the
+    /// revision it was read at.
+    fn edit_remote_plan(&mut self, idx: usize) {
+        let Some(plan) = self.sessions[idx].handles.remote_plan.clone() else {
+            return;
+        };
+        let read = match plan.read() {
+            Ok(read) => read,
+            Err(error) => return self.sessions[idx].app.flash(error),
+        };
+        let outcome = {
+            let _pause = self.input.pause();
+            plan.edit(read, |copy| terminal::open_in_editor(copy, self.terminal))
+        };
+        self.focus.on_resume();
+        self.sessions[idx].app.flash(outcome);
+    }
+
     fn open_editor(&mut self, idx: usize, path: &std::path::Path) -> i32 {
         let result = {
             let _pause = self.input.pause();
@@ -1182,71 +1186,64 @@ impl<'t> EventLoop<'t> {
     }
 
     fn emit_status_changes(&mut self) {
-        let handle = &self.ctx.lua_event_handle;
         for (i, rt) in self.sessions.iter_mut().enumerate() {
             let status = SessionStatus::of(&rt.app);
             if status == rt.last_status {
                 continue;
             }
             rt.last_status = status;
-            handle.fire(
-                Some(&rt.id()),
-                HostEvent::SessionStatusChanged {
-                    title: &rt.app.state.session.title,
-                    status: status.as_str(),
-                    focused: i == self.focused,
-                },
-            );
+            rt.app.fire_session_event(HostEvent::SessionStatusChanged {
+                title: &rt.app.state.session.title,
+                status: status.as_str(),
+                focused: i == self.focused,
+            });
         }
     }
 
     /// `/rename` and title auto-generation change the title without touching
     /// the status diff above, so the title gets its own diff per frame.
     fn emit_title_changes(&mut self) {
-        let handle = &self.ctx.lua_event_handle;
         for (i, rt) in self.sessions.iter_mut().enumerate() {
             if rt.app.state.session.title == rt.last_title {
                 continue;
             }
             rt.last_title = rt.app.state.session.title.clone();
-            handle.fire(
-                Some(&rt.id()),
-                HostEvent::SessionTitleChanged {
-                    title: &rt.last_title,
-                    focused: i == self.focused,
-                },
-            );
+            rt.app.fire_session_event(HostEvent::SessionTitleChanged {
+                title: &rt.last_title,
+                focused: i == self.focused,
+            });
         }
     }
 
     /// One diff per frame covers every path that finishes, cancels or errors a
     /// chat, so none of them has to remember to fire an event.
     fn emit_task_changes(&mut self) {
-        let handle = &self.ctx.lua_event_handle;
         for rt in &mut self.sessions {
-            let session_id = rt.app.state.session.id;
+            let app = &rt.app;
             rt.last_tasks
-                .diff(session_id, rt.app.task_states(), |task| {
-                    handle.fire(
-                        Some(&session_id),
-                        HostEvent::TaskStatusChanged {
-                            id: task.id,
-                            name: task.name,
-                            status: task.status.into(),
-                            plugin: task.plugin.map(|plugin| &**plugin),
-                        },
-                    );
+                .diff(rt.app.state.session.id, rt.app.task_states(), |task| {
+                    app.fire_session_event(HostEvent::TaskStatusChanged {
+                        id: task.id,
+                        name: task.name,
+                        status: task.status.into(),
+                        plugin: task.plugin.map(|plugin| &**plugin),
+                    });
                 });
         }
     }
 
     /// Called only after the cancel went out, so a handler that checks
     /// `maki.agent.list()` already finds a stopped plugin task gone.
-    fn emit_task_stopped(&self, idx: usize, id: &str, plugin: Option<&str>) {
-        self.ctx.lua_event_handle.fire(
-            Some(&self.sessions[idx].app.state.session.id),
-            HostEvent::TaskStopped { id, plugin },
-        );
+    fn emit_task_stopped(&self, idx: usize, id: &str) {
+        let app = &self.sessions[idx].app;
+        let plugin = app
+            .task_states()
+            .find(|task| &**task.id == id)
+            .and_then(|task| task.plugin);
+        app.fire_session_event(HostEvent::TaskStopped {
+            id,
+            plugin: plugin.map(|plugin| &**plugin),
+        });
     }
 
     fn emit_notifications(&mut self) {
@@ -1288,93 +1285,67 @@ impl<'t> EventLoop<'t> {
         let previous_session = self.last_focus.replace(current.clone()).map(|(id, _)| id);
         let (session_id, task_id) = current;
         let switched = previous_session.is_some() && previous_session != Some(session_id);
-        let eh = &self.ctx.lua_event_handle;
         if previous_session != Some(session_id) {
-            eh.fire(
-                Some(&session_id),
-                HostEvent::SessionFocusChanged {
-                    previous_session_id: previous_session.map(|id| id.to_string()),
-                },
-            );
+            rt.app.fire_session_event(HostEvent::SessionFocusChanged {
+                previous_session_id: previous_session.map(|id| id.to_string()),
+            });
         }
-        eh.fire(
-            Some(&session_id),
-            HostEvent::TaskFocusChanged { id: &task_id },
-        );
+        rt.app
+            .fire_session_event(HostEvent::TaskFocusChanged { id: &task_id });
         if switched {
             self.focused_app().announce_input();
         }
     }
 
-    fn start_mailbox_runs(&mut self) -> Dirty {
-        let ready: Vec<_> = self
-            .sessions
-            .iter()
-            .enumerate()
-            .filter_map(|(index, runtime)| {
-                if !runtime.quiescent() {
-                    return None;
-                }
-                let preamble = runtime.handles.claim_mailbox_wake();
-                (!preamble.is_empty()).then_some((index, preamble))
-            })
-            .collect();
-
-        let dirty = Dirty::from(!ready.is_empty());
-        for (index, preamble) in ready {
-            let actions = self.sessions[index].app.start_mailbox_run(preamble);
-            self.dispatch(index, actions);
-        }
-        dirty
-    }
-
     /// `List` replies from a background task (the scan can be slow); every
     /// other request is answered synchronously by the event loop, which owns
-    /// the live runtimes.
+    /// the live runtimes. A remote tab's agent owns its sessions, so a remote
+    /// tab lists the agent's and answers only for itself.
     fn handle_session_request(&mut self, req: SessionRequest, reply_tx: flume::Sender<UiReply>) {
         match req {
-            SessionRequest::List => {
-                let storage = self.ctx.storage.clone();
-                spawn_blocking(move || {
-                    let cwd = std::env::current_dir().unwrap_or_default();
-                    let reply = AppSession::list(&cwd.to_string_lossy(), &storage)
-                        .map_err(|e| e.to_string())
-                        .and_then(|list| serde_json::to_value(list).map_err(|e| e.to_string()));
-                    let _ = reply_tx.send(reply);
-                });
+            SessionRequest::List => self.list_remote_sessions(reply_tx),
+            SessionRequest::Read { id } => {
+                let result = self.sessions[self.focused]
+                    .handles
+                    .remote_link
+                    .request::<serde_json::Value>(|current| SessionOperation::Read {
+                        session_id: id.map(Into::into).unwrap_or(current),
+                    });
+                let _ = reply_tx.send(result);
             }
-            // Deletes run on the storage writer thread after any queued
-            // flushes, so the loop never blocks on disk and a queued save
-            // cannot resurrect the files.
-            SessionRequest::Delete { id } => {
-                let id = match parse_session_id(&id) {
-                    Ok(id) => id,
-                    Err(e) => {
-                        let _ = reply_tx.send(Err(e));
-                        return;
-                    }
-                };
-                let mut claim = None;
-                if let Some(i) = self.position(id) {
-                    if i == self.focused {
-                        let _ = reply_tx.send(Err(DELETE_FOCUSED_ERR.into()));
-                        return;
-                    }
-                    let rt = self.remove_runtime(i);
-                    self.ctx
-                        .lua_event_handle
-                        .end_session(rt.id(), SessionEndReason::Delete);
-                    rt.handles.cancel_all();
-                    claim = Some(rt.app.state.claim.clone());
+            SessionRequest::SetTitle { id, title } => {
+                let result = self.sessions[self.focused]
+                    .handles
+                    .remote_link
+                    .request::<serde_json::Value>(|_| SessionOperation::SetTitle {
+                        session_id: id.clone().into(),
+                        title: title.clone(),
+                    });
+                if result.is_ok()
+                    && let Some(rt) = self.sessions.iter_mut().find(|rt| rt.name() == id)
+                {
+                    rt.app
+                        .state
+                        .session_mut()
+                        .set_title(normalize_title(&title));
                 }
-                self.ctx.storage_writer.delete(id, claim, move |res| {
-                    let reply = match res {
-                        Ok(()) => Ok(json!(true)),
-                        Err(e) if e.is_not_found() => Ok(json!(true)),
-                        Err(e) => Err(e.to_string()),
-                    };
-                    let _ = reply_tx.send(reply);
-                });
+                let _ = reply_tx.send(result);
+            }
+            SessionRequest::Delete { id } => {
+                let result = if self.sessions.iter().any(|rt| rt.name() == id) {
+                    Err("Close the session tab before deleting it".into())
+                } else {
+                    self.sessions[self.focused]
+                        .handles
+                        .remote_link
+                        .request::<serde_json::Value>(|_| SessionOperation::Delete {
+                            session_id: id.into(),
+                        })
+                };
+                let _ = reply_tx.send(result);
+            }
+            req if self.ctx.agent_factory.is_none() && remote_refuses(&req) => {
+                let _ = reply_tx.send(Err(UNAVAILABLE_REMOTE.into()));
             }
             SessionRequest::Live => {
                 let list: Vec<_> = self
@@ -1383,7 +1354,7 @@ impl<'t> EventLoop<'t> {
                     .enumerate()
                     .map(|(i, rt)| {
                         json!({
-                            "id": rt.id(),
+                            "id": rt.name(),
                             "title": rt.app.state.session.title,
                             "status": SessionStatus::of(&rt.app).as_str(),
                             "updated_at": rt.app.state.session.updated_at,
@@ -1394,30 +1365,7 @@ impl<'t> EventLoop<'t> {
                 let _ = reply_tx.send(Ok(json!(list)));
             }
             SessionRequest::Current => {
-                let _ = reply_tx.send(Ok(json!(self.sessions[self.focused].id())));
-            }
-            // A stored session is read from disk, off the loop like `List`.
-            SessionRequest::Read { id } => {
-                let id = match id.as_deref().map(parse_session_id).transpose() {
-                    Ok(id) => id,
-                    Err(e) => {
-                        let _ = reply_tx.send(Err(e));
-                        return;
-                    }
-                };
-                let live = match id {
-                    None => Ok(self.focused),
-                    Some(id) => self.position(id).ok_or(id),
-                };
-                match live {
-                    Ok(idx) => {
-                        let _ = reply_tx.send(Ok(self.session_snapshot_json(idx)));
-                    }
-                    Err(id) => self.answer_from_disk(id, reply_tx, |session| {
-                        serde_json::to_value(SessionSnapshot::stored(&session))
-                            .map_err(|e| e.to_string())
-                    }),
-                }
+                let _ = reply_tx.send(Ok(json!(self.sessions[self.focused].name())));
             }
             SessionRequest::New {
                 transcript,
@@ -1427,47 +1375,51 @@ impl<'t> EventLoop<'t> {
             SessionRequest::Prompt { id, text } => {
                 let idx = match id {
                     None => Ok(self.focused),
-                    Some(id) => parse_session_id(&id).and_then(|id| {
-                        self.position(id)
-                            .ok_or_else(|| format!("{NOT_LIVE_ERR}: {id}"))
-                    }),
+                    Some(id) => find_tab(&self.sessions, &id)
+                        .and_then(|tab| tab.map_err(|closed| format!("{NOT_LIVE_ERR}: {closed}"))),
                 };
                 let _ = reply_tx.send(idx.and_then(|idx| self.submit_text(idx, text)));
             }
             SessionRequest::Focus { id } => {
-                let reply = parse_session_id(&id)
-                    .and_then(|id| self.focus_session(id))
-                    .map(|()| json!(true));
-                let _ = reply_tx.send(reply);
+                let reply = match find_tab(&self.sessions, &id) {
+                    Ok(Ok(idx)) => {
+                        self.set_focused(idx);
+                        Ok(())
+                    }
+                    _ if self.ctx.agent_factory.is_none() => Err(UNAVAILABLE_REMOTE.into()),
+                    Ok(Err(id)) => self.focus_session(id),
+                    Err(e) => Err(e),
+                };
+                let _ = reply_tx.send(reply.map(|()| json!(true)));
             }
             // Resolved by id like the rest: a plan form row asking for build
             // mode fires for the session whose plan landed, which may be in
             // the background.
             SessionRequest::SetMode { id, mode } => {
                 let reply = parse_mode(&mode).and_then(|mode| {
-                    let idx = self.resolve_session_index(id.as_deref())?;
+                    let idx = resolve_tab(&self.sessions, self.focused, id.as_deref())?;
                     self.sessions[idx].app.set_mode(mode);
                     Ok(json!(true))
                 });
                 let _ = reply_tx.send(reply);
             }
-            SessionRequest::SetTitle { id, title } => {
-                let title = normalize_title(&title);
-                let reply = (|| {
-                    let id = parse_session_id(&id)?;
-                    if let Some(i) = self.position(id) {
-                        self.sessions[i].app.state.session_mut().set_title(title);
-                    } else {
-                        let OpenSession { mut session, claim } =
-                            OpenSession::load(id, &self.ctx.storage).map_err(|e| e.to_string())?;
-                        session.set_title(title);
-                        self.ctx.storage_writer.send(Arc::new(session), claim);
-                    }
-                    Ok(json!(true))
-                })();
-                let _ = reply_tx.send(reply);
-            }
         }
+    }
+
+    /// Every page of the agent's sessions, off the loop like a local list.
+    fn list_remote_sessions(&self, reply_tx: flume::Sender<UiReply>) {
+        let rt = &self.sessions[self.focused];
+        let Some(link) = &rt.app.remote_link else {
+            let _ = reply_tx.send(Err(UNAVAILABLE_REMOTE.into()));
+            return;
+        };
+        let list = remote_facade::list_sessions(
+            Arc::clone(&link.client),
+            rt.app.state.session.cwd.clone().into(),
+        );
+        tokio::spawn(async move {
+            let _ = reply_tx.send(list.await);
+        });
     }
 
     /// The input a plugin reads and writes is the focused session's.
@@ -1502,48 +1454,47 @@ impl<'t> EventLoop<'t> {
         self.terminal.size().map(Rect::from).unwrap_or_default()
     }
 
-    /// Lua acts on the focused session, the same target the model picker
-    /// writes to.
-    fn handle_model_request(&mut self, req: ModelRequest) -> UiReply {
-        match req {
-            ModelRequest::Get => Ok(self.focused_app().model_state()),
-            ModelRequest::Available => {
-                let available = self.ctx.available_models.load();
-                Ok(json!(
-                    available
-                        .as_deref()
-                        .map(|list| list.specs.as_slice())
-                        .unwrap_or(&[])
-                ))
-            }
+    /// The focused remote tab's agent owns its model and settings, so the
+    /// menus it published answer, and a change waits for the agent's answer
+    /// off the loop. Its models are opaque values the next prompt switches
+    /// to, so a spec is not taken here.
+    fn handle_remote_model_request(&mut self, req: ModelRequest, reply_tx: flume::Sender<UiReply>) {
+        let app = &self.sessions[self.focused].app;
+        let settings = app.remote_settings.as_ref();
+        let takes_settings = app.backend.takes_settings();
+        let set = match req {
+            ModelRequest::Get => Ok(app.model_state()),
+            ModelRequest::Available => Ok(remote_facade::model_choices(settings)),
+            ModelRequest::Set { spec: Some(_), .. } => Err(UNAVAILABLE_REMOTE.into()),
             ModelRequest::Set {
-                spec,
+                spec: None,
                 thinking,
                 fast,
             } => {
-                if let Some(spec) = spec {
-                    self.change_model(&spec)?;
+                let thinking = thinking
+                    .map(|input| {
+                        ThinkingConfig::parse(input.trim(), app.state.thinking)
+                            .map(|parsed| (Setting::Thinking, Value::String(parsed.to_string())))
+                            .map_err(str::to_owned)
+                    })
+                    .transpose();
+                let fast = fast.map(|on| (Setting::Fast, Value::Bool(on)));
+                let changed = thinking.and_then(|thinking| {
+                    let changes = thinking.into_iter().chain(fast).collect();
+                    remote_facade::set_settings(settings, takes_settings, changes)
+                });
+                match changed {
+                    Ok(answered) => {
+                        tokio::spawn(async move {
+                            let _ = reply_tx.send(answered.await);
+                        });
+                        return;
+                    }
+                    Err(e) => Err(e),
                 }
-                let app = self.focused_app();
-                if let Some(thinking) = thinking {
-                    app.set_thinking(&thinking)?;
-                }
-                if let Some(fast) = fast {
-                    app.set_fast(fast)?;
-                }
-                Ok(app.model_state())
             }
-        }
-    }
-
-    /// Route a plan-surface request to the session it names, or the focused
-    /// one when it names none. Plan state is per session, so a plugin woken
-    /// by a background tab's `PlanReady` would otherwise read the wrong plan.
-    fn handle_plan_request(&mut self, req: PlanRequest) -> UiReply {
-        let idx = self.resolve_session_index(req.session())?;
-        match req {
-            PlanRequest::Read { .. } => Ok(self.sessions[idx].app.plan_snapshot()),
-        }
+        };
+        let _ = reply_tx.send(set);
     }
 
     fn handle_task_request(&mut self, req: TaskRequest) -> UiReply {
@@ -1584,34 +1535,52 @@ impl<'t> EventLoop<'t> {
         focus: bool,
         reply_tx: flume::Sender<UiReply>,
     ) {
-        let inherits_model = transcript.model.is_none();
-        let open = match self.sessions[self.focused].app.session_from(transcript) {
+        if !self.focused_backend().supports(Feature::Sessions) {
+            let _ = reply_tx.send(Err(UNAVAILABLE_REMOTE.into()));
+            return;
+        }
+        let imported = self.sessions[self.focused]
+            .app
+            .remote_link
+            .as_ref()
+            .ok_or_else(|| UNAVAILABLE_REMOTE.to_owned())
+            .and_then(|link| {
+                link.request::<serde_json::Value>(|parent| SessionOperation::Import {
+                    parent,
+                    transcript: Box::new(transcript),
+                })
+            })
+            .and_then(|reply| {
+                reply["sessionId"]
+                    .as_str()
+                    .ok_or("missing session id".to_owned())?
+                    .parse::<MakiId>()
+                    .map_err(|error| error.to_string())
+            })
+            .and_then(|id| {
+                OpenSession::load(id, &self.ctx.storage).map_err(|error| error.to_string())
+            });
+        let open = match imported {
             Ok(open) => open,
-            Err(e) => {
-                let _ = reply_tx.send(Err(e));
+            Err(error) => {
+                let _ = reply_tx.send(Err(error));
                 return;
             }
         };
         if prompt.is_none() && !focus {
-            let storage = self.ctx.storage.clone();
-            spawn_blocking(move || {
-                let reply = open.store(&storage).map(|id| json!(id));
-                let _ = reply_tx.send(reply.map_err(|e| e.to_string()));
-            });
+            let _ = reply_tx.send(Ok(json!(open.session.id)));
             return;
         }
-        // An inherited model's slot is already built and sitting right here.
-        let (slot, fallback) = if inherits_model {
-            (self.sessions[self.focused].slot.load_full(), None)
-        } else {
-            self.slots.get_or_fallback(&open.session.model)
+        let runtime = match self.ctx.spawn_runtime(open) {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                let _ = reply_tx.send(Err(error.to_string()));
+                return;
+            }
         };
-        let idx = self.push_runtime(self.ctx.spawn_runtime(open, slot));
+        let idx = self.push_runtime(runtime);
         let id = self.sessions[idx].id();
         maki_otel::emit::session_started(maki_otel::emit::START_FRESH, Some(&id.to_string()));
-        if let Some(reason) = fallback {
-            self.sessions[idx].app.flash(reason);
-        }
         if let Some(prompt) = prompt {
             let _ = self.submit_text(idx, prompt);
         }
@@ -1621,84 +1590,23 @@ impl<'t> EventLoop<'t> {
         let _ = reply_tx.send(Ok(json!(id)));
     }
 
-    /// Reads a session no tab has open off the loop, without claiming it, so
-    /// one another maki holds still answers.
-    fn answer_from_disk<T: Send + 'static>(
-        &self,
-        id: MakiId,
-        reply_tx: flume::Sender<Result<T, String>>,
-        answer: impl FnOnce(AppSession) -> Result<T, String> + Send + 'static,
-    ) {
-        let storage = self.ctx.storage.clone();
-        spawn_blocking(move || {
-            let reply = AppSession::read_only(id, &storage)
-                .map_err(|e| e.to_string())
-                .and_then(answer);
-            let _ = reply_tx.send(reply);
-        });
+    fn focused_backend(&self) -> AgentBackend {
+        self.sessions[self.focused].app.backend
+    }
+
+    /// A remote runtime owns its one connection for the life of the tab, so
+    /// it is never respawned and nothing forks or loads into it.
+    fn refuses_sessions(&mut self, idx: usize) -> bool {
+        let app = &mut self.sessions[idx].app;
+        if app.backend.supports(Feature::Sessions) {
+            return false;
+        }
+        app.flash(UNAVAILABLE_REMOTE.into());
+        true
     }
 
     fn position(&self, id: MakiId) -> Option<usize> {
         self.sessions.iter().position(|rt| rt.id() == id)
-    }
-
-    /// No session means the focused tab. A session that is open in no tab
-    /// has none, and the request should not land on some other tab instead.
-    fn tab_of(&self, session: Option<MakiId>) -> Option<usize> {
-        match session {
-            None => Some(self.focused),
-            Some(id) => self.position(id),
-        }
-    }
-
-    /// A plugin holding the id of a tab that has since closed gets
-    /// `session not live` back, so it knows to stop.
-    fn resolve_session_index(&self, id: Option<&str>) -> Result<usize, String> {
-        let session = id.map(parse_session_id).transpose()?;
-        self.tab_of(session).ok_or_else(|| NOT_LIVE_ERR.into())
-    }
-
-    /// The totals live on the session, so a plugin that reloads mid run keeps
-    /// the accounting it would lose by summing `TurnEnd` payloads itself.
-    fn session_snapshot_json(&self, idx: usize) -> serde_json::Value {
-        let rt = &self.sessions[idx];
-        let app = &rt.app;
-        let snapshot = SessionSnapshot {
-            id: rt.id().to_string(),
-            cwd: app.state.session.cwd.clone(),
-            title: Some(app.state.session.title.clone()),
-            model: app.state.model.spec(),
-            mode: if app.state.mode == Mode::Plan {
-                MODE_PLAN
-            } else {
-                MODE_BUILD
-            },
-            thinking: Some(app.state.thinking.to_string()),
-            fast: Some(app.state.fast),
-            status: SessionStatus::of(app).as_str(),
-            focused: idx == self.focused,
-            updated_at: app.state.session.updated_at,
-            queue: Some(SessionQueueSnapshot {
-                count: app.queue.text_messages().len(),
-            }),
-            usage: app.state.token_usage,
-            context_size: app.state.context_size,
-            context_window: Some(app.state.model.context_window),
-            cost: app.state.cost,
-        };
-        json!(snapshot)
-    }
-
-    /// The single place that removes a runtime: keeps `focused` pointing at
-    /// the same session afterwards. The focused runtime itself is never
-    /// removable, so `sessions` stays non-empty.
-    fn remove_runtime(&mut self, idx: usize) -> SessionRuntime {
-        debug_assert_ne!(idx, self.focused);
-        let rt = self.sessions.remove(idx);
-        if idx < self.focused {
-            self.focused -= 1;
-        }
-        rt
     }
 
     /// The single place the focused tab changes. Keys held behind a key
@@ -1729,25 +1637,25 @@ impl<'t> EventLoop<'t> {
             self.set_focused(i);
             return Ok(());
         }
+        if !self.focused_backend().supports(Feature::Sessions) {
+            return Err(UNAVAILABLE_REMOTE.into());
+        }
         // A session another maki owns is refused here, where it costs a flash,
         // rather than at the first write, after a whole conversation.
         let open = OpenSession::load(id, &self.ctx.storage)
             .map_err(|e| format!("Failed to load session: {e}"))?;
-        let (slot, reason) = self.slots.get_or_fallback(&open.session.model);
         let focused = &self.sessions[self.focused];
         if SessionStatus::of(&focused.app) == SessionStatus::Idle && focused.app.is_blank() {
             let idx = self.focused;
-            let history = self.sessions[idx]
-                .app
-                .apply_loaded_session(open, &slot.model);
-            self.apply_model(idx, slot);
-            self.respawn_agent(idx, history, Respawn::Load);
+            self.sessions[idx].app.apply_loaded_session(open);
+            self.respawn_agent(idx, SessionEndReason::Load);
         } else {
-            let idx = self.push_runtime(self.ctx.spawn_runtime(open, slot));
+            let idx = self.push_runtime(
+                self.ctx
+                    .spawn_runtime(open)
+                    .map_err(|error| error.to_string())?,
+            );
             self.set_focused(idx);
-        }
-        if let Some(reason) = reason {
-            self.focused_app().flash(reason);
         }
         Ok(())
     }
@@ -1892,54 +1800,49 @@ impl<'t> EventLoop<'t> {
         }
     }
 
-    /// The only writer of a runtime's model, so the cell the agent reads, the
-    /// app that draws and persists it and the per provider usage panel all move
-    /// together. Spread over callers, one of them always forgets a piece.
-    fn apply_model(&mut self, idx: usize, slot: Arc<ModelSlot>) {
-        let rt = &mut self.sessions[idx];
-        rt.app.state.update_model(&slot.model);
-        rt.app.usage_slot.store(None);
-        rt.slot.store(slot);
-    }
-
-    /// Discovery landed or a provider was re-authenticated. Invalidating alone
-    /// would leave the tabs on stale providers, so dropping the built slots and
-    /// putting every session back on its own spec is a single step. The cache
-    /// in `ModelSlots` keeps that to one build per spec.
-    fn rebuild_models(&mut self) {
-        self.slots.invalidate();
-        for idx in 0..self.sessions.len() {
-            let spec = self.sessions[idx].app.state.model.spec();
-            match self.slots.try_get(&spec) {
-                Ok(slot) => self.apply_model(idx, slot),
-                Err(error) => warn!(%spec, %error, "keeping the previous model"),
+    fn respawn_agent(&mut self, idx: usize, reason: SessionEndReason) {
+        if self.ctx.agent_factory.is_some() {
+            if let Some(link) = &self.sessions[idx].app.remote_link
+                && let Err(error) =
+                    link.request::<serde_json::Value>(|session_id| SessionOperation::Close {
+                        session_id,
+                        reason: Some(reason),
+                    })
+            {
+                self.sessions[idx].app.flash(error);
+                return;
             }
+            let rt = &self.sessions[idx];
+            let open = OpenSession {
+                session: (*rt.app.state.session).clone(),
+                claim: rt.app.state.claim.clone(),
+            };
+            match self.ctx.spawn_runtime(open) {
+                Ok(next) => {
+                    let old = mem::replace(&mut self.sessions[idx], next);
+                    old.handles.cancel_all();
+                }
+                Err(error) => self.sessions[idx].app.flash(error.to_string()),
+            }
+        } else {
+            let rt = &mut self.sessions[idx];
+            rt.reset_run_notifications();
+            rt.handles.rebind(&mut rt.app);
         }
     }
 
-    fn respawn_agent(&mut self, idx: usize, history: Vec<Message>, reason: Respawn) {
-        let rt = &mut self.sessions[idx];
-        rt.reset_run_notifications();
-        let lua_handle = rt.app.lua_event_handle.clone();
-        let permissions = Arc::clone(&rt.app.permissions);
-        let slot = Arc::clone(&rt.slot);
-        rt.handles.respawn(
-            history,
-            &slot,
-            self.ctx.config.clone(),
-            self.ctx.ui_config.tool_output_lines,
-            &permissions,
-            &mut rt.app,
-            lua_handle,
-            reason,
-        );
-    }
-
-    /// The fork runs on the model of the session it came from, whose slot is
-    /// already built.
     fn open_fork(&mut self, idx: usize, open: OpenSession) {
-        let slot = self.sessions[idx].slot.load_full();
-        let fork = self.push_runtime(self.ctx.spawn_runtime(open, slot));
+        if self.refuses_sessions(idx) {
+            return;
+        }
+        let runtime = match self.ctx.spawn_runtime(open) {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                self.sessions[idx].app.flash(error.to_string());
+                return;
+            }
+        };
+        let fork = self.push_runtime(runtime);
         self.set_focused(fork);
         let id = self.sessions[self.focused].id();
         maki_otel::emit::session_started(maki_otel::emit::START_FRESH, Some(&id.to_string()));
@@ -1971,13 +1874,37 @@ impl<'t> EventLoop<'t> {
                 self.sessions[idx]
                     .handles
                     .cancel_subagent(tool_use_id.clone());
-                self.emit_task_stopped(idx, &tool_use_id, None);
+                self.emit_task_stopped(idx, &tool_use_id);
             }
-            Action::CancelPluginTask { id, plugin } => {
-                self.ctx.lua_event_handle.cancel_plugin_session(&id);
-                self.emit_task_stopped(idx, &id, Some(&plugin));
+            Action::CancelPluginTask { id, .. } => {
+                if let Err(error) =
+                    self.sessions[idx]
+                        .handles
+                        .remote_link
+                        .request::<bool>(|session_id| SessionOperation::StopPluginTask {
+                            session_id,
+                            id: id.clone(),
+                        })
+                {
+                    self.sessions[idx].app.flash(error);
+                    return;
+                }
+                self.emit_task_stopped(idx, &id);
             }
-            Action::RestartAgent(history) => self.respawn_agent(idx, history, Respawn::Restart),
+            Action::RestartAgent => self.respawn_agent(idx, SessionEndReason::Reset),
+            Action::Rewind(entry) => {
+                let rt = &mut self.sessions[idx];
+                rt.app.queue.clear();
+                rt.handles.cancel_run(rt.app.run_id);
+                match rt
+                    .handles
+                    .remote_link
+                    .rewind(entry.turn_index, entry.prompt_text.clone())
+                {
+                    Ok(snapshot) => rt.app.finish_remote_rewind(snapshot, entry),
+                    Err(error) => rt.app.flash(error),
+                }
+            }
             Action::OpenFork(open) => self.open_fork(idx, *open),
             Action::ChangeModel(spec) => {
                 if let Err(e) = self.change_model(&spec) {
@@ -1985,12 +1912,6 @@ impl<'t> EventLoop<'t> {
                 }
             }
             Action::RefreshProvider { slug } => self.refresh_provider(slug),
-            Action::AssignTier(spec, tier) => {
-                maki_providers::model_registry::set_and_persist(spec, tier, &self.ctx.storage);
-            }
-            Action::UnassignTier(spec, tier) => {
-                maki_providers::model_registry::unset_and_persist(&spec, tier, &self.ctx.storage);
-            }
             Action::Compact(instructions) => {
                 let rt = &mut self.sessions[idx];
                 rt.reset_run_notifications();
@@ -2003,10 +1924,9 @@ impl<'t> EventLoop<'t> {
                 }));
             }
             Action::ToggleMcp(server_name, enabled) => {
-                self.sessions[idx].handles.send_mcp(McpCommand::Toggle {
-                    server: server_name,
-                    enabled,
-                });
+                if let Err(error) = self.sessions[idx].handles.send_mcp(server_name, enabled) {
+                    self.sessions[idx].app.flash(error);
+                }
             }
             Action::ShellCommand {
                 id,
@@ -2041,13 +1961,14 @@ impl<'t> EventLoop<'t> {
                     Err(e) => self.sessions[idx].app.flash(e),
                 }
             }
+            Action::RemoteLogin => self.remote_login(idx),
+            Action::EditRemotePlan => self.edit_remote_plan(idx),
             Action::Btw(question) => {
-                let slot = self.sessions[idx].slot.load_full();
-                self.sessions[idx].app.start_btw(
-                    question,
-                    Arc::clone(&slot.provider),
-                    slot.model.clone(),
-                );
+                let rt = &mut self.sessions[idx];
+                match rt.handles.remote_btw.clone() {
+                    Some(remote) => rt.app.start_remote_btw(question, remote),
+                    None => rt.app.flash(UNAVAILABLE_REMOTE.into()),
+                }
             }
             Action::PreparePack(command) => self.start_pack(idx, command),
             Action::Suspend => {
@@ -2055,7 +1976,6 @@ impl<'t> EventLoop<'t> {
                 terminal::suspend(self.terminal);
                 self.focus.on_resume();
             }
-            Action::RefreshModels => self.refresh_models(),
             Action::RefreshUsage => self.refresh_usage(),
             Action::ManualExit => self.sessions[idx].notifications.on_manual_exit(),
         }
@@ -2064,12 +1984,27 @@ impl<'t> EventLoop<'t> {
     /// The one explicit pick, which is why it alone writes the last-used file.
     /// Opening an old session must not change what the next `maki` starts on.
     fn change_model(&mut self, spec: &str) -> Result<(), String> {
-        let slot = self.slots.try_get(spec)?;
-        let picked = slot.model.spec();
-        let idx = self.focused;
-        self.apply_model(idx, slot);
-        self.sessions[idx].app.record_recent_model(spec);
-        persist_model(&self.ctx.storage, &picked);
+        let app = &self.sessions[self.focused].app;
+        if self.ctx.agent_factory.is_some()
+            && let (Some(link), Some(configuration)) = (&app.remote_link, &app.remote_settings)
+        {
+            let key = ConfigurationKey::Option(MODEL_CONFIG_ID.into());
+            let change = configuration.lock().desire(key, json!(spec), false);
+            let answer = tokio::runtime::Handle::current()
+                .block_on(
+                    link.client
+                        .configure(change.key.clone(), change.value.clone()),
+                )
+                .map_err(|error| error.to_string());
+            let mut core = configuration.lock();
+            let (result, _) = core.confirm(&change, answer);
+            configuration.refresh(&core);
+            result?;
+        }
+        let app = self.focused_app();
+        app.state.session_mut().set_model(spec.to_owned());
+        app.record_recent_model(spec);
+        persist_model(&self.ctx.storage, spec);
         Ok(())
     }
 
@@ -2086,6 +2021,7 @@ impl<'t> EventLoop<'t> {
         self.pack_running = true;
         self.sessions[idx].app.flash(PACK_PREPARING.to_owned());
         let handle = self.ctx.lua_event_handle.clone();
+        let prepare = self.ctx.prepare_pack.clone();
         let tx = self.pack_tx.clone();
         let runtime = Handle::current();
         std::thread::spawn(move || {
@@ -2093,11 +2029,12 @@ impl<'t> EventLoop<'t> {
             // Without this a panic drops the sender with no answer, and
             // `pack_running` stays set for the rest of the process, so every
             // later package command reports "already running".
-            let preparation = catch_unwind(AssertUnwindSafe(|| match handle.package_context() {
-                Ok(context) => maki_lua::prepare_pack_command(&command, &context),
-                Err(error) => PackPreparation::failed(error),
-            }))
-            .unwrap_or_else(|_| PackPreparation::failed(PACK_PANIC_ERR.to_owned()));
+            let preparation =
+                catch_unwind(AssertUnwindSafe(|| match handle.core.package_context() {
+                    Ok(context) => prepare(&command, context),
+                    Err(error) => PackPreparation::failed(error),
+                }))
+                .unwrap_or_else(|_| PackPreparation::failed(PACK_PANIC_ERR.to_owned()));
             let _ = tx.send(Box::new(preparation));
         });
     }
@@ -2111,49 +2048,48 @@ impl<'t> EventLoop<'t> {
         self.dispatch(self.focused, actions);
     }
 
-    fn refresh_models(&self) {
-        fetch_models(
-            Arc::clone(&self.ctx.available_models),
-            Arc::clone(&self.ctx.model_policy),
-            self.warn_tx.clone(),
-            self.models_tx.clone(),
-        );
+    /// The agent's own login, run here; the agent then rebuilds what its
+    /// old credentials connected.
+    fn remote_login(&mut self, idx: usize) {
+        let Some(login) = self.sessions[idx].handles.remote_login.clone() else {
+            return;
+        };
+        let result = {
+            let _pause = self.input.pause();
+            terminal::run_login(&login.invocation, self.terminal)
+        };
+        self.focus.on_resume();
+        let app = &mut self.sessions[idx].app;
+        let status = match result {
+            Ok(status) => status,
+            Err(e) => return app.flash(e),
+        };
+        // Told after any exit: a login that failed late may have saved its
+        // credentials already.
+        if let Err(e) = login.client.auth_changed() {
+            return app.flash(format!("{LOGIN_UNANNOUNCED}: {e}"));
+        }
+        match status.success() {
+            true => app.flash(LOGIN_DONE.into()),
+            false => app.flash(format!("{LOGIN_FAILED}: {status}")),
+        }
     }
 
     fn refresh_usage(&mut self) {
-        let rt = &self.sessions[self.focused];
-        let provider = Arc::clone(&rt.slot.load().provider);
-        let slot = Arc::clone(&rt.app.usage_slot);
-        slot.store(Some(Arc::new(UsageFetchState::Loading)));
-        tokio::spawn(async move {
-            let state = match provider.fetch_usage().await {
-                Ok(Some(usage)) => UsageFetchState::Ready(usage),
-                Ok(None) => UsageFetchState::Unsupported,
-                Err(e) => UsageFetchState::Error(e.user_message()),
-            };
-            slot.store(Some(Arc::new(state)));
-        });
+        let rt = &mut self.sessions[self.focused];
+        if let Some(remote) = rt.handles.remote_quota.clone() {
+            rt.app.refresh_remote_quota(remote);
+        }
     }
 
     /// Re-login rebuilds the provider for every tab on it, not just the focused
     /// one. A tab the user has not looked at would otherwise keep using the
     /// credentials that just failed.
-    fn refresh_provider(&mut self, slug: String) {
-        if self
-            .sessions
-            .iter()
-            .any(|rt| *rt.app.state.model.provider == *slug)
-        {
-            self.rebuild_models();
-        } else if let Some(default_model) =
-            maki_config::providers::builtin_provider(&slug).and_then(|b| b.default_model)
-            && let Err(e) = self.change_model(default_model)
-        {
-            self.focused_app().flash(e);
-        }
+    fn refresh_provider(&mut self, _slug: String) {
+        self.focused_app().exit_request = ExitRequest::Reload;
     }
 
-    fn shutdown(mut self) -> ShutdownReport {
+    fn shutdown(mut self) -> Result<ShutdownReport> {
         let started = Instant::now();
         let mut phase_start = started;
         let mut lap = || {
@@ -2171,51 +2107,56 @@ impl<'t> EventLoop<'t> {
         // `/reload` hands these same sessions to the next generation, so
         // their handlers must not hear that the process is quitting.
         let reason = match exit {
-            ExitRequest::Reload => SessionEndReason::Reload,
+            ExitRequest::Reload | ExitRequest::Plugins(_) | ExitRequest::Pack(_) => {
+                SessionEndReason::Reload
+            }
             _ => SessionEndReason::Shutdown,
         };
         self.ctx
             .lua_event_handle
+            .core
             .end_sessions_blocking(self.sessions.iter().map(SessionRuntime::id), reason);
         let session_end_ms = lap();
-        if let Some(ref h) = self.ctx.mcp_handle {
-            mcp::kill_process_groups(&h.reader().load().pids);
-        }
         for rt in &self.sessions {
             rt.handles.cancel_all();
         }
         let kill_mcp_ms = lap();
         let mut tabs = Vec::with_capacity(self.sessions.len());
-        let mut mailboxes = Vec::with_capacity(self.sessions.len());
         let mut agent_tasks = Vec::with_capacity(self.sessions.len());
         for rt in self.sessions.drain(..) {
             let SessionRuntime {
                 mut app, handles, ..
             } = rt;
             app.checkpoint_now();
+            if self.ctx.agent_factory.is_some() {
+                match handles.remote_link.request::<AppSession>(|session_id| {
+                    SessionOperation::Close {
+                        session_id,
+                        reason: Some(reason),
+                    }
+                }) {
+                    Ok(mut stored) => {
+                        let input = app.unsent();
+                        stored.meta.input_draft = input.input_draft;
+                        stored.meta.input_draft_writers = input.input_draft_writers;
+                        app.state.session = Arc::new(stored);
+                    }
+                    Err(error) => return Err(eyre!(error)),
+                }
+            }
             // `app` drops at the end of this iteration, closing the
             // channels the agent loop waits on, so `join_all` can finish.
             tabs.push(OpenSession {
                 session: Arc::unwrap_or_clone(app.state.session),
                 claim: app.state.claim,
             });
-            mailboxes.push(handles.mailbox().clone());
             agent_tasks.push(handles.into_task());
         }
         let save_sessions_ms = lap();
         crate::agent::join_all(agent_tasks, AGENT_SHUTDOWN_TIMEOUT);
         let join_agents_ms = lap();
-        if let Some(ref h) = self.ctx.mcp_handle {
-            Handle::current().block_on(h.shutdown());
-        }
         let mcp_shutdown_ms = lap();
-        let unsaved = match Arc::try_unwrap(self.ctx.storage_writer) {
-            Ok(writer) => writer.shutdown(AGENT_SHUTDOWN_TIMEOUT),
-            Err(_) => {
-                warn!("storage writer has outstanding references, skipping graceful shutdown");
-                Vec::new()
-            }
-        };
+        let unsaved = Vec::new();
         let storage_drain_ms = lap();
         info!(
             session_end_ms,
@@ -2227,13 +2168,12 @@ impl<'t> EventLoop<'t> {
             total_ms = started.elapsed().as_millis() as u64,
             "ui shutdown phases"
         );
-        ShutdownReport {
+        Ok(ShutdownReport {
             exit,
             tabs,
             focused: self.focused,
             unsaved,
-            mailboxes,
-        }
+        })
     }
 }
 
@@ -2248,12 +2188,95 @@ fn scroll_delta(kind: MouseEventKind, lines: u32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use maki_agent::DoneReason;
-    use maki_providers::TokenUsage;
+    use crate::agent::fake_agent::{Peer, SESSION, remote};
+    use crate::app::tests::test_app;
+    use maki_types::stop_reason::DoneReason;
+    use maki_types::usage::TokenUsage;
     use test_case::test_case;
 
     const OBSERVATION: &str = "failed";
     const SHELL_RESULT: &str = "command finished";
+    const NOT_AN_ID: &str = "not-a-session";
+
+    /// The one tab a client runs, bound to the fake agent's `SESSION`.
+    fn remote_tab() -> (SessionRuntime, Peer) {
+        let (handles, peer) = remote();
+        let mut app = test_app();
+        handles.apply_to_app(&mut app);
+        app.backend = AgentBackend::Remote {
+            native: false,
+            host: false,
+            images: true,
+            plan: true,
+            settings: true,
+            btw: false,
+            usage_ledger: false,
+            login: false,
+            plan_file: false,
+            reload: false,
+        };
+        let (shell_tx, shell_rx) = flume::unbounded();
+        let runtime = SessionRuntime {
+            app,
+            handles,
+            shell_tx,
+            shell_rx,
+            last_status: SessionStatus::Idle,
+            last_title: String::new(),
+            last_tasks: TaskWatch::default(),
+            notifications: RunNotificationState::default(),
+        };
+        (runtime, peer)
+    }
+
+    /// `current` and the one `live` row name it so, which is how the
+    /// `sessions` picker marks the agent's listed row live.
+    #[test]
+    fn a_remote_tab_is_named_by_its_agents_session() {
+        let (tab, _peer) = remote_tab();
+        assert_eq!(tab.name(), SESSION);
+    }
+
+    #[test]
+    fn plan_read_accepts_the_agents_session_id() {
+        let (tab, _peer) = remote_tab();
+        let tabs = [tab];
+        let read = PlanRequest {
+            session: Some(SESSION.to_owned()),
+        };
+        assert_eq!(plan_reply(&tabs, 0, read), Ok(tabs[0].app.plan_snapshot()));
+    }
+
+    #[test]
+    fn a_window_named_by_the_agents_session_opens_in_its_tab() {
+        let (tab, _peer) = remote_tab();
+        let named = TabRef(Arc::from(SESSION));
+        assert_eq!(tab_of(&[tab], 0, Some(&named)), Some(0));
+    }
+
+    /// Its local id still names it, and anything else is not a tab.
+    #[test]
+    fn a_remote_tab_still_answers_to_its_local_id() {
+        let (tab, _peer) = remote_tab();
+        let local = tab.id();
+        let tabs = [tab];
+        let other = MakiId::generate();
+        assert_eq!(find_tab(&tabs, &local.to_string()), Ok(Ok(0)));
+        assert_eq!(find_tab(&tabs, &other.to_string()), Ok(Err(other)));
+        assert!(find_tab(&tabs, NOT_AN_ID).is_err());
+        assert_eq!(
+            resolve_tab(&tabs, 0, Some(&other.to_string())),
+            Err(NOT_LIVE_ERR.to_owned())
+        );
+    }
+
+    #[test_case(SessionRequest::Delete { id: SESSION.into() }, true ; "delete")]
+    #[test_case(SessionRequest::SetTitle { id: SESSION.into(), title: OBSERVATION.into() }, true ; "rename")]
+    #[test_case(SessionRequest::Current, false ; "current")]
+    #[test_case(SessionRequest::List, false ; "list")]
+    fn a_remote_tab_refuses_what_only_its_agent_could_do(req: SessionRequest, refused: bool) {
+        assert_eq!(remote_refuses(&req), refused);
+    }
 
     fn done_event() -> AgentEvent {
         AgentEvent::Done {
@@ -2381,7 +2404,7 @@ mod tests {
     fn notification_selection_prefers_priority_then_session_order() {
         let completion = Notification::TurnComplete { response: None };
         let first_prompt = Notification::QuestionRequested;
-        let second_prompt = Notification::AuthenticationRequired;
+        let second_prompt = Notification::PermissionRequested { tool: None };
 
         let selected = select_notification(None, Some(completion));
         let selected = select_notification(selected, Some(first_prompt.clone()));

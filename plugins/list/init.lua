@@ -1,4 +1,3 @@
-local dir_listing = require("maki.dir_listing")
 local list_helpers = require("list_helpers")
 local shorten_path = require("maki.shorten_path")
 
@@ -30,21 +29,9 @@ maki.api.register_tool({
     },
   },
 
-  header = function(input)
-    local buf = maki.ui.buf()
-    buf:line({ { shorten_path(input.path or ""), "path" } })
-    return buf
+  summary = function(input)
+    return shorten_path(input.path or "")
   end,
 
-  restore = function(_input, output, _is_error, ctx)
-    return dir_listing.view(output, ctx)
-  end,
-
-  handler = function(input, ctx)
-    local result = list_helpers.handler(input, ctx)
-    if not result.is_error then
-      result.body = dir_listing.view(result.llm_output, ctx)
-    end
-    return result
-  end,
+  handler = list_helpers.handler,
 })

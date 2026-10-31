@@ -1,10 +1,5 @@
--- This plugin owns the /tasks picker over the subagents spawned here:
--- picker.lua registers the command and the keymap when this file is loaded, so
--- the two cannot be enabled apart and left pointing at each other's absence.
+-- The UI component loads the /tasks picker; this component owns its work.
 
-local ToolView = require("maki.tool_view")
-local output_limits = require("maki.output_limits")
-require("picker")
 require("stop")
 
 local Runner = require("runner")
@@ -12,8 +7,6 @@ local Runner = require("runner")
 -- not pay for the tool's definition.
 local Message = Runner.allow_background and require("message")
 
-local DEFAULT_OUTPUT_LINES = 5
-local WAITING_FOR_SLOT = "waiting for a free subagent slot"
 local MOVED_RECEIPT = "Subagent %s"
 local FOREGROUND_NOTE = "Could not start in the background (%s). Ran in the foreground."
 
@@ -37,17 +30,6 @@ local examples = {
     model_tier = "weak",
   },
 }
-
--- Standalone runs render markdown on the Rust side (format = "markdown").
--- This mirrors it for restore, batch children and a row that had to wait.
-local function result_body(output, is_error, ctx)
-  local tol = ctx:tool_output_lines()
-  return ToolView.restore_markdown(output, is_error, {
-    max_lines = (tol and tol.task) or DEFAULT_OUTPUT_LINES,
-    keep = "head",
-    max_line_bytes = output_limits.DEFAULT_MAX_LINE_BYTES,
-  })
-end
 
 local function handler(input, ctx)
   local prepared, prepare_err = Runner.prepare(input, ctx)
@@ -83,17 +65,11 @@ local function handler(input, ctx)
     end
   end
 
-  -- Shown only while every slot is taken, moved subagents included. A live
-  -- body outlives the wait as a snapshot, so the final reply carries its own.
-  local waiting
+  -- Shown only while every slot is taken, moved subagents included.
   local permit = Runner.acquire_slot(function()
-    waiting = maki.ui.buf()
-    waiting:line({ { WAITING_FOR_SLOT, "dim" } })
-    ctx:live_buf(waiting)
+    ctx:set_state({ waiting = true })
   end)
-  if waiting then
-    waiting:set_lines({})
-  end
+  ctx:set_state({ waiting = false })
 
   -- pcall so a raised error cannot leak the permit or the session.
   local ok, out = pcall(function()
@@ -121,21 +97,10 @@ local function handler(input, ctx)
   if not ok then
     error(out, 0)
   end
-  if waiting then
-    out.body = result_body(out.llm_output, out.is_error, ctx)
-  end
   if foreground_note then
     out.llm_output = foreground_note .. "\n\n" .. out.llm_output
   end
   return out
-end
-
-local function header(input)
-  return input.description
-end
-
-local function restore(_input, output, is_error, ctx)
-  return result_body(output, is_error, ctx)
 end
 
 maki.api.register_tool({
@@ -146,6 +111,7 @@ maki.api.register_tool({
   examples = examples,
   schema = Runner.schema,
   handler = handler,
-  header = header,
-  restore = restore,
+  summary = function(input)
+    return input.description
+  end,
 })

@@ -8,7 +8,8 @@ use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
 use crate::repaint::Cadence;
 
 use crossterm::event::{KeyCode, KeyEvent};
-use maki_providers::{Message, Role};
+use maki_types::message::Message;
+use maki_types::session::rewind_turns;
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 
@@ -85,25 +86,9 @@ impl RewindPicker {
         messages: &[Message],
         running: &[(Arc<str>, String)],
     ) -> Result<(), String> {
-        let mut turn_num = 0usize;
         let mut entries: Vec<RewindEntry> = Vec::new();
-        // Context updates go out right before the prompt they came with, so
-        // rewinding to the prompt takes them too, leaving the transcript as
-        // it was before the prompt was sent.
-        let mut updates_from = None;
-        for (msg_idx, msg) in messages.iter().enumerate() {
-            if msg.is_context_update() {
-                updates_from.get_or_insert(msg_idx);
-                continue;
-            }
-            let sent_from = updates_from.take().unwrap_or(msg_idx);
-            if !matches!(msg.role, Role::User) || msg.is_from_host() {
-                continue;
-            }
-            let Some(full_text) = msg.user_text() else {
-                continue;
-            };
-            turn_num += 1;
+        for (turn_num, (sent_from, full_text)) in rewind_turns(messages).into_iter().enumerate() {
+            let turn_num = turn_num + 1;
             let first_line = full_text.lines().next().unwrap_or("");
             let preview = if first_line.len() > PREVIEW_MAX_LEN {
                 format!(
@@ -226,7 +211,7 @@ mod tests {
     use super::*;
     use crate::components::buffer_text;
     use crossterm::event::KeyModifiers;
-    use maki_providers::ContentBlock;
+    use maki_types::message::{ContentBlock, Role};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use test_case::test_case;

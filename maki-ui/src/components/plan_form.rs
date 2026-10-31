@@ -4,7 +4,7 @@ use crate::components::keybindings::key;
 use crate::theme;
 
 use crossterm::event::{KeyCode, KeyEvent};
-use maki_lua::{PlanFormRow, PlanMenu, PlanRowAction};
+use maki_lua_ui::{PlanFormRow, PlanMenu, PlanRowAction};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Style;

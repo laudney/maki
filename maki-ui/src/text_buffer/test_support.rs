@@ -1,6 +1,6 @@
 use std::ops::Range;
 
-use maki_lua::TextEdit;
+use maki_lua_ui::TextEdit;
 
 use super::TextBuffer;
 use crate::decor_worker;

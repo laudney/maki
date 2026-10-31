@@ -9,21 +9,25 @@ maki-config = { workspace = true }
 maki-otel = { workspace = true }
 maki-providers = { workspace = true }
 maki-storage = { workspace = true }
+maki-types = { workspace = true }
+maki-wire = { workspace = true }
 agent-client-protocol-schema = { workspace = true }
 jiff = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }
+futures-lite = { workspace = true }
 tokio-util = { workspace = true }
 flume = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 color-eyre = { workspace = true }
+tempfile = { workspace = true }
 
 [dev-dependencies]
 maki-config = { workspace = true, features = ["test-util"] }
+maki-providers = { workspace = true, features = ["test-support"] }
 test-case = { workspace = true }
-tempfile = { workspace = true }
 
 [lints]
 workspace = true

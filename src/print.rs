@@ -16,7 +16,9 @@ use std::time::{Duration, Instant};
 use clap::ValueEnum;
 use color_eyre::Result;
 use color_eyre::eyre::{Context, eyre};
-use maki_agent::headless::{self, BackgroundMode, InteractiveHandle, InteractiveParams};
+use maki_agent::headless::{
+    self, BackgroundMode, InteractiveHandle, InteractiveParams, SessionInput,
+};
 use maki_agent::permissions::PluginRuleStore;
 use maki_agent::session::Resumed;
 use maki_agent::tools::QUESTION_TOOL_NAME;
@@ -26,7 +28,7 @@ use maki_agent::{
 };
 use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
 use maki_lua::session_snapshot::{HeadlessMeta, HeadlessSnapshot, MODE_BUILD};
-use maki_lua::{EventHandle, SessionEndReason};
+use maki_lua::{AgentHandle, CoreHandle, SessionEndReason};
 use maki_providers::TokenUsage;
 use maki_providers::model::Model;
 use maki_storage::StateDir;
@@ -218,7 +220,8 @@ pub struct PrintParams {
     pub config: AgentConfig,
     pub permissions_config: PermissionsConfig,
     pub timeouts: maki_providers::Timeouts,
-    pub lua_handle: EventHandle,
+    pub lua_core: CoreHandle,
+    pub lua_agent: AgentHandle,
     pub defaults: SessionDefaults,
     pub model_policy: Arc<ModelPolicy>,
     pub plugin_rules: Arc<PluginRuleStore>,
@@ -247,7 +250,8 @@ pub async fn run(params: PrintParams) -> Result<Interrupt> {
         config,
         permissions_config,
         timeouts,
-        lua_handle,
+        lua_core,
+        lua_agent,
         defaults,
         model_policy,
         plugin_rules,
@@ -271,7 +275,7 @@ pub async fn run(params: PrintParams) -> Result<Interrupt> {
     // After the prompt is read, so a signal still ends a stdin read at once.
     let interrupt = Interrupt::install();
 
-    let prompt_slots = lua_handle.collect_prompt_slots();
+    let prompt_slots = lua_agent.collect_prompt_slots();
 
     let initial_wd = std::env::current_dir().unwrap_or_else(|_| ".".into());
     let cwd = initial_wd.to_string_lossy().into_owned();
@@ -282,6 +286,7 @@ pub async fn run(params: PrintParams) -> Result<Interrupt> {
     }
 
     let (handle, mut events) = headless::spawn_interactive(InteractiveParams {
+        plugins: None,
         model: model.clone(),
         config,
         permissions_config,
@@ -295,6 +300,8 @@ pub async fn run(params: PrintParams) -> Result<Interrupt> {
         storage,
         yolo: false,
         unattended: true,
+        auto_wake: false,
+        reauth: false,
         system_prompt_override: None,
         append_system_prompt: None,
         defaults,
@@ -304,6 +311,7 @@ pub async fn run(params: PrintParams) -> Result<Interrupt> {
         local_tools: Default::default(),
         background: BackgroundMode::from_wait(background_wait),
         stop: interrupt.stop(),
+        settings: None,
     });
 
     let InteractiveHandle {
@@ -316,13 +324,13 @@ pub async fn run(params: PrintParams) -> Result<Interrupt> {
     } = handle;
     // One prompt, then the input ends. A session that never connected has
     // already said why on the event stream.
-    let _ = input_tx.send(AgentInput::from_defaults(
+    let _ = input_tx.send(SessionInput::Prompt(AgentInput::from_defaults(
         prompt,
         AgentMode::Build,
         images,
         defaults,
         InputSource::Headless,
-    ));
+    )));
     drop(input_tx);
     let start = Instant::now();
 
@@ -350,7 +358,7 @@ pub async fn run(params: PrintParams) -> Result<Interrupt> {
 
     let snapshot = HeadlessSnapshot::default();
     snapshot.install(
-        &lua_handle,
+        &lua_agent,
         HeadlessMeta {
             id: session_id.to_string(),
             cwd: cwd.clone(),
@@ -364,12 +372,7 @@ pub async fn run(params: PrintParams) -> Result<Interrupt> {
         // Folded in first, so a plugin handling `TurnEnd` finds the finished
         // totals when it calls `maki.session.read()`.
         snapshot.observe(&envelope);
-        maki_lua::agent_autocmd::dispatch(
-            &lua_handle,
-            &session_id,
-            &envelope,
-            envelope.subagent.is_some(),
-        );
+        lua_core.dispatch(&session_id, &envelope, envelope.subagent.is_some());
         let Envelope {
             ref event,
             ref subagent,
@@ -385,11 +388,17 @@ pub async fn run(params: PrintParams) -> Result<Interrupt> {
             | AgentEvent::ThinkingDelta { .. }
             | AgentEvent::ToolPending { .. }
             | AgentEvent::ToolStart(_)
+            | AgentEvent::ToolProgress(_)
             | AgentEvent::ToolOutput { .. }
             | AgentEvent::ToolDone(_)
+            | AgentEvent::TaskEnded { .. }
             | AgentEvent::ToolMovable { .. }
             | AgentEvent::ToolParts { .. }
             | AgentEvent::QueueItemConsumed { .. }
+            | AgentEvent::PluginTask { .. }
+            | AgentEvent::ContextReset { .. }
+            | AgentEvent::TaskQueue { .. }
+            | AgentEvent::QueueUpdated(_)
             | AgentEvent::QueueDrained
             | AgentEvent::AutoCompacting { .. }
             | AgentEvent::CompactionDone { .. }
@@ -397,9 +406,6 @@ pub async fn run(params: PrintParams) -> Result<Interrupt> {
             | AgentEvent::AllowedByPlugin { .. }
             | AgentEvent::PermissionRequest { .. }
             | AgentEvent::SubagentHistory { .. }
-            | AgentEvent::ToolSnapshot { .. }
-            | AgentEvent::ToolHeaderSnapshot { .. }
-            | AgentEvent::LiveToolBuf { .. }
             | AgentEvent::Nudge
             | AgentEvent::Notice { .. }
             | AgentEvent::PromptProgress { .. }
@@ -469,7 +475,7 @@ pub async fn run(params: PrintParams) -> Result<Interrupt> {
         }
     }
     let track = headless::await_shutdown(task).await;
-    lua_handle.end_sessions_blocking([session_id.id()], SessionEndReason::Completed);
+    lua_core.end_sessions_blocking([session_id.id()], SessionEndReason::Completed);
     // Background work and plugin jobs are stopped by now, so nothing spends
     // any more. Dropping the track saves the full bill, also what no turn
     // was left to report.

@@ -1,13 +1,9 @@
 use std::collections::BTreeMap;
 use std::fmt::Write;
-use std::sync::Arc;
 
-use maki_agent::tools::ToolRegistry;
 use maki_config::Permission;
-use maki_lua::{LuaCommandInfo, PluginHost};
+use maki_lua_ui::LuaCommandInfo;
 use maki_ui::{BUILTIN_COMMANDS, PluginAccess, SUBMITS_PROMPT};
-
-use crate::lua_util::in_registration_window;
 
 const ALIASING: &str = r#"## Aliasing commands
 
@@ -59,9 +55,14 @@ fn builtin_names(access: PluginAccess) -> Vec<String> {
 /// Read from booted plugins, so what is listed is the grant `run_command`
 /// actually compares against.
 fn bundled_commands() -> Vec<LuaCommandInfo> {
-    let host = in_registration_window(|| {
-        PluginHost::with_all_builtins(Arc::new(ToolRegistry::new())).expect("loading builtins")
-    });
+    let host = maki_lua_ui::UiHost::start(
+        maki_lua::Interaction::None,
+        true,
+        maki_lua_ui::UiFiles::Bundled,
+        maki_lua_ui::UiDirs::of_user(),
+    )
+    .expect("loading UI builtins")
+    .host;
     let mut commands = host.command_reader().load().commands.clone();
     commands.sort_by(|a, b| a.name.cmp(&b.name));
     commands

@@ -1,9 +1,10 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use maki_host::update::backup_path;
+use maki_storage::StorageError;
 use maki_storage::paths::canonicalize_clean;
 use maki_storage::version::{self, VersionError};
-use maki_storage::{StateDir, StorageError};
 
 use tokio::runtime::Handle;
 
@@ -25,7 +26,6 @@ const INSTALLER: Installer = Installer {
     args: &["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"],
 };
 
-const BACKUP_FILENAME: &str = "maki_backup";
 const INSTALL_DIR_ENV: &str = "MAKI_INSTALL_DIR";
 
 struct Installer {
@@ -91,11 +91,6 @@ fn fetch_script() -> Result<String, UpdateError> {
             url: INSTALLER.url,
             source,
         })
-}
-
-/// Where `maki update` keeps the binary it replaced, for `maki rollback`.
-pub fn backup_path() -> Result<PathBuf, StorageError> {
-    Ok(StateDir::resolve()?.path().join(BACKUP_FILENAME))
 }
 
 fn backup_binary(exe_path: &Path, backup_path: &Path) -> Result<(), UpdateError> {

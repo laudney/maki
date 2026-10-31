@@ -1,24 +1,29 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use agent_client_protocol_schema::v1::{
-    Content, ContentBlock, ContentChunk, Cost, Diff, ImageContent, SessionUpdate, StopReason,
+    Content, ContentBlock, ContentChunk, Cost, Diff, ImageContent, Meta, SessionUpdate, StopReason,
     TextContent, ToolCall, ToolCallContent, ToolCallId, ToolCallLocation, ToolCallStatus,
     ToolCallUpdate, ToolCallUpdateFields, ToolKind, UsageUpdate,
 };
 use maki_agent::tools::ToolRegistry;
-use maki_agent::types::{ToolDoneEvent, ToolOutput, ToolStartEvent, TurnCompleteEvent};
-use maki_agent::{DisplayItem, DoneReason, display_order};
+use maki_agent::types::{ToolData, ToolDoneEvent, ToolOutput, ToolStartEvent, TurnCompleteEvent};
+use maki_agent::{AgentEvent, DisplayItem, DoneReason, display_order};
 use maki_providers::{ContentBlock as MsgBlock, ImageMediaType, Message, Role as MsgRole};
+use maki_types::message::TaskEnd;
+use maki_wire::extensions::META_KEY;
+use maki_wire::format::{NOTICE_ID_PREFIX, fenced};
+use maki_wire::tool_data;
+use serde_json::json;
 
-const MIN_FENCE_LEN: usize = 3;
 const WRITE_TOOL: &str = "write";
 /// One task pumps every session update, so reading a giant file to render a
 /// diff nobody can read would stall the whole stream.
 const MAX_DIFF_OLD_TEXT_BYTES: u64 = 256 * 1024;
 /// Model pricing is quoted in US dollars, so that is the reported currency.
 const CURRENCY: &str = "USD";
-const NOTICE_ID_PREFIX: &str = "notice-";
 
 /// File-level tools report a location so the client can follow along. Directory
 /// scoped tools (glob, grep, list) and commands (bash) target no single file.
@@ -32,19 +37,6 @@ const FILE_TOOLS: &[&str] = &[
     "index",
     "view_image",
 ];
-
-/// Zed renders tool output as markdown, so bare text loses its newlines.
-/// We wrap it in a backtick fence (longer than any run inside the text)
-/// to keep the original formatting.
-fn fenced(text: &str) -> String {
-    let longest_backtick_run = text
-        .split(|c: char| c != '`')
-        .map(str::len)
-        .max()
-        .unwrap_or(0);
-    let fence = "`".repeat(MIN_FENCE_LEN.max(longest_backtick_run + 1));
-    format!("{fence}\n{text}\n{fence}")
-}
 
 pub fn tool_kind(name: &str) -> ToolKind {
     let entry = match ToolRegistry::global().get(name) {
@@ -83,13 +75,31 @@ pub fn text_delta(text: &str) -> SessionUpdate {
 /// finished card, so it stands apart from the reply. The card has no
 /// content: the body the model read is never shown.
 pub fn notice(id: &str, line: &str) -> SessionUpdate {
+    notice_detail(id, line, None, None)
+}
+
+pub fn notice_detail(
+    id: &str,
+    line: &str,
+    detail: Option<String>,
+    end: Option<TaskEnd>,
+) -> SessionUpdate {
+    let meta = (detail.is_some() || end.is_some()).then(|| {
+        [(
+            META_KEY.into(),
+            json!({ "notice": { "detail": detail, "end": end } }),
+        )]
+        .into_iter()
+        .collect::<Meta>()
+    });
     SessionUpdate::ToolCall(
         ToolCall::new(
             ToolCallId::from(format!("{NOTICE_ID_PREFIX}{id}")),
             line.to_owned(),
         )
         .kind(ToolKind::Other)
-        .status(ToolCallStatus::Completed),
+        .status(ToolCallStatus::Completed)
+        .meta(meta),
     )
 }
 
@@ -376,36 +386,62 @@ pub fn map_done_reason(reason: DoneReason) -> StopReason {
 /// Per ACP "Session Usage Updates": the current context gauge plus the
 /// session's cumulative cost. Each turn's event only carries its own turn's
 /// share, so the caller tracks the running total across turns.
-pub fn usage_update(event: &TurnCompleteEvent, cost_total: Option<f64>) -> SessionUpdate {
+/// A turn's gauge, used and window. A host that reports no context size
+/// leaves what the turn's own usage says.
+pub fn turn_gauge(event: &TurnCompleteEvent) -> (u32, u32) {
     let used = event
         .context_size
-        .unwrap_or_else(|| event.usage.context_tokens()) as u64;
-    let mut update = UsageUpdate::new(used, u64::from(event.context_window));
+        .unwrap_or_else(|| event.usage.context_tokens());
+    (used, event.context_window)
+}
+
+pub fn context_usage(used: u32, window: u32, cost_total: Option<f64>) -> SessionUpdate {
+    let mut update = UsageUpdate::new(u64::from(used), u64::from(window));
     if let Some(cost) = cost_total {
         update = update.cost(Cost::new(cost, CURRENCY));
     }
     SessionUpdate::UsageUpdate(update)
 }
 
+/// A stored session read back as the updates a live client would have seen.
+pub struct Replay<'a> {
+    pub cwd: &'a Path,
+    pub home: Option<&'a Path>,
+    /// Stored outputs for clients that agreed on tool data.
+    pub outputs: Option<&'a HashMap<String, Arc<ToolOutput>>>,
+    /// The stored data of each call, whose summary and effective input a
+    /// replayed card shows in place of the model's input and the header.
+    pub data: &'a HashMap<String, Arc<ToolData>>,
+    /// The client agreed on the tool data extension, so a call replays its
+    /// data and output in extension metadata.
+    pub tool_data: bool,
+}
+
 /// A replayed card is named by its observation's place in history, which
 /// a live card's random id can never take.
-pub fn replay_history(messages: &[Message], cwd: &Path, home: Option<&Path>) -> Vec<SessionUpdate> {
+pub fn replay_history(messages: &[Message], replay: &Replay) -> Vec<SessionUpdate> {
     let mut updates = Vec::new();
     for item in display_order(messages) {
         match item {
             DisplayItem::ObservationLine { index, text } => {
-                updates.push(notice(&index.to_string(), text));
+                let message = &messages[index];
+                updates.push(notice_detail(
+                    &index.to_string(),
+                    text,
+                    maki_types::display_order::observation_detail(message).map(str::to_owned),
+                    message.settles.as_ref().map(|settles| settles.end),
+                ));
             }
             DisplayItem::Message(msg) => match msg.role {
-                MsgRole::User => replay_user(msg, &mut updates),
-                MsgRole::Assistant => replay_assistant(msg, &mut updates, cwd, home),
+                MsgRole::User => replay_user(msg, &mut updates, replay),
+                MsgRole::Assistant => replay_assistant(msg, &mut updates, replay),
             },
         }
     }
     updates
 }
 
-fn replay_user(msg: &Message, updates: &mut Vec<SessionUpdate>) {
+fn replay_user(msg: &Message, updates: &mut Vec<SessionUpdate>, replay: &Replay) {
     if msg.is_from_host() {
         return;
     }
@@ -421,7 +457,30 @@ fn replay_user(msg: &Message, updates: &mut Vec<SessionUpdate>) {
                 content,
                 is_error,
                 ..
-            } => updates.push(replay_tool_result(tool_use_id, content, *is_error)),
+            } => {
+                let update = replay_tool_result(tool_use_id, content, *is_error);
+                let output = replay.outputs.and_then(|outputs| outputs.get(tool_use_id));
+                let update = match replay.data.get(tool_use_id).filter(|_| replay.tool_data) {
+                    Some(data) => {
+                        let event = AgentEvent::ToolDone(Box::new(ToolDoneEvent {
+                            id: tool_use_id.clone(),
+                            tool: Arc::clone(&data.tool),
+                            output: output.cloned().unwrap_or_else(|| {
+                                Arc::new(ToolOutput::Plain(content.clone().into()))
+                            }),
+                            is_error: *is_error,
+                            annotation: None,
+                            written_path: None,
+                            backgrounded: msg.receipts.contains(tool_use_id),
+                            call: None,
+                            data: Some(Arc::clone(data)),
+                        }));
+                        tool_data::attach(Some(update), tool_use_id, &event)
+                    }
+                    None => update,
+                };
+                updates.push(update);
+            }
             MsgBlock::Image { source } => {
                 updates.push(SessionUpdate::UserMessageChunk(ContentChunk::new(
                     ContentBlock::Image(ImageContent::new(
@@ -435,39 +494,74 @@ fn replay_user(msg: &Message, updates: &mut Vec<SessionUpdate>) {
     }
 }
 
-fn replay_assistant(
-    msg: &Message,
-    updates: &mut Vec<SessionUpdate>,
-    cwd: &Path,
-    home: Option<&Path>,
-) {
+fn replay_assistant(msg: &Message, updates: &mut Vec<SessionUpdate>, replay: &Replay) {
     for block in &msg.content {
         match block {
             MsgBlock::Text { text } => updates.push(text_delta(text)),
             MsgBlock::Thinking { thinking, .. } => updates.push(thinking_delta(thinking)),
+            MsgBlock::Image { source } => {
+                updates.push(SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                    ContentBlock::Image(ImageContent::new(
+                        source.data.to_string(),
+                        mime_type(&source.media_type),
+                    )),
+                )));
+            }
             MsgBlock::ToolUse {
                 id, name, input, ..
-            } => {
-                updates.push(replay_tool_call(id, name, input, cwd, home));
-            }
+            } => updates.extend(replay_tool_call(id, name, input, replay)),
             _ => {}
         }
     }
 }
 
+/// The card is named by the tool, as a live one is, and then gets the
+/// summary the call stored, or the header a local load shows for a call
+/// without one, so the row reads as it did live. The input is the one the
+/// call ran with when it was stored.
 fn replay_tool_call(
     id: &str,
     name: &str,
     input: &serde_json::Value,
-    cwd: &Path,
-    home: Option<&Path>,
-) -> SessionUpdate {
+    replay: &Replay,
+) -> [SessionUpdate; 2] {
+    let data = replay.data.get(id).map(Arc::as_ref);
+    let input = data.map_or(input, |data| &data.input);
+    let title = data
+        .map(|data| data.summary.as_str())
+        .filter(|summary| !summary.is_empty())
+        .unwrap_or(name)
+        .to_owned();
     let call = ToolCall::new(ToolCallId::from(id.to_string()), name.to_string())
         .kind(tool_kind(name))
         .status(ToolCallStatus::Pending)
         .raw_input(input.clone())
-        .locations(tool_locations(name, Some(input), cwd, home));
-    SessionUpdate::ToolCall(call)
+        .locations(tool_locations(name, Some(input), replay.cwd, replay.home));
+    let header = ToolCallUpdateFields::new()
+        .status(ToolCallStatus::InProgress)
+        .title(title);
+    let header = SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+        ToolCallId::from(id.to_string()),
+        header,
+    ));
+    let header = match data.filter(|_| replay.tool_data) {
+        Some(data) => tool_data::attach(
+            Some(header),
+            id,
+            &AgentEvent::ToolStart(Box::new(ToolStartEvent {
+                id: id.to_owned(),
+                tool: Arc::clone(&data.tool),
+                data_version: data.version,
+                summary: data.summary.clone(),
+                annotation: None,
+                input: None,
+                raw_input: Some(data.input.clone()),
+                output: None,
+            })),
+        ),
+        None => header,
+    };
+    [SessionUpdate::ToolCall(call), header]
 }
 
 fn replay_tool_result(id: &str, content: &str, is_error: bool) -> SessionUpdate {
@@ -501,12 +595,17 @@ fn mime_type(media: &ImageMediaType) -> &'static str {
 mod tests {
     use std::sync::Arc;
 
+    use maki_agent::DEFAULT_DATA_VERSION;
     use maki_providers::ImageSource;
+    use maki_types::event::AgentEvent;
+    use maki_wire::display::DisplayMapper;
+    use maki_wire::extensions::Agreed;
     use serde_json::json;
     use tempfile::TempDir;
     use test_case::test_case;
 
     use super::*;
+    use maki_wire::extensions::META_KEY;
 
     const CWD: &str = "/home/user/project";
     const HOME: &str = "/home/user";
@@ -522,12 +621,13 @@ mod tests {
     const PROMPT: &str = "what changed";
     const REPLY: &str = "the build is green";
     const CONTEXT_UPDATE_TEXT: &str = "<context-update>date: tomorrow</context-update>";
-
-    #[test_case("1: mod render\n2: mod segment", "```\n1: mod render\n2: mod segment\n```" ; "plain_text_gets_default_fence")]
-    #[test_case("has ```rust\ncode\n``` inside", "````\nhas ```rust\ncode\n``` inside\n````" ; "fence_longer_than_inner_backticks")]
-    fn fenced_wraps_in_code_block(input: &str, expected: &str) {
-        assert_eq!(fenced(input), expected);
-    }
+    const REPLAY_TOOL: &str = "replay_header_mock";
+    /// What the registry's mock invocation names itself.
+    const STORED_SUMMARY: &str = "ran what the hook rewrote";
+    const HOOKED_KEY: &str = "hooked";
+    const START_ANNOTATION: &str = "started";
+    const DONE_ANNOTATION: &str = "12 lines";
+    const STORED_STATE: &str = "kept\r\nraw";
 
     /// The pairs whose names disagree. ACP clients read these to tell "the
     /// model stopped" from "the agent ran out of turns" or "the prompt never
@@ -548,10 +648,43 @@ mod tests {
     }
 
     fn updates_json(messages: &[Message]) -> Vec<serde_json::Value> {
-        replay_history(messages, Path::new(CWD), Some(Path::new(HOME)))
+        replay_json(messages, None, &HashMap::new())
+    }
+
+    fn replay_json(
+        messages: &[Message],
+        outputs: Option<&HashMap<String, Arc<ToolOutput>>>,
+        data: &HashMap<String, Arc<ToolData>>,
+    ) -> Vec<serde_json::Value> {
+        replay_updates(messages, outputs, data, outputs.is_some())
             .iter()
             .map(|u| serde_json::to_value(u).unwrap())
             .collect()
+    }
+
+    fn replay_updates(
+        messages: &[Message],
+        outputs: Option<&HashMap<String, Arc<ToolOutput>>>,
+        data: &HashMap<String, Arc<ToolData>>,
+        tool_data: bool,
+    ) -> Vec<SessionUpdate> {
+        let replay = Replay {
+            cwd: Path::new(CWD),
+            home: Some(Path::new(HOME)),
+            outputs,
+            data,
+            tool_data,
+        };
+        replay_history(messages, &replay)
+    }
+
+    fn tool_result(id: &str, content: &str) -> Message {
+        Message {
+            role: MsgRole::User,
+            content: vec![MsgBlock::tool_result(id, content, false)],
+            display_text: None,
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -580,7 +713,7 @@ mod tests {
         ];
 
         let json = updates_json(&messages);
-        assert_eq!(json.len(), 6);
+        assert_eq!(json.len(), 7);
         assert_eq!(json[0]["sessionUpdate"], "user_message_chunk");
         assert_eq!(json[0]["content"]["text"], "hello");
         assert_eq!(json[1]["sessionUpdate"], "agent_thought_chunk");
@@ -592,14 +725,137 @@ mod tests {
         assert!(json[3]["kind"].is_null());
         assert_eq!(json[3]["rawInput"]["command"], "ls");
         assert_eq!(json[4]["sessionUpdate"], "tool_call_update");
-        assert_eq!(json[4]["toolCallId"], "tu-1");
-        assert_eq!(json[4]["status"], "completed");
+        assert_eq!(json[4]["status"], "in_progress");
+        assert_eq!(json[5]["sessionUpdate"], "tool_call_update");
+        assert_eq!(json[5]["toolCallId"], "tu-1");
+        assert_eq!(json[5]["status"], "completed");
         assert_eq!(
-            json[4]["content"][0]["content"]["text"],
+            json[5]["content"][0]["content"]["text"],
             "```\nfile.rs\n```"
         );
-        assert_eq!(json[5]["sessionUpdate"], "agent_message_chunk");
-        assert_eq!(json[5]["content"]["text"], "done");
+        assert!(json[5]["_meta"].is_null());
+        assert_eq!(json[6]["sessionUpdate"], "agent_message_chunk");
+        assert_eq!(json[6]["content"]["text"], "done");
+    }
+
+    /// A call stored with data replays the summary and the input it ran
+    /// with, a null one included; one stored without data replays as before.
+    #[test_case(Some(STORED_SUMMARY), json!({ HOOKED_KEY: true }), STORED_SUMMARY ; "stored_summary_titles_the_call")]
+    #[test_case(Some(""),             json!({ HOOKED_KEY: true }), REPLAY_TOOL    ; "empty_summary_falls_back_to_the_tool")]
+    #[test_case(Some(STORED_SUMMARY), serde_json::Value::Null,     STORED_SUMMARY ; "stored_null_input_is_kept")]
+    #[test_case(None,                 serde_json::Value::Null,     REPLAY_TOOL    ; "call_without_data_replays_as_before")]
+    fn replay_reads_a_calls_stored_data(
+        summary: Option<&str>,
+        ran_input: serde_json::Value,
+        expected_title: &str,
+    ) {
+        let model_input = json!({});
+        let data: HashMap<_, _> = summary
+            .map(|summary| {
+                let data = ToolData::new(
+                    Arc::from(REPLAY_TOOL),
+                    DEFAULT_DATA_VERSION,
+                    ran_input.clone(),
+                    summary.into(),
+                );
+                ("tu-1".to_owned(), Arc::new(data))
+            })
+            .into_iter()
+            .collect();
+        let messages = [assistant(vec![MsgBlock::tool_use(
+            "tu-1",
+            REPLAY_TOOL,
+            model_input.clone(),
+        )])];
+
+        let json = replay_json(&messages, None, &data);
+
+        let expected_input = if summary.is_some() {
+            ran_input
+        } else {
+            model_input
+        };
+        assert_eq!(json[0]["rawInput"], expected_input);
+        assert_eq!(json[1]["title"], expected_title);
+    }
+
+    #[test]
+    fn old_calls_without_data_keep_their_text_output() {
+        let messages = [tool_result("tu-1", "old output")];
+        let updates = replay_json(&messages, None, &HashMap::new());
+        assert!(updates[0]["_meta"].is_null());
+        assert!(
+            updates[0]["content"][0]["content"]["text"]
+                .as_str()
+                .unwrap()
+                .contains("old output")
+        );
+    }
+
+    fn maki_meta(update: &SessionUpdate) -> serde_json::Value {
+        serde_json::to_value(update).unwrap()["_meta"][META_KEY].clone()
+    }
+
+    #[test_case(true ; "tool_data_client")]
+    #[test_case(false ; "standard_client")]
+    fn replay_sends_stored_data_only_under_its_extension(tool_data: bool) {
+        let mut stored = ToolData::new(
+            Arc::from(REPLAY_TOOL),
+            DEFAULT_DATA_VERSION,
+            json!({ HOOKED_KEY: true }),
+            STORED_SUMMARY.into(),
+        );
+        stored.annotations = vec![START_ANNOTATION.into(), DONE_ANNOTATION.into()];
+        stored.state = json!({ HOOKED_KEY: STORED_STATE });
+        let output = ToolOutput::Plain(STORED_STATE.into());
+        let outputs = HashMap::from([("tu-1".to_owned(), Arc::new(output))]);
+        let data = HashMap::from([("tu-1".to_owned(), Arc::new(stored))]);
+        let messages = [
+            assistant(vec![MsgBlock::tool_use("tu-1", REPLAY_TOOL, json!({}))]),
+            tool_result("tu-1", STORED_STATE),
+        ];
+
+        let updates = replay_updates(&messages, Some(&outputs), &data, tool_data);
+
+        let [_, start, result] = updates.as_slice() else {
+            panic!("expected the card, its start and its result");
+        };
+        let carried = |key| maki_meta(result).get(key).is_some();
+        assert_eq!(carried(tool_data::TOOL_DATA_KEY), tool_data);
+        assert_eq!(
+            maki_meta(start).get(tool_data::TOOL_DATA_KEY).is_some(),
+            tool_data
+        );
+        if !tool_data {
+            return;
+        }
+        let mut mapper = DisplayMapper::new(&Agreed {
+            tool_data: true,
+            ..Agreed::default()
+        });
+        let events: Vec<_> = updates.into_iter().flat_map(|u| mapper.map(u)).collect();
+        let Some(AgentEvent::ToolDone(done)) = events.last() else {
+            panic!("expected the completion last");
+        };
+        assert_eq!(
+            serde_json::to_value(&done.data).unwrap(),
+            serde_json::to_value(data.get("tu-1")).unwrap()
+        );
+        assert_eq!(done.output.as_text(), STORED_STATE);
+    }
+
+    #[test]
+    fn replay_sends_an_assistant_image_as_an_image_chunk() {
+        let messages = [assistant(vec![MsgBlock::Image {
+            source: ImageSource::new(ImageMediaType::Png, Arc::from("b64data")),
+        }])];
+
+        let json = updates_json(&messages);
+
+        assert_eq!(json.len(), 1);
+        assert_eq!(json[0]["sessionUpdate"], "agent_message_chunk");
+        assert_eq!(json[0]["content"]["type"], "image");
+        assert_eq!(json[0]["content"]["mimeType"], "image/png");
     }
 
     #[test]
@@ -617,9 +873,8 @@ mod tests {
     }
 
     /// A restored result line replays as the same finished card the client
-    /// saw live, named by its observation's place in history, and the body
-    /// the model read never reaches the client. Where it goes is
-    /// `display_order`'s call.
+    /// saw live, named by its observation's place in history. The body is
+    /// available as expandable detail. `display_order` decides its place.
     #[test]
     fn replay_shows_an_observation_line_as_a_finished_card() {
         let messages = [
@@ -637,7 +892,8 @@ mod tests {
         assert_eq!(json[1]["title"], NOTICE_LINE);
         assert_eq!(json[1]["status"], "completed");
         assert_eq!(json[2], serde_json::to_value(text_delta(REPLY)).unwrap());
-        assert!(!serde_json::to_string(&json).unwrap().contains(MONITOR_NOTE));
+        assert!(json[1]["content"].as_array().is_none_or(Vec::is_empty));
+        assert_eq!(json[1]["_meta"][META_KEY]["notice"]["detail"], MONITOR_NOTE);
     }
 
     #[test_case(None ; "absent")]
@@ -712,11 +968,11 @@ mod tests {
             id: "t-1".into(),
             tool: Arc::from(tool),
             summary: String::new(),
-            render_header: None,
             annotation: None,
             input: None,
             raw_input,
             output: None,
+            data_version: DEFAULT_DATA_VERSION,
         }
     }
 
@@ -793,6 +1049,7 @@ mod tests {
             is_error,
             annotation: None,
             written_path: written.map(str::to_owned),
+            data: None,
             backgrounded: false,
         }
     }
@@ -859,7 +1116,6 @@ mod tests {
             json!({"path": "src/lib.rs", "offset": 10, "limit": 0}),
         )]);
         let json = updates_json(&[msg]);
-        assert_eq!(json.len(), 1);
         assert_eq!(json[0]["sessionUpdate"], "tool_call");
         assert_eq!(json[0]["toolCallId"], "tu-1");
         assert_eq!(
@@ -896,36 +1152,19 @@ mod tests {
             model: "test-model".into(),
             cost,
             subsidised_list_cost: None,
+            subsidised_by: None,
             context_size,
             context_window,
         }
     }
 
-    #[test]
-    fn usage_update_reports_gauge_and_cumulative_cost() {
-        let event = turn_event(Some(60_000), 200_000, Some(0.05));
-        let json = serde_json::to_value(usage_update(&event, Some(0.125))).unwrap();
-        assert_eq!(json["sessionUpdate"], "usage_update");
-        assert_eq!(json["used"], 60_000);
-        assert_eq!(json["size"], 200_000);
-        assert_eq!(json["cost"]["amount"], 0.125);
-        assert_eq!(json["cost"]["currency"], CURRENCY);
-    }
-
-    #[test]
-    fn usage_update_without_cost_omits_cost() {
-        let event = turn_event(Some(60_000), 200_000, None);
-        let json = serde_json::to_value(usage_update(&event, None)).unwrap();
-        assert_eq!(json["used"], 60_000);
-        assert_eq!(json["size"], 200_000);
-        assert!(json.get("cost").is_none(), "{json}");
-    }
-
-    #[test]
-    fn usage_update_falls_back_to_usage_when_context_size_missing() {
-        let event = turn_event(None, 200_000, None);
-        let json = serde_json::to_value(usage_update(&event, None)).unwrap();
-        assert_eq!(json["used"], 51_200);
+    #[test_case(Some(60_000), 60_000 ; "reported")]
+    #[test_case(None, 51_200 ; "falls_back_to_the_usage")]
+    fn turn_gauge_reads_the_context_size(context_size: Option<u32>, used: u32) {
+        assert_eq!(
+            turn_gauge(&turn_event(context_size, 200_000, None)),
+            (used, 200_000)
+        );
     }
 
     fn permission_json(
@@ -1041,6 +1280,240 @@ mod tests {
         assert_eq!(json["title"], PERMISSION_TITLE);
         for field in ["kind", "locations", "rawInput", "content"] {
             assert!(json[field].is_null(), "{field} must stay unset: {json}");
+        }
+    }
+
+    mod display {
+        use std::path::Path;
+        use std::sync::Arc;
+
+        use agent_client_protocol_schema::v1::{
+            SessionUpdate, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
+        };
+        use maki_types::event::{AgentEvent, ToolDoneEvent, ToolStartEvent};
+        use maki_types::stop_reason::DoneReason;
+        use maki_types::tool::{DEFAULT_DATA_VERSION, TextOutput, ToolOutput};
+        use maki_wire::display::DisplayMapper;
+        use test_case::test_case;
+
+        use crate::translate;
+
+        const CALL_ID: &str = "call-1";
+        const TOOL: &str = "bash";
+        const SUMMARY: &str = "ls -la";
+        const OUTPUT: &str = "total 0\n```inner```\n\tend";
+        const DIFF_PATH: &str = "/work/a.rs";
+        const BEFORE: &str = "old\n";
+        const AFTER: &str = "new\n";
+        const NOTICE_TEXT: &str = "Background agent finished";
+
+        fn start_event() -> ToolStartEvent {
+            ToolStartEvent {
+                id: CALL_ID.into(),
+                tool: TOOL.into(),
+                summary: SUMMARY.into(),
+                annotation: None,
+                input: None,
+                raw_input: Some(serde_json::json!({ "command": SUMMARY })),
+                output: None,
+                data_version: DEFAULT_DATA_VERSION,
+            }
+        }
+
+        fn done_event(output: ToolOutput, is_error: bool) -> ToolDoneEvent {
+            ToolDoneEvent {
+                id: CALL_ID.into(),
+                tool: TOOL.into(),
+                output: Arc::new(output),
+                is_error,
+                annotation: None,
+                written_path: None,
+                call: None,
+                data: None,
+                backgrounded: false,
+            }
+        }
+
+        fn mapped(mapper: &mut DisplayMapper, update: SessionUpdate) -> Vec<serde_json::Value> {
+            mapper
+                .map(update)
+                .iter()
+                .map(|event| serde_json::to_value(event).unwrap())
+                .collect()
+        }
+
+        fn json(event: AgentEvent) -> serde_json::Value {
+            serde_json::to_value(event).unwrap()
+        }
+
+        fn cwd() -> &'static Path {
+            Path::new("/work")
+        }
+
+        /// The whole lifecycle of one call, written by the server's own
+        /// translator, comes back as the events the local agent emits.
+        #[test]
+        fn server_tool_lifecycle_round_trips() {
+            let mut mapper = DisplayMapper::default();
+
+            let pending = mapped(&mut mapper, translate::tool_pending(CALL_ID, TOOL));
+            assert_eq!(
+                pending,
+                vec![json(AgentEvent::ToolPending {
+                    id: CALL_ID.into(),
+                    name: TOOL.into(),
+                })]
+            );
+
+            let start = mapped(
+                &mut mapper,
+                translate::tool_start(&start_event(), cwd(), None),
+            );
+            assert_eq!(
+                start,
+                vec![json(AgentEvent::ToolStart(Box::new(start_event())))]
+            );
+
+            let output = mapped(&mut mapper, translate::tool_output(CALL_ID, OUTPUT));
+            assert_eq!(
+                output,
+                vec![json(AgentEvent::ToolOutput {
+                    id: CALL_ID.into(),
+                    content: OUTPUT.into(),
+                })]
+            );
+
+            let plain = ToolOutput::Plain(TextOutput::from(OUTPUT));
+            let done = mapped(
+                &mut mapper,
+                translate::tool_done(&done_event(plain.clone(), false), cwd(), None),
+            );
+            assert_eq!(
+                done,
+                vec![json(AgentEvent::ToolDone(Box::new(done_event(
+                    plain, false
+                ))))]
+            );
+        }
+
+        #[test]
+        fn server_diff_round_trips() {
+            let mut mapper = DisplayMapper::default();
+            mapper.map(translate::tool_pending(CALL_ID, TOOL));
+            let diff = ToolOutput::Diff {
+                path: DIFF_PATH.into(),
+                before: BEFORE.into(),
+                after: AFTER.into(),
+                summary: String::new(),
+            };
+            let done = mapped(
+                &mut mapper,
+                translate::tool_done(&done_event(diff.clone(), false), cwd(), None),
+            );
+            assert_eq!(
+                done,
+                vec![json(AgentEvent::ToolDone(Box::new(done_event(
+                    diff, false
+                ))))]
+            );
+        }
+
+        #[test]
+        fn failed_tool_is_an_error() {
+            let mut mapper = DisplayMapper::default();
+            mapper.map(translate::tool_pending(CALL_ID, TOOL));
+            let plain = ToolOutput::Plain(TextOutput::from(OUTPUT));
+            let done = mapped(
+                &mut mapper,
+                translate::tool_done(&done_event(plain.clone(), true), cwd(), None),
+            );
+            assert_eq!(
+                done,
+                vec![json(AgentEvent::ToolDone(Box::new(done_event(
+                    plain, true
+                ))))]
+            );
+        }
+
+        #[test]
+        fn notice_card_is_an_observation_line() {
+            let mut mapper = DisplayMapper::default();
+            let events = mapped(&mut mapper, translate::notice(CALL_ID, NOTICE_TEXT));
+            assert_eq!(
+                events,
+                vec![json(AgentEvent::ObservationLine {
+                    text: NOTICE_TEXT.into(),
+                    detail: None,
+                    end: None,
+                })]
+            );
+        }
+
+        fn update(fields: ToolCallUpdateFields) -> SessionUpdate {
+            SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(CALL_ID, fields))
+        }
+
+        /// Update fields are changes, so a completion that only sets the status
+        /// must not wipe the output streamed before it.
+        #[test]
+        fn status_only_completion_keeps_streamed_output() {
+            let mut mapper = DisplayMapper::default();
+            mapper.map(translate::tool_pending(CALL_ID, TOOL));
+            mapper.map(translate::tool_output(CALL_ID, OUTPUT));
+            let events = mapper.map(update(
+                ToolCallUpdateFields::new().status(ToolCallStatus::Completed),
+            ));
+            let [AgentEvent::ToolDone(done)] = events.as_slice() else {
+                panic!("expected one ToolDone");
+            };
+            assert_eq!(done.output.as_text(), OUTPUT);
+        }
+
+        #[test]
+        fn explicit_empty_content_clears_the_output() {
+            let mut mapper = DisplayMapper::default();
+            mapper.map(translate::tool_pending(CALL_ID, TOOL));
+            mapper.map(translate::tool_output(CALL_ID, OUTPUT));
+            let events = mapper.map(update(
+                ToolCallUpdateFields::new()
+                    .status(ToolCallStatus::Completed)
+                    .content(Vec::new()),
+            ));
+            let [AgentEvent::ToolDone(done)] = events.as_slice() else {
+                panic!("expected one ToolDone");
+            };
+            assert_eq!(done.output.as_text(), "");
+        }
+
+        #[test]
+        fn repeated_start_keeps_summary_and_input() {
+            let mut mapper = DisplayMapper::default();
+            mapper.map(translate::tool_pending(CALL_ID, TOOL));
+            mapper.map(translate::tool_start(&start_event(), cwd(), None));
+            let events = mapped(
+                &mut mapper,
+                update(ToolCallUpdateFields::new().status(ToolCallStatus::InProgress)),
+            );
+            assert_eq!(
+                events,
+                vec![json(AgentEvent::ToolStart(Box::new(start_event())))]
+            );
+        }
+
+        /// Every Maki stop reason that goes out must come back as itself, except
+        /// `Compact`, which ACP has no word for.
+        #[test_case(DoneReason::EndTurn ; "end_turn")]
+        #[test_case(DoneReason::MaxTokens ; "max_tokens")]
+        #[test_case(DoneReason::MaxTurns ; "max_turns")]
+        #[test_case(DoneReason::Cancelled ; "cancelled")]
+        #[test_case(DoneReason::Dropped ; "dropped")]
+        fn done_reason_round_trips(reason: DoneReason) {
+            let AgentEvent::Done { reason: got, .. } =
+                DisplayMapper::default().done(translate::map_done_reason(reason))
+            else {
+                panic!("done must build a Done event");
+            };
+            assert_eq!(got, reason);
         }
     }
 }

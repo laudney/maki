@@ -9,7 +9,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crossterm::event::{KeyEvent, MouseEventKind};
-use maki_lua::{InputMode, Key, KeybindTicket, PASTE, SLICE_WARN, is_reserved};
+use maki_lua_core::runtime::SLICE_WARN;
+use maki_lua_ui::{InputMode, Key, KeybindTicket, PASTE, is_reserved};
 
 use super::Msg;
 

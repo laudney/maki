@@ -1,11 +1,10 @@
-use maki_providers::{ModelRequestOptions, ModelThinking};
 use std::time::{Duration, Instant};
 
 use maki_providers::provider::Provider;
 use maki_providers::retry::{RetryPolicy, RetryState};
 use maki_providers::{
-    ContentBlock, ContextGauge, Message, Model, Overflow, ProviderEvent, RequestOptions,
-    StreamResponse, estimate_prompt_tokens,
+    ContentBlock, ContextGauge, Message, Model, ModelRequestOptions, ModelThinking, Overflow,
+    ProviderEvent, RequestOptions, StreamResponse, estimate_prompt_tokens,
 };
 use maki_storage::id::SessionRef;
 use serde_json::Value;
@@ -320,11 +319,13 @@ pub(crate) async fn stream_with_retry(
                 // appended to.
                 let delay_ms = delay.as_millis() as u64;
                 warn!(attempt, delay_ms, rotated, error = %e, "retryable, will retry");
-                event_tx.send(AgentEvent::Retry {
-                    attempt,
-                    message,
-                    delay_ms,
-                })?;
+                event_tx
+                    .send(AgentEvent::Retry {
+                        attempt,
+                        message,
+                        delay_ms,
+                    })
+                    .map_err(AgentError::from)?;
                 if !delay.is_zero() {
                     let _ = cancel.race(sleep(delay)).await;
                 }

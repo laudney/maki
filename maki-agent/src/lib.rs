@@ -1,6 +1,7 @@
 //! Async agent loop with tools.
 
 pub mod agent;
+pub mod btw;
 pub mod call_scope;
 pub mod cancel;
 pub mod child_guard;
@@ -36,8 +37,11 @@ pub use live_session::{
     result_notice,
 };
 pub use maki_config::{AgentConfig, PermissionsConfig, SessionDefaults, ToolOutputLines};
+pub use maki_types::diff;
+pub use maki_types::input::{
+    AgentInput, AgentMode, EarlierInput, InputSource, McpPromptRef, merge_inputs,
+};
 pub mod command;
-pub mod diff;
 pub mod permissions;
 pub mod prompt;
 pub mod template;
@@ -45,37 +49,20 @@ pub mod tools;
 pub use tools::ToolFilter;
 pub mod types;
 
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-
 pub use maki_providers::AgentError;
-use maki_providers::Message;
+use maki_providers::provider::BoxFuture;
 pub use maki_providers::{
     EMPTY_RESPONSE_MARKER, ImageMediaType, ImageSource, TaskEnd, ThinkingConfig,
 };
 pub use types::{
-    AgentEvent, BufWatch, BufferSnapshot, CallRecord, CostTally, DoneReason, Envelope, EventSender,
-    EventStreamGuard, GrepFileEntry, GrepLine, GrepMatchGroup, InstructionBlock, NO_FILES_FOUND,
-    PartStatus, RunLedger, RunTotals, SessionEndReason, SessionEvents, SharedBuf, SnapshotLine,
-    SnapshotSpan, SpanColor, SpanStyle, SteerKind, SubagentInfo, TextOutput, ToolDoneEvent,
-    ToolInput, ToolOutput, ToolPart, ToolStartEvent, TurnCompleteEvent, UiWaker, event_stream,
+    AgentEvent, BufferSnapshot, CallRecord, ChildStatus, CostTally, DEFAULT_DATA_VERSION,
+    DoneReason, Envelope, EventSender, EventStreamGuard, GrepFileEntry, GrepLine, GrepMatchGroup,
+    InstructionBlock, NO_FILES_FOUND, PartStatus, PermissionChoice, RunLedger, RunTotals,
+    SessionEndReason, SessionEvents, SharedBuf, SnapshotLine, SnapshotSpan, SpanColor, SpanStyle,
+    SteerKind, SubagentInfo, TextOutput, ToolChild, ToolData, ToolDoneEvent, ToolInput, ToolOutput,
+    ToolPart, ToolProgressEvent, ToolStartEvent, TurnCompleteEvent, UiWaker, error_event,
+    event_stream,
 };
-
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub enum AgentMode {
-    #[default]
-    Build,
-    Plan(PathBuf),
-}
-
-impl AgentMode {
-    pub fn plan_path(&self) -> Option<&Path> {
-        match self {
-            Self::Plan(p) => Some(p),
-            Self::Build => None,
-        }
-    }
-}
 
 pub enum ExtractedCommand {
     /// Every message the user queued back to back, so one turn answers them
@@ -88,92 +75,22 @@ pub enum ExtractedCommand {
     Compact(Option<String>),
 }
 
+/// Polled once at every turn boundary. A source that waits for its answer
+/// stops when `cancel` does, so a run never hangs on it. `mode` is the run's
+/// mode right now, which a kept interrupt may have switched since it began.
 pub trait InterruptSource: Send + Sync {
-    fn poll(&self) -> Option<ExtractedCommand>;
+    fn poll<'a>(
+        &'a self,
+        cancel: &'a CancelToken,
+        mode: &'a AgentMode,
+    ) -> BoxFuture<'a, Option<ExtractedCommand>>;
 }
 
-#[derive(Clone)]
-pub struct McpPromptRef {
-    pub qualified_name: String,
-    pub arguments: HashMap<String, String>,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum InputSource {
-    Tui,
-    Acp,
-    /// `maki -p` and sdk mode.
-    Headless,
-    /// A plugin prompting a session of its own, `task` subagents included.
-    Plugin,
-}
-
-impl InputSource {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Tui => "tui",
-            Self::Acp => "acp",
-            Self::Headless => "headless",
-            Self::Plugin => "plugin",
-        }
-    }
-}
-
-/// A message queued ahead of the one that drives a run. It stays apart from
-/// the preamble so `agent.user_message` gets to judge it like any other.
-pub struct EarlierInput {
-    pub message: String,
-    pub images: Vec<ImageSource>,
-    pub preamble: Vec<Message>,
-}
-
-impl From<AgentInput> for EarlierInput {
-    fn from(input: AgentInput) -> Self {
-        Self {
-            message: input.message,
-            images: input.images,
-            preamble: input.preamble,
-        }
-    }
-}
-
-pub struct AgentInput {
-    pub message: String,
-    pub mode: AgentMode,
-    pub images: Vec<ImageSource>,
-    pub preamble: Vec<Message>,
-    /// The rest of a burst of queued messages, oldest first.
-    pub earlier: Vec<EarlierInput>,
-    pub thinking: ThinkingConfig,
-    pub fast: bool,
-    /// No `Default` on this struct so adding a field forces every call site to update.
-    pub workflow: bool,
-    pub prompt: Option<Box<McpPromptRef>>,
-    pub source: InputSource,
-}
-
-impl AgentInput {
-    /// What a host with no toggle UI sends. `-p`, the SDK and ACP know nothing
-    /// about the toggles beyond what config says, so they all build their input
-    /// here and a knob added to [`SessionDefaults`] reaches every one of them.
-    pub fn from_defaults(
-        message: String,
-        mode: AgentMode,
-        images: Vec<ImageSource>,
-        defaults: SessionDefaults,
-        source: InputSource,
-    ) -> Self {
-        Self {
-            message,
-            mode,
-            images,
-            preamble: Vec::new(),
-            earlier: Vec::new(),
-            thinking: defaults.thinking.into(),
-            fast: defaults.fast,
-            workflow: defaults.workflow,
-            prompt: None,
-            source,
-        }
-    }
+#[cfg(test)]
+pub(crate) fn test_block_on<T>(future: impl std::future::Future<Output = T>) -> T {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime")
+        .block_on(future)
 }

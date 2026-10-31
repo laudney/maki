@@ -99,33 +99,7 @@ fn default_timeout() -> u64 {
     DEFAULT_TIMEOUT_MS
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum McpServerStatus {
-    Connecting,
-    Running,
-    Disabled,
-    Failed(String),
-    NeedsAuth { url: Option<String> },
-}
-
-impl McpServerStatus {
-    pub fn is_active(&self) -> bool {
-        matches!(self, Self::Running | Self::Connecting)
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct McpServerInfo {
-    pub name: String,
-    pub transport_kind: &'static str,
-    pub tool_count: usize,
-    pub prompt_count: usize,
-    pub status: McpServerStatus,
-    pub config_path: PathBuf,
-    pub url: Option<String>,
-    pub oauth: Option<OauthClientConfig>,
-    pub ca_file: Option<PathBuf>,
-}
+pub use maki_types::mcp::{CallbackScheme, McpServerInfo, McpServerStatus, OauthClientConfig};
 
 #[derive(Deserialize, Default)]
 pub struct McpConfig {
@@ -200,37 +174,6 @@ pub struct ServerConfig {
     pub transport: Transport,
 }
 
-/// Without `client_id` the client is registered dynamically, so the
-/// `callback_*` fields still shape the redirect URI.
-#[derive(Deserialize, Clone, Debug, Default)]
-pub struct OauthClientConfig {
-    #[serde(default)]
-    pub client_id: Option<String>,
-    #[serde(default)]
-    pub client_secret: Option<String>,
-    /// Fixed loopback port so the redirect URI can be pre-registered.
-    #[serde(default)]
-    pub callback_port: Option<u16>,
-    /// Loopback path of the redirect URI (defaults to `/mcp/oauth/callback`).
-    #[serde(default)]
-    pub callback_path: Option<String>,
-    /// Loopback hostname of the redirect URI (defaults to `127.0.0.1`).
-    #[serde(default)]
-    pub callback_hostname: Option<String>,
-    /// `https` is for providers that refuse http redirect URIs. Maki has no TLS
-    /// listener, so the user pastes the redirect URL from the browser instead.
-    #[serde(default)]
-    pub callback_scheme: CallbackScheme,
-}
-
-#[derive(Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum CallbackScheme {
-    #[default]
-    Http,
-    Https,
-}
-
 #[derive(Clone, Debug)]
 pub enum Transport {
     Stdio {
@@ -264,7 +207,7 @@ impl McpConfig {
                 };
                 McpServerInfo {
                     name: name.clone(),
-                    transport_kind: transport_kind(&raw.transport),
+                    transport_kind: transport_kind(&raw.transport).into(),
                     tool_count: 0,
                     prompt_count: 0,
                     status,

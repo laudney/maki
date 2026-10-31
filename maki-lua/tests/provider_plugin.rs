@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use maki_agent::tools::ToolRegistry;
 use maki_lua::test_support::runtime;
-use maki_lua::{DiscoveredPackage, Origin, PluginHost, PluginPermissions, Requested};
+use maki_lua::{DiscoveredPackage, Origin, PackageRequests, PluginHost, PluginPermissions};
 use maki_providers::model::{Model, ModelTier};
 use maki_providers::provider::Provider;
 use maki_providers::retry::RetryKind;
@@ -744,7 +744,7 @@ fn every_registered_slug_needs_the_grant_a_package_load_carries() {
         name: TAKEOVER_PACKAGE.to_owned(),
         dir,
         eager: true,
-        requested: Requested::from_manifest(
+        requested: PackageRequests::from_manifest(
             &toml::from_str::<toml::Value>(&manifest).expect(PARSE_FAILED),
         ),
         origin: Origin::Manual,
@@ -807,7 +807,7 @@ error("the package failed after registering")"#
         name: TAKEOVER_PACKAGE.to_owned(),
         dir,
         eager: true,
-        requested: Requested::from_manifest(
+        requested: PackageRequests::from_manifest(
             &toml::from_str::<toml::Value>(&manifest).expect(PARSE_FAILED),
         ),
         origin: Origin::Manual,

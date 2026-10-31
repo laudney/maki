@@ -18,7 +18,7 @@ use crate::mcp::McpSession;
 use crate::prompt::COMPACTION_USER;
 use crate::tools::hook::Verdict;
 use crate::tools::truncate_bytes;
-use crate::{AgentError, AgentEvent, DoneReason, EventSender, TurnCompleteEvent};
+use crate::{AgentError, AgentEvent, DoneReason, EventSender, RunLedger, TurnCompleteEvent};
 
 const CONTINUE_AFTER_COMPACT: &str = "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed. If the summary contains a todo list, restore it with todo_write and keep it updated. If you learned important project context during this session, consider saving it to memory before it's lost.";
 const TOOL_RESULT_PLACEHOLDER: &str = "[tool result]";
@@ -186,6 +186,9 @@ pub(super) struct Compacted {
 /// after it, so input no turn has answered yet survives verbatim without ever
 /// leaving `history`. Anything less and the mirror would publish a transcript
 /// missing that input for the length of the summary request.
+///
+/// `ledger` is billed for the summary as soon as it arrives, so a summary
+/// that turns out unusable is still paid for.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn compact_history(
     provider: &dyn maki_providers::provider::Provider,
@@ -197,6 +200,7 @@ pub(super) async fn compact_history(
     instructions: Option<&str>,
     carry_len: usize,
     retry: RetryPolicy,
+    ledger: Option<&RunLedger>,
 ) -> Result<Compacted, AgentError> {
     let compact_start = std::time::Instant::now();
     let summarized = history.len().saturating_sub(carry_len);
@@ -245,6 +249,7 @@ pub(super) async fn compact_history(
                     event_tx,
                     compact_start,
                     model,
+                    ledger,
                 );
             }
             Err(StreamError::Other(e)) if e.is_context_overflow() && attempt < max_attempts - 1 => {
@@ -271,16 +276,23 @@ fn finish_compact(
     event_tx: &EventSender,
     compact_start: std::time::Instant,
     model: &Model,
+    ledger: Option<&RunLedger>,
 ) -> Result<Compacted, AgentError> {
-    let _ = event_tx.send(AgentEvent::TurnComplete(Box::new(TurnCompleteEvent {
+    // The summary request never asks for fast, so it is priced without it.
+    let turn = TurnCompleteEvent {
         message: response.message.clone(),
         usage: response.usage,
         model: model.id.clone(),
         cost: model.billed_cost(&response.usage, false),
         subsidised_list_cost: model.subsidised_list_cost(&response.usage, false),
+        subsidised_by: model.subsidised_by.clone(),
         context_size: Some(response.usage.output),
         context_window: model.context_window,
-    })));
+    };
+    if let Some(ledger) = ledger {
+        ledger.bill(&turn, model.list_cost(&response.usage, false));
+    }
+    let _ = event_tx.send(AgentEvent::TurnComplete(Box::new(turn)));
 
     // Swapping the history for a summary the model never wrote would throw the
     // session away for nothing.
@@ -330,14 +342,17 @@ pub async fn compact(
     config: &AgentConfig,
     instructions: Option<&str>,
     retry: RetryPolicy,
+    ledger: Option<&RunLedger>,
 ) -> Result<DoneReason, AgentError> {
     let size_before = gauge.size();
+    // The gauge is the session's, so it is sized against the session's
+    // model; only the prices are the summariser's.
     let finished = |usage: TokenUsage, context_size| AgentEvent::Done {
         usage,
         cost: model.billed_cost(&usage, false),
         list_cost: model.list_cost(&usage, false),
         context_size,
-        context_window: model.context_window,
+        context_window: hooks.model.context_window,
         num_turns: 1,
         // `Compact` and not `EndTurn`, so a goal loop reading this sees
         // housekeeping and does not treat it as a turn boundary.
@@ -358,6 +373,7 @@ pub async fn compact(
         steer.instructions.as_deref(),
         0,
         retry,
+        ledger,
     )
     .await
     {
@@ -386,7 +402,7 @@ pub async fn compact(
     event_tx.send(AgentEvent::CompactionDone {
         context_size_before,
         context_size_after,
-        context_window: model.context_window,
+        context_window: hooks.model.context_window,
         summary,
     })?;
     event_tx.send(finished(usage, context_size_after))?;
@@ -638,6 +654,7 @@ mod tests {
     const OLD_RESULT: &str = "old";
     const NEW_RESULT: &str = "new result";
     const KEPT_TEXT: &str = "keep me";
+    const EMPTY_SUMMARY_OUTPUT: u32 = 40;
     /// These tests assert on the transcript and on gauge sizes relative to each
     /// other, so the baseline would only add noise.
     const NO_SYSTEM: &str = "";
@@ -761,6 +778,7 @@ mod tests {
             config,
             instructions,
             RetryPolicy::default(),
+            None,
         )
         .await
     }
@@ -785,6 +803,7 @@ mod tests {
             None,
             carry_len,
             RetryPolicy::default(),
+            None,
         )
         .await
         .unwrap();
@@ -932,6 +951,49 @@ mod tests {
         assert_eq!(history.as_slice()[0].user_text(), Some(KEPT));
     }
 
+    /// The summariser billed the request before its answer proved unusable.
+    #[tokio::test]
+    async fn an_empty_summary_is_still_billed() {
+        let usage = TokenUsage {
+            output: EMPTY_SUMMARY_OUTPUT,
+            ..TokenUsage::default()
+        };
+        let provider = MockProvider::new(vec![Ok(StreamResponse {
+            message: Message {
+                role: Role::Assistant,
+                ..Default::default()
+            },
+            usage,
+            stop_reason: Some(StopReason::EndTurn),
+            ..Default::default()
+        })]);
+        let mut history = History::new(vec![Message::user(KEPT_TEXT.into())]);
+        let (raw_tx, _rx) = flume::unbounded();
+        let registry = ToolRegistry::new();
+        let model = default_model();
+        let cancel = CancelToken::none();
+        let ledger = RunLedger::default();
+
+        let result = compact(
+            &provider,
+            &model,
+            &mut history,
+            &mut ContextGauge::default(),
+            bare_context(&model),
+            None,
+            &EventSender::new(raw_tx, 0),
+            &test_hooks(&registry, None, &model, &cancel),
+            &AgentConfig::default(),
+            None,
+            RetryPolicy::default(),
+            Some(&ledger),
+        )
+        .await;
+
+        assert!(matches!(result, Err(AgentError::EmptySummary)));
+        assert_eq!(ledger.totals().usage.output, EMPTY_SUMMARY_OUTPUT);
+    }
+
     #[tokio::test]
     async fn compact_reports_a_cancel_as_an_ending_not_a_failure() {
         let provider = MockProvider::new(vec![Ok(text_response(StopReason::EndTurn))]);
@@ -1032,6 +1094,7 @@ mod tests {
             &AgentConfig::default(),
             instructions,
             RetryPolicy::default(),
+            None,
         )
         .await;
         (result, rx.try_iter().map(|e| e.event).collect())

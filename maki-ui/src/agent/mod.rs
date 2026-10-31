@@ -1,127 +1,184 @@
-mod agent_loop;
-mod model_slots;
-mod run_cancels;
+pub(crate) mod capabilities;
+pub(crate) mod remote_facade;
+pub(crate) mod remote_models;
+pub(crate) mod remote_plan;
+pub(crate) mod remote_settings;
+pub use self::remote_settings::RemoteSettings;
+mod remote_loop;
+pub(crate) mod remote_replay;
 pub(crate) mod shared_queue;
 
-use std::mem;
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use arc_swap::ArcSwap;
-use maki_agent::permissions::PermissionManager;
-use maki_agent::session::Resumed;
-use maki_agent::{
-    AgentConfig, CancelMap, Envelope, HistorySnapshot, McpCommand, McpConfigErrors, McpHandle,
-    McpSnapshotReader, SessionMailbox, SharedMessages, ToolOutputLines,
-};
-use maki_config::ModelPolicy;
-use maki_lua::EventHandle;
-use maki_storage::id::SessionRef;
+use crate::EventHandle;
+use crate::components::permission_prompt::AnsweredRequest;
+use agent_client_protocol_schema::v1::{SessionId, SessionUpdate};
+use arc_swap::ArcSwapOption;
+use maki_storage::remote_drafts::RemoteStore;
+use maki_types::event::Envelope;
+use maki_types::session::StoredSession;
+use maki_wire::client::{AcpClient, ClientEvent};
+use maki_wire::extensions::Agreed;
+use maki_wire::session::SessionOperation;
+use maki_wire::usage::SessionUsage;
+use serde::de::DeserializeOwned;
 
-use self::run_cancels::RunCancels;
-use maki_providers::Message;
+use self::remote_plan::{PlanWrites, RemotePlan};
+
+use maki_types::cancel::RunCancels;
 use tokio::runtime::Handle;
 use tokio_util::task::AbortOnDropHandle;
 use tracing::{info, warn};
 
 use crate::app::App;
 
-use self::agent_loop::AgentLoop;
-pub(crate) use self::model_slots::ModelSlots;
+pub(crate) use self::remote_loop::MALFORMED_UPDATE;
+/// A fake agent on the other end of a remote tab's link.
+#[cfg(test)]
+pub(crate) use self::remote_loop::tests as fake_agent;
+pub use self::remote_loop::{BUILD_MODE, PLAN_MODE};
+use self::remote_loop::{Rebind, RemoteAgentLoop, RewindRequest};
 pub(crate) use self::shared_queue::{QueueSender, QueuedMessage};
-pub(crate) use maki_agent::ModelSlot;
 
-/// Why a tab's agent loop is replaced.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum Respawn {
-    /// The tab's own session moved on (rewind, `/new`). Its meta lags behind
-    /// the mailbox then, so the receipts it lists are not lost work.
-    Restart,
-    /// A stored session was loaded into the tab. The receipts it left
-    /// unanswered come back as lost notices, ahead of its restored queue.
-    Load,
+/// A remote session's spending, published by its loop and drawn by the App.
+pub(crate) type UsageSlot = Arc<ArcSwapOption<SessionUsage>>;
+
+/// Which `/new` the client is bound to. The App asks for a replacement at
+/// once, the loop installs it later, and until then the client still names
+/// the old session, which a side question must not ask.
+#[derive(Default)]
+pub(crate) struct SessionBinding {
+    requested: AtomicU64,
+    bound: AtomicU64,
 }
 
-/// Input channels (`answer_tx`, `queue`) are per-agent, so an old loop can
-/// never steal new input. The output channel (`agent_tx`/`agent_rx`) is
-/// per-tab: `respawn` reuses it, so anyone still holding a sender (a Lua
-/// restore reply, a click, an old agent winding down) can always deliver.
-/// Stale events are filtered by `run_id`, not by killing the channel.
+impl SessionBinding {
+    pub(crate) fn request(&self) -> u64 {
+        self.requested.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    fn bind(&self, generation: u64) {
+        self.bound.store(generation, Ordering::SeqCst);
+    }
+
+    pub(crate) fn is_current(&self) -> bool {
+        self.bound.load(Ordering::SeqCst) == self.requested.load(Ordering::SeqCst)
+    }
+}
+
+/// A spawned agent's own invocation with its terminal login's arguments
+/// and environment, run in this terminal for `/login`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LoginInvocation {
+    pub program: String,
+    pub args: Vec<String>,
+    pub env: HashMap<String, String>,
+}
+
+/// A remote tab's `/login`: what to run, and whom to tell it ran.
+#[derive(Clone)]
+pub(crate) struct RemoteLogin {
+    pub(crate) invocation: LoginInvocation,
+    pub(crate) client: Arc<AcpClient>,
+}
+
+/// What a remote tab's side requests (`/btw`, the `/usage` quota) ask
+/// through, when the agent agreed on them.
+#[derive(Clone)]
+pub(crate) struct RemoteSession {
+    pub(crate) client: Arc<AcpClient>,
+    pub(crate) binding: Arc<SessionBinding>,
+    pub(crate) rewind_tx: Option<flume::Sender<RewindRequest>>,
+}
+
+impl RemoteSession {
+    /// The binding first: only the UI thread asks for a `/new`, so once it
+    /// is current the session read next is the installed one.
+    pub(crate) fn session(&self) -> Option<SessionId> {
+        match self.binding.is_current() {
+            true => self.client.bound_session().ok(),
+            false => None,
+        }
+    }
+
+    pub(crate) fn request<T: DeserializeOwned>(
+        &self,
+        operation: impl FnOnce(SessionId) -> SessionOperation,
+    ) -> Result<T, String> {
+        if self.rewind_tx.is_none() {
+            return Err(capabilities::UNAVAILABLE_REMOTE.into());
+        }
+        let id = self.session().ok_or(capabilities::SESSION_OPENING)?;
+        let result = Handle::current()
+            .block_on(self.client.session_operation(operation(id.clone())))
+            .map_err(|error| error.to_string())?;
+        if self.session().as_ref() != Some(&id) {
+            return Err(remote_settings::SESSION_REPLACED.into());
+        }
+        serde_json::from_value(result).map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn rewind(&self, index: usize, prompt: String) -> Result<StoredSession, String> {
+        let (reply, result) = flume::bounded(1);
+        self.rewind_tx
+            .as_ref()
+            .ok_or(capabilities::UNAVAILABLE_REMOTE)?
+            .send(RewindRequest {
+                session: self.session().ok_or(capabilities::SESSION_OPENING)?,
+                index,
+                prompt,
+                reply,
+            })
+            .map_err(|_| capabilities::CONNECTION_LOST.to_owned())?;
+        result
+            .recv()
+            .map_err(|_| capabilities::CONNECTION_LOST.to_owned())?
+    }
+
+    /// The session the client is bound to, which names the tab, also while
+    /// a `/new` is still opening the next one.
+    pub(crate) fn name(&self) -> Option<String> {
+        self.client.bound_session().ok().map(|id| id.to_string())
+    }
+}
+
+/// Channels and task for one tab's ACP connection.
 pub(crate) struct AgentHandles {
     pub(crate) agent_rx: flume::Receiver<Envelope>,
-    pub(crate) agent_tx: flume::Sender<Envelope>,
-    pub(crate) answer_tx: flume::Sender<String>,
-    pub(crate) history: SharedMessages,
-    pub(crate) mcp_handle: Option<McpHandle>,
-    pub(crate) mcp_config_errors: McpConfigErrors,
+    pub(crate) answer_tx: flume::Sender<AnsweredRequest>,
     pub(crate) queue: QueueSender,
-    pub(crate) timeouts: maki_providers::Timeouts,
     cancels: Arc<RunCancels>,
-    subagent_cancels: Arc<CancelMap<String>>,
-    model_policy: Arc<ModelPolicy>,
-    mailbox: SessionMailbox,
     task: AbortOnDropHandle<()>,
+    remote_usage: UsageSlot,
+    remote_settings: RemoteSettings,
+    /// A remote tab's loop owns the connection, so `/new` hands it new input
+    /// channels instead of respawning it.
+    rebind_tx: flume::Sender<Rebind>,
+    pub(crate) remote_btw: Option<RemoteSession>,
+    pub(crate) remote_quota: Option<RemoteSession>,
+    pub(crate) remote_login: Option<RemoteLogin>,
+    /// The session a remote tab is bound to, for what it keeps of its own.
+    pub(crate) remote_link: RemoteSession,
+    pub(crate) remote_plan: Option<RemotePlan>,
+    /// Shared with the loop, which binds each replacement it installs.
+    binding: Arc<SessionBinding>,
 }
 
 impl AgentHandles {
-    /// MCP is shared across sessions and agent respawns; the event loop starts it
-    /// once and shuts it down at exit. Only the agent loop task lives here.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn spawn(
-        model_slot: &Arc<ArcSwap<ModelSlot>>,
-        resumed: Resumed,
-        config: AgentConfig,
-        tool_output_lines: ToolOutputLines,
-        permissions: &Arc<PermissionManager>,
-        timeouts: maki_providers::Timeouts,
-        lua_handle: EventHandle,
-        mcp_handle: Option<McpHandle>,
-        mcp_config_errors: McpConfigErrors,
-        model_policy: Arc<ModelPolicy>,
-    ) -> Self {
-        spawn_agent_internal(
-            flume::unbounded(),
-            model_slot,
-            resumed,
-            config,
-            tool_output_lines,
-            permissions,
-            mcp_handle,
-            mcp_config_errors,
-            timeouts,
-            lua_handle,
-            model_policy,
-        )
-    }
-
-    pub(crate) fn mcp_reader(&self) -> McpSnapshotReader {
-        self.mcp_handle
-            .as_ref()
-            .map(McpHandle::reader)
-            .unwrap_or_else(McpSnapshotReader::empty)
-    }
-
     pub(crate) fn apply_to_app(&self, app: &mut App) {
         app.answer_tx = Some(self.answer_tx.clone());
-        app.mailbox = Some(self.mailbox.clone());
-        app.shared_history = Some(Arc::clone(&self.history));
         app.queue.set_shared(self.queue.clone());
-        let restore_tx =
-            maki_agent::EventSender::new(self.agent_tx.clone(), crate::app::RESTORE_RUN_ID);
-        app.restore_event_tx = Some(restore_tx.clone());
-        for chat in &mut app.chats {
-            chat.set_restore_channel(Some(restore_tx.clone()));
-        }
-        self.publish_chat_settings(app);
-    }
-
-    /// Background subagents read the chat's mode and thinking from the seed. A
-    /// fresh loop gets them right away, before any monitor can look. The event
-    /// loop then sends them again on every pass, so code that changes a
-    /// setting never has to remember to.
-    pub(crate) fn publish_chat_settings(&self, app: &App) {
-        if let Some(seed) = self.mailbox.seed() {
-            seed.set_chat_settings(app.request_options(), &app.agent_mode());
+        app.watch_remote_usage(Some(self.remote_usage.clone()));
+        app.remote_settings = Some(self.remote_settings.clone());
+        app.remote_plan = self.remote_plan.clone();
+        app.remote_link = Some(self.remote_link.clone());
+        if self.remote_link.rewind_tx.is_some() {
+            let reader = app.mcp_picker.set_remote(self.remote_link.clone());
+            app.command_palette.set_mcp_reader(reader);
         }
     }
 
@@ -131,81 +188,57 @@ impl AgentHandles {
     }
 
     pub(crate) fn cancel_subagent(&self, tool_use_id: String) {
-        self.subagent_cancels.cancel(tool_use_id);
+        if let Some(session_id) = self.remote_link.session() {
+            let client = Arc::clone(&self.remote_link.client);
+            tokio::spawn(async move {
+                if let Err(error) = client
+                    .session_operation(SessionOperation::CancelSubagent {
+                        session_id,
+                        id: tool_use_id,
+                    })
+                    .await
+                {
+                    warn!(%error, "could not cancel subagent");
+                }
+            });
+        }
     }
 
     /// Respawn or shutdown: this loop is done, whatever it was in the middle of.
     pub(crate) fn cancel_all(&self) {
         self.cancels.cancel_all();
-        self.subagent_cancels.cancel_all();
     }
 
-    pub(crate) fn send_mcp(&self, cmd: McpCommand) {
-        if let Some(ref h) = self.mcp_handle {
-            h.send(cmd);
-        }
+    pub(crate) fn send_mcp(&self, server: String, enabled: bool) -> Result<(), String> {
+        self.remote_link
+            .request::<maki_types::mcp::McpSnapshot>(|session_id| SessionOperation::Mcp {
+                session_id,
+                toggle: Some((server, enabled)),
+            })?;
+        Ok(())
     }
 
-    pub(crate) fn claim_mailbox_wake(&self) -> Vec<Message> {
-        self.mailbox.claim_wake()
-    }
-
-    pub(crate) fn mailbox(&self) -> &SessionMailbox {
-        &self.mailbox
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn respawn(
-        &mut self,
-        history: Vec<Message>,
-        model_slot: &Arc<ArcSwap<ModelSlot>>,
-        config: AgentConfig,
-        tool_output_lines: ToolOutputLines,
-        permissions: &Arc<PermissionManager>,
-        app: &mut App,
-        lua_handle: EventHandle,
-        reason: Respawn,
-    ) {
-        // The output channel survives the respawn, so this bump is the only
-        // thing that makes the old loop's in-flight envelopes stale. It lives
-        // here so no caller can respawn without it.
+    /// `/new` replaces the queue only after the loop has its successor,
+    /// so the loop never reads the closed queue as a shutdown.
+    pub(crate) fn rebind(&mut self, app: &mut App) {
         app.run_id += 1;
-        let slot = model_slot.load();
-        if let Err(e) = Handle::current().block_on(slot.provider.reload_auth()) {
-            warn!(error = %e, "failed to reload auth, continuing with existing credentials");
-        }
-        let new = spawn_agent_internal(
-            (self.agent_tx.clone(), self.agent_rx.clone()),
-            model_slot,
-            Resumed {
-                id: SessionRef::from(app.state.session.id),
-                history,
-                // A respawn carries the app's last reported count across, so
-                // the next request is not left guessing at its own prompt.
-                context_size: app.state.context_size,
-                frame: app.state.session.frame().cloned(),
-                session: None,
-            },
-            config,
-            tool_output_lines,
-            permissions,
-            self.mcp_handle.clone(),
-            self.mcp_config_errors.clone(),
-            self.timeouts,
-            lua_handle,
-            Arc::clone(&self.model_policy),
-        );
-        let old = mem::replace(self, new);
-        // Repoint the app at the new queue before dropping `old`, otherwise the app keeps
-        // the last old `QueueSender` alive and the old loop parks in `recv_notify` forever.
-        self.apply_to_app(app);
-        // The first restored prompt can start a run at once, and that run
-        // has to drain the lost notices with it.
-        if reason == Respawn::Load {
-            app.restore_lost_background();
-        }
-        app.flush_restored_queue();
-        old.cancel_all();
+        self.rebind_queue(app.run_id);
+        app.queue.set_shared(self.queue.clone());
+        app.watch_remote_usage(Some(self.remote_usage.clone()));
+        app.usage_slot = Arc::default();
+    }
+
+    fn rebind_queue(&mut self, run_id: u64) {
+        let (queue_tx, queue_rx) = shared_queue::queue();
+        let usage = UsageSlot::default();
+        let _ = self.rebind_tx.send(Rebind {
+            queue: Arc::new(queue_rx),
+            run_id,
+            usage: Arc::clone(&usage),
+            generation: self.binding.request(),
+        });
+        self.queue = queue_tx;
+        self.remote_usage = usage;
     }
 
     pub(crate) fn is_finished(&self) -> bool {
@@ -237,570 +270,115 @@ pub(crate) fn join_all(tasks: Vec<AbortOnDropHandle<()>>, timeout: Duration) {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn spawn_agent_internal(
-    (agent_tx, agent_rx): (flume::Sender<Envelope>, flume::Receiver<Envelope>),
-    model_slot: &Arc<ArcSwap<ModelSlot>>,
-    resumed: Resumed,
-    config: AgentConfig,
-    tool_output_lines: ToolOutputLines,
-    permissions: &Arc<PermissionManager>,
-    mcp_handle: Option<McpHandle>,
-    mcp_config_errors: McpConfigErrors,
-    timeouts: maki_providers::Timeouts,
-    lua_handle: EventHandle,
-    model_policy: Arc<ModelPolicy>,
+/// Start a tab's ACP loop and its channels.
+/// `seed` is the replay's usage, stored before the loop starts so any live
+/// update, which is newer, replaces it.
+pub(crate) fn spawn_remote(
+    mut remote: RemoteAgent,
+    seed: Option<SessionUsage>,
+    cwd: PathBuf,
+    lua: EventHandle,
 ) -> AgentHandles {
-    let (answer_tx, answer_rx) = flume::unbounded::<String>();
+    let (agent_tx, agent_rx) = flume::unbounded::<Envelope>();
+    let (answer_tx, answer_rx) = flume::unbounded::<AnsweredRequest>();
     let (queue_tx, queue_rx) = shared_queue::queue();
-    let queue_rx = Arc::new(queue_rx);
-    // Seeded empty because `AgentLoop::new` below publishes the real snapshot
-    // synchronously, before any handle escapes.
-    let shared_history: SharedMessages =
-        Arc::new(ArcSwap::from_pointee(HistorySnapshot::default()));
-    maki_agent::agent::publish_live_history(resumed.id.id(), &shared_history);
+    let (rebind_tx, rebind_rx) = flume::unbounded();
+    let (rewind_tx, rewind_rx) = flume::unbounded();
     let cancels = RunCancels::new();
-    let subagent_cancels: Arc<CancelMap<String>> = Arc::new(CancelMap::new());
-    let mailbox = SessionMailbox::register(resumed.id.id());
-
-    let agent_loop = AgentLoop::new(
-        Arc::clone(model_slot),
-        config,
-        tool_output_lines,
-        resumed,
-        Arc::clone(&shared_history),
-        mcp_handle.clone(),
-        Arc::clone(permissions),
+    let usage = UsageSlot::new(ArcSwapOption::from_pointee(seed));
+    let binding = Arc::<SessionBinding>::default();
+    let link = RemoteSession {
+        client: Arc::clone(&remote.client),
+        binding: Arc::clone(&binding),
+        rewind_tx: remote.extensions.sessions.then_some(rewind_tx),
+    };
+    let side = |agreed: bool| agreed.then(|| link.clone());
+    let plan_writes = remote.extensions.plan.then(PlanWrites::default);
+    let remote_plan = plan_writes.clone().map(|writes| RemotePlan {
+        writes,
+        link: link.clone(),
+    });
+    let remote_btw = side(remote.extensions.btw);
+    let remote_quota = side(remote.extensions.usage_ledger);
+    let remote_login = remote
+        .login
+        .clone()
+        .filter(|_| remote.extensions.login)
+        .map(|invocation| RemoteLogin {
+            invocation,
+            client: Arc::clone(&remote.client),
+        });
+    let remote_loop = RemoteAgentLoop::new(
+        &mut remote,
         agent_tx.clone(),
         answer_rx,
-        queue_rx,
+        Arc::new(queue_rx),
         Arc::clone(&cancels),
-        mailbox.clone(),
-        timeouts,
-        lua_handle,
-        Arc::clone(&subagent_cancels),
-        Arc::clone(&model_policy),
+        Arc::clone(&usage),
+        cwd.clone(),
+        rebind_rx,
+        rewind_rx,
+        Arc::clone(&binding),
+        lua,
+        plan_writes,
     );
-
-    let task = AbortOnDropHandle::new(tokio::spawn(agent_loop.run()));
-
     AgentHandles {
         agent_rx,
-        agent_tx,
         answer_tx,
-        history: shared_history,
-        mcp_handle,
-        mcp_config_errors,
         queue: queue_tx,
-        timeouts,
         cancels,
-        subagent_cancels,
-        model_policy,
-        mailbox,
-        task,
+        task: AbortOnDropHandle::new(tokio::spawn(remote_loop.run())),
+        remote_usage: usage,
+        remote_settings: remote.settings,
+        rebind_tx,
+        remote_btw,
+        remote_quota,
+        remote_login,
+        remote_link: link,
+        remote_plan,
+        binding,
     }
 }
 
-#[cfg(test)]
-mod tests {
-    mod background_e2e;
+/// An ACP connection with its session already open, handed to the first tab.
+pub struct RemoteAgent {
+    pub client: Arc<AcpClient>,
+    pub events: flume::Receiver<ClientEvent>,
+    /// The Maki extensions both sides agreed on.
+    pub extensions: Agreed,
+    /// The agent takes images in prompts.
+    pub images: bool,
+    /// The agent advertised `build` and `plan`, so Tab switches its mode.
+    pub plan_modes: bool,
+    /// The agent's mode when the session opened.
+    pub mode: Option<String>,
+    /// The wire position of the `session/new` or `session/load` answer the
+    /// mode and menu came from, so only later updates replace them.
+    pub session_seq: u64,
+    /// The history a loaded session replayed, drawn before the first frame.
+    pub replay: Vec<SessionUpdate>,
+    /// Replayed lines the client could not read.
+    pub unreadable: usize,
+    /// Shared model, mode and preference configuration.
+    pub settings: RemoteSettings,
+    /// The agent offered a terminal login this client can run.
+    pub login: Option<LoginInvocation>,
+    /// Where the tab keeps what it typed, when the user's store resolves.
+    pub input: Option<RemoteInput>,
+    /// The agent loads sessions, so a reload of the client's plugins
+    /// reopens this one instead of ending the run.
+    pub reload: bool,
+    /// Events the client read off the link after the session opened and
+    /// before this tab's loop started, which the loop handles first, in
+    /// order.
+    pub early: Vec<ClientEvent>,
+}
 
-    use std::path::{Path, PathBuf};
-    use std::time::Instant;
-
-    use maki_agent::live_session::BACKGROUND_PLAN_WRITE_DENIED;
-    use maki_agent::{AgentEvent, AgentInput, AgentMode, AgentSeed, InputSource};
-    use maki_config::{PermissionsConfig, ProjectConfig};
-    use maki_providers::provider::{BoxFuture, Provider};
-    use maki_providers::{
-        AgentError, Model, ModelInfo, ProviderEvent, RequestOptions, StreamResponse, TaskEnd,
-        ThinkingConfig,
-    };
-    use test_case::test_case;
-
-    use super::shared_queue::{QueueItem, QueuedInput};
-    use super::*;
-    use crate::app::Mode;
-    use crate::app::tests::enter_runtime;
-
-    const LONG_TIMEOUT: Duration = Duration::from_secs(60);
-    const SHORT_TIMEOUT: Duration = Duration::from_millis(50);
-    const PROBE_TEXT: &str = "probe-through-old-sender";
-    const RESTORED_TEXT: &str = "restored-queued-message";
-    const RESUMED_HISTORY_TEXT: &str = "resumed-conversation";
-    const MODEL_A: &str = "model-a";
-    const MODEL_B: &str = "model-b";
-    const FIRST_PROMPT: &str = "first-turn";
-    const SECOND_PROMPT: &str = "second-turn";
-    const RECORDER_TOOL: &str = "recording-provider";
-    const TURN_OVER: &str = "model recorded, nothing left to stream";
-    const NO_CALL: &str = "the agent never reached the provider";
-    const NO_TURN_END: &str = "the run never reported that it was over";
-    const GATE_CLOSED: &str = "the in-flight call is no longer waiting to be released";
-    const SEED_NOT_LIVE: &str = "the respawned loop publishes a seed for the app's session";
-    const LOST_ID: &str = "toolu_lost_on_exit";
-
-    struct StubProvider;
-
-    impl Provider for StubProvider {
-        fn stream_message<'a>(
-            &'a self,
-            _model: &'a Model,
-            _messages: &'a [Message],
-            _system: &'a str,
-            _tools: &'a serde_json::Value,
-            _event_tx: &'a flume::Sender<ProviderEvent>,
-            _opts: RequestOptions,
-            _session_id: Option<&'a SessionRef>,
-        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
-            Box::pin(std::future::pending())
-        }
-
-        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-            Box::pin(async { Ok(Vec::new()) })
-        }
-    }
-
-    fn stub_spawn() -> (
-        AgentHandles,
-        Arc<ArcSwap<ModelSlot>>,
-        Arc<PermissionManager>,
-    ) {
-        stub_spawn_with(Vec::new())
-    }
-
-    fn stub_spawn_with(
-        initial_history: Vec<Message>,
-    ) -> (
-        AgentHandles,
-        Arc<ArcSwap<ModelSlot>>,
-        Arc<PermissionManager>,
-    ) {
-        let model_slot = Arc::new(ArcSwap::from_pointee(ModelSlot {
-            model: crate::components::test_model(),
-            provider: Arc::new(StubProvider),
-        }));
-        let (handles, permissions) = spawn_on(&model_slot, initial_history);
-        (handles, model_slot, permissions)
-    }
-
-    fn spawn_on(
-        model_slot: &Arc<ArcSwap<ModelSlot>>,
-        initial_history: Vec<Message>,
-    ) -> (AgentHandles, Arc<PermissionManager>) {
-        let permissions = Arc::new(PermissionManager::new(
-            PermissionsConfig::default(),
-            PathBuf::from("/tmp"),
-            ProjectConfig::for_project(Path::new("/tmp")),
-            Arc::default(),
-        ));
-        let handles = AgentHandles::spawn(
-            model_slot,
-            Resumed {
-                history: initial_history,
-                ..Resumed::fresh()
-            },
-            AgentConfig::default(),
-            ToolOutputLines::default(),
-            &permissions,
-            maki_providers::Timeouts::default(),
-            EventHandle::disconnected_for_test(),
-            None,
-            McpConfigErrors::new(PathBuf::new()),
-            Arc::new(ModelPolicy::default()),
-        );
-        (handles, permissions)
-    }
-
-    fn respawn(
-        handles: &mut AgentHandles,
-        model_slot: &Arc<ArcSwap<ModelSlot>>,
-        permissions: &Arc<PermissionManager>,
-        app: &mut App,
-    ) {
-        handles.respawn(
-            Vec::new(),
-            model_slot,
-            AgentConfig::default(),
-            ToolOutputLines::default(),
-            permissions,
-            app,
-            EventHandle::disconnected_for_test(),
-            Respawn::Restart,
-        );
-    }
-
-    /// Reports which model the agent handed it, then ends the turn with a
-    /// non-retryable error so no stream has to be faked. `gate` parks a call in
-    /// flight until the test lets it go, one permit per call.
-    struct RecordingProvider {
-        calls: flume::Sender<String>,
-        gate: Option<flume::Receiver<()>>,
-    }
-
-    impl Provider for RecordingProvider {
-        fn stream_message<'a>(
-            &'a self,
-            model: &'a Model,
-            _messages: &'a [Message],
-            _system: &'a str,
-            _tools: &'a serde_json::Value,
-            _event_tx: &'a flume::Sender<ProviderEvent>,
-            _opts: RequestOptions,
-            _session_id: Option<&'a SessionRef>,
-        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
-            let id = model.id.clone();
-            Box::pin(async move {
-                let _ = self.calls.send(id);
-                if let Some(ref gate) = self.gate {
-                    gate.recv_async().await.expect(GATE_CLOSED);
-                }
-                Err(AgentError::Tool {
-                    tool: RECORDER_TOOL.into(),
-                    message: TURN_OVER.into(),
-                })
-            })
-        }
-
-        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-            Box::pin(async { Ok(Vec::new()) })
-        }
-    }
-
-    fn recorder() -> (Arc<dyn Provider>, flume::Receiver<String>) {
-        let (calls, reported) = flume::unbounded();
-        (Arc::new(RecordingProvider { calls, gate: None }), reported)
-    }
-
-    fn gated_recorder() -> (
-        Arc<dyn Provider>,
-        flume::Receiver<String>,
-        flume::Sender<()>,
-    ) {
-        let (calls, reported) = flume::unbounded();
-        let (release, gate) = flume::unbounded();
-        (
-            Arc::new(RecordingProvider {
-                calls,
-                gate: Some(gate),
-            }),
-            reported,
-            release,
-        )
-    }
-
-    fn slot(model_id: &str, provider: &Arc<dyn Provider>) -> Arc<ModelSlot> {
-        Arc::new(ModelSlot {
-            model: Model {
-                id: model_id.into(),
-                ..crate::components::test_model()
-            },
-            provider: Arc::clone(provider),
-        })
-    }
-
-    fn push_prompt(handles: &AgentHandles, run_id: u64, text: &str) {
-        handles.queue.push(QueueItem::Message(QueuedInput {
-            text: text.into(),
-            input: AgentInput {
-                message: text.into(),
-                mode: AgentMode::default(),
-                images: Vec::new(),
-                preamble: Vec::new(),
-                earlier: Vec::new(),
-                thinking: ThinkingConfig::default(),
-                fast: false,
-                workflow: false,
-                prompt: None,
-                source: InputSource::Tui,
-            },
-            run_id,
-            displayed: true,
-        }));
-    }
-
-    /// The failed turn's `Error` is what says the run is over. Queue the next
-    /// prompt before it and the running turn swallows it as an interrupt, so
-    /// the second request never happens.
-    fn await_turn_end(handles: &AgentHandles) {
-        loop {
-            let envelope = handles
-                .agent_rx
-                .recv_timeout(LONG_TIMEOUT)
-                .expect(NO_TURN_END);
-            if matches!(envelope.event, AgentEvent::Error { .. }) {
-                return;
-            }
-        }
-    }
-
-    fn drive_turn(
-        handles: &AgentHandles,
-        reported: &flume::Receiver<String>,
-        run_id: u64,
-        text: &str,
-    ) -> String {
-        push_prompt(handles, run_id, text);
-        let model_id = reported.recv_timeout(LONG_TIMEOUT).expect(NO_CALL);
-        await_turn_end(handles);
-        model_id
-    }
-
-    /// The regression the per-runtime cell fixed. With one process-wide slot,
-    /// picking a model in one tab dragged every other tab onto it.
-    #[test]
-    fn a_model_swap_in_one_tab_leaves_the_other_tab_alone() {
-        let _runtime = enter_runtime();
-        let (provider_one, reported_one) = recorder();
-        let (provider_two, reported_two) = recorder();
-        let cell_one = Arc::new(ArcSwap::new(slot(MODEL_A, &provider_one)));
-        let cell_two = Arc::new(ArcSwap::new(slot(MODEL_A, &provider_two)));
-        let (handles_one, _permissions_one) = spawn_on(&cell_one, Vec::new());
-        let (handles_two, _permissions_two) = spawn_on(&cell_two, Vec::new());
-
-        cell_one.store(slot(MODEL_B, &provider_one));
-
-        assert_eq!(
-            drive_turn(&handles_one, &reported_one, 1, FIRST_PROMPT),
-            MODEL_B
-        );
-        assert_eq!(
-            drive_turn(&handles_two, &reported_two, 1, SECOND_PROMPT),
-            MODEL_A,
-            "a swap on one runtime's cell must not move another runtime's model"
-        );
-    }
-
-    /// `respawn` hands the new loop the cell, not the model inside it. Captured
-    /// by value, a `/model` pick after a `/new` or a session load would be
-    /// ignored until something respawned the agent again.
-    #[test]
-    fn a_swap_after_respawn_still_reaches_the_new_agent() {
-        let _runtime = enter_runtime();
-        let (provider, reported) = recorder();
-        let cell = Arc::new(ArcSwap::new(slot(MODEL_A, &provider)));
-        let (mut handles, permissions) = spawn_on(&cell, Vec::new());
-        let mut app = crate::app::tests::test_app();
-        respawn(&mut handles, &cell, &permissions, &mut app);
-
-        cell.store(slot(MODEL_B, &provider));
-        assert_eq!(
-            drive_turn(&handles, &reported, app.run_id, FIRST_PROMPT),
-            MODEL_B
-        );
-    }
-
-    /// The loop reads its cell at the start of every run rather than keeping
-    /// the model it spawned with, so a pick made mid-flight leaves the running
-    /// turn alone and still shows up on the next one.
-    #[test]
-    fn a_swap_during_a_turn_only_applies_to_the_following_turn() {
-        let _runtime = enter_runtime();
-        let (provider, reported, release) = gated_recorder();
-        let cell = Arc::new(ArcSwap::new(slot(MODEL_A, &provider)));
-        let (handles, _permissions) = spawn_on(&cell, Vec::new());
-
-        push_prompt(&handles, 1, FIRST_PROMPT);
-        let in_flight = reported.recv_timeout(LONG_TIMEOUT).expect(NO_CALL);
-        cell.store(slot(MODEL_B, &provider));
-        release.send(()).expect(GATE_CLOSED);
-        await_turn_end(&handles);
-        assert_eq!(in_flight, MODEL_A);
-
-        push_prompt(&handles, 2, SECOND_PROMPT);
-        let next = reported.recv_timeout(LONG_TIMEOUT).expect(NO_CALL);
-        release.send(()).expect(GATE_CLOSED);
-        await_turn_end(&handles);
-        assert_eq!(
-            next, MODEL_B,
-            "a swap stored mid-flight must still land on the next turn"
-        );
-    }
-
-    /// Senders captured before any respawn (Lua restore replies, clicks) must
-    /// still reach the live receiver, and restored queue items must land in
-    /// the freshly wired queue, not the one that just died.
-    #[test]
-    fn respawn_twice_keeps_channel_and_delivers_restored_queue() {
-        let _runtime = enter_runtime();
-        let (mut handles, model_slot, permissions) = stub_spawn();
-        let pre_gen1_sender =
-            maki_agent::EventSender::new(handles.agent_tx.clone(), crate::app::RESTORE_RUN_ID);
-
-        let mut app = crate::app::tests::test_app();
-        let run_id_before = app.run_id;
-        respawn(&mut handles, &model_slot, &permissions, &mut app);
-        assert_eq!(app.run_id, run_id_before + 1);
-
-        app.state.session_mut().meta.queued_messages = vec![RESTORED_TEXT.into()];
-        respawn(&mut handles, &model_slot, &permissions, &mut app);
-        assert_eq!(
-            app.run_id,
-            run_id_before + 2,
-            "each respawn must bump run_id exactly once"
-        );
-        assert_eq!(
-            app.queue.text_messages(),
-            [RESTORED_TEXT],
-            "the restored item lands in the new queue exactly once"
-        );
-
-        pre_gen1_sender
-            .send(AgentEvent::TextDelta {
-                text: PROBE_TEXT.into(),
-            })
-            .expect("pre-generation-1 sender must still deliver after two respawns");
-
-        let mut probe_seen = false;
-        let mut consumed_seen = false;
-        while !(probe_seen && consumed_seen) {
-            let envelope = handles
-                .agent_rx
-                .recv_timeout(LONG_TIMEOUT)
-                .expect("probe or restored queue item never reached the tab channel");
-            match envelope.event {
-                AgentEvent::TextDelta { ref text } if text == PROBE_TEXT => probe_seen = true,
-                AgentEvent::QueueItemConsumed { ref text, .. } => {
-                    assert_eq!(text, RESTORED_TEXT);
-                    assert_eq!(envelope.run_id, app.run_id);
-                    consumed_seen = true;
-                }
-                _ => {}
-            }
-        }
-    }
-
-    /// If the seeded empty snapshot ever outlived `spawn`, the next checkpoint
-    /// would adopt it and wipe a resumed conversation from disk.
-    #[test]
-    fn spawn_publishes_the_resumed_history_before_the_handles_escape() {
-        let _runtime = enter_runtime();
-        let (handles, _model_slot, _permissions) =
-            stub_spawn_with(vec![Message::user(RESUMED_HISTORY_TEXT.into())]);
-        let snapshot = handles.history.load();
-        assert_eq!(
-            snapshot.messages.len(),
-            1,
-            "the seeded empty snapshot must be replaced synchronously"
-        );
-        assert_eq!(snapshot.messages[0].user_text(), Some(RESUMED_HISTORY_TEXT));
-    }
-
-    #[test]
-    fn respawn_publishes_the_new_history_into_the_app_mirror() {
-        let _runtime = enter_runtime();
-        let (mut handles, model_slot, permissions) = stub_spawn();
-        let mut app = crate::app::tests::test_app();
-        handles.respawn(
-            vec![Message::user(RESUMED_HISTORY_TEXT.into())],
-            &model_slot,
-            AgentConfig::default(),
-            ToolOutputLines::default(),
-            &permissions,
-            &mut app,
-            EventHandle::disconnected_for_test(),
-            Respawn::Restart,
-        );
-
-        let mirror = app
-            .shared_history
-            .as_ref()
-            .expect("respawn wires the live mirror into the app");
-        let snapshot = mirror.load();
-        assert_eq!(
-            snapshot.messages.len(),
-            1,
-            "a checkpoint right after respawn must not see the seeded empty snapshot"
-        );
-        assert_eq!(snapshot.messages[0].user_text(), Some(RESUMED_HISTORY_TEXT));
-    }
-
-    /// A loaded session's lost notices are queued before its restored prompt
-    /// can start a run, so that first run carries them. A restart brings none
-    /// back: the meta lags behind the mailbox there.
-    #[test_case(Respawn::Load, true ; "load_restores_before_the_queue_runs")]
-    #[test_case(Respawn::Restart, false ; "restart_restores_nothing")]
-    fn respawn_restores_lost_notices_only_for_a_loaded_session(reason: Respawn, restored: bool) {
-        let _runtime = enter_runtime();
-        let (provider, _reported) = recorder();
-        let cell = Arc::new(ArcSwap::new(slot(MODEL_A, &provider)));
-        let (mut handles, permissions) = spawn_on(&cell, Vec::new());
-        let mut app = crate::app::tests::test_app();
-        let meta = &mut app.state.session_mut().meta;
-        meta.pending_background = vec![LOST_ID.into()];
-        meta.queued_messages = vec![RESTORED_TEXT.into()];
-
-        handles.respawn(
-            Vec::new(),
-            &cell,
-            AgentConfig::default(),
-            ToolOutputLines::default(),
-            &permissions,
-            &mut app,
-            EventHandle::disconnected_for_test(),
-            reason,
-        );
-
-        let mut observed = false;
-        loop {
-            let envelope = handles
-                .agent_rx
-                .recv_timeout(LONG_TIMEOUT)
-                .expect(NO_TURN_END);
-            match envelope.event {
-                AgentEvent::ObservationLine { end, .. } => observed |= end == Some(TaskEnd::Lost),
-                AgentEvent::Error { .. } => break,
-                _ => {}
-            }
-        }
-        assert_eq!(observed, restored);
-    }
-
-    /// A monitor can prompt before the user sends anything, so the seed has to
-    /// know whether the chat plans, and its effort, from the moment the loop
-    /// exists.
-    /// `/new` and loads respawn under a new id with no settings to inherit.
-    #[test]
-    fn a_respawned_seed_starts_with_the_chat_settings() {
-        let _runtime = enter_runtime();
-        let (mut handles, model_slot, permissions) = stub_spawn();
-        let mut app = crate::app::tests::test_app();
-        app.set_mode(Mode::Plan);
-        app.state.thinking = ThinkingConfig::Adaptive;
-
-        respawn(&mut handles, &model_slot, &permissions, &mut app);
-        let id = app.state.session.id;
-        let seed = AgentSeed::live(id).expect(SEED_NOT_LIVE);
-        assert_eq!(seed.chat_opts(), app.request_options());
-        assert_eq!(
-            AgentSeed::background_write_block(id).as_deref(),
-            Some(BACKGROUND_PLAN_WRITE_DENIED)
-        );
-    }
-
-    #[test]
-    fn join_all_returns_when_all_tasks_complete() {
-        let _runtime = enter_runtime();
-        join_all(Vec::new(), LONG_TIMEOUT);
-        join_all(
-            (0..3)
-                .map(|_| AbortOnDropHandle::new(tokio::spawn(async {})))
-                .collect(),
-            LONG_TIMEOUT,
-        );
-    }
-
-    #[test]
-    fn join_all_stuck_task_returns_after_shared_timeout() {
-        let _runtime = enter_runtime();
-        let start = Instant::now();
-        join_all(
-            vec![
-                AbortOnDropHandle::new(tokio::spawn(async {})),
-                AbortOnDropHandle::new(tokio::spawn(std::future::pending::<()>())),
-            ],
-            SHORT_TIMEOUT,
-        );
-        assert!(start.elapsed() >= SHORT_TIMEOUT);
-    }
+/// A remote tab's own input, in the user's store: its history for the
+/// workspace, and its unsent draft and queue per session.
+pub struct RemoteInput {
+    pub store: RemoteStore,
+    pub history: PathBuf,
+    /// The session was loaded, so its record is restored.
+    pub resumed: bool,
 }

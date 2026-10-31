@@ -4,13 +4,14 @@
 //! places, one per transition: `start_run`, `handle_cancel`, and
 //! `AgentHandles::respawn`. Everything else only reads it.
 
-use maki_providers::ModelThinking;
-
 mod btw;
 mod image_paste;
 pub(crate) mod mode;
 mod mouse;
 mod queue;
+pub(crate) mod remote_drafts;
+mod remote_settings;
+mod remote_usage;
 mod session;
 pub(crate) mod session_state;
 pub(crate) mod shell;
@@ -21,14 +22,26 @@ mod typeahead;
 pub(crate) mod view;
 
 use std::collections::{HashMap, HashSet};
-use std::env;
-use std::mem;
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
+use std::{env, mem};
 
-use crate::OpenSession;
+use agent_client_protocol_schema::v1::SessionUpdate;
+use maki_wire::extensions::Agreed;
+use maki_wire::plugins::PluginOperation;
+use maki_wire::sanitize::sanitize_display;
+use maki_wire::usage::SessionUsage;
+
+use crate::agent::capabilities::{
+    AgentBackend, CONNECTION_LOST, MODEL_NEXT_PROMPT, UNAVAILABLE_REMOTE,
+};
+use crate::agent::remote_models::{ModelMenu, ModelPick};
+use crate::agent::remote_plan::RemotePlan;
+use crate::agent::remote_settings::{Intent, RemoteSettings, Setting, SettingsMenu};
+use crate::agent::{MALFORMED_UPDATE, RemoteSession, UsageSlot, remote_facade, remote_replay};
+use crate::app::remote_drafts::RemoteDrafts;
 use crate::app::tasks::{BackgroundMoves, TaskClock, TaskOutcome, TaskParent, count_phrase};
 use crate::chat::Chat;
 use crate::chat::{CANCELLED_TEXT, ChatEventResult, DONE_TEXT, ERROR_TEXT};
@@ -45,16 +58,17 @@ use crate::components::keybindings::key;
 use crate::components::login_picker::{LoginPicker, LoginPickerAction};
 use crate::components::lua_float::FloatManager;
 use crate::components::mcp_picker::{McpPicker, McpPickerAction};
-use crate::components::model_picker::{ModelPicker, ModelPickerAction};
+use crate::components::messages::RenderPlace;
 use crate::components::pack_review::{PackReview, PackReviewAction};
-use crate::components::permission_prompt::PermissionPrompt;
+use crate::components::permission_prompt::{AnsweredRequest, PermissionPrompt};
 use crate::components::plan_form::{PlanForm, PlanFormAction, builtin_menu, builtin_rows};
+use crate::components::remote_model_picker::{RemoteModelPicker, RemoteModelPickerAction};
 use crate::components::rewind_picker::{RewindPicker, RewindPickerAction};
 use crate::components::scrollbar;
 use crate::components::search_modal::{SearchAction, SearchModal};
 use crate::components::status_bar::StatusBar;
 use crate::components::theme_picker::{ThemePicker, ThemePickerAction};
-use crate::components::usage_modal::{UsageFetchState, UsageModal};
+use crate::components::usage_modal::{UsageFetch, UsageFetchState, UsageModal};
 use crate::components::{
     Action, BackgroundOutcome, DisplayMessage, DisplayRole, ExitRequest, Overlay, RetryInfo,
     Status, is_ctrl,
@@ -63,31 +77,32 @@ use crate::markdown::TRUNCATION_PREFIX;
 use crate::repaint::{Cadence, Dirty, Watch};
 use crate::selection::{SelectionState, SelectionZone, ZoneRegistry};
 use crate::text_buffer::{RuleSet, TextBuffer, Writers, normalize_line_endings, sanitize};
+use crate::{EventHandle, OpenSession};
 use arc_swap::ArcSwapOption;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
-use maki_agent::permissions::{PermissionManager, TaggedAnswer};
-use maki_agent::{
-    AgentEvent, Envelope, ImageSource, McpConfigErrors, McpPromptInfo, McpSnapshotReader,
-    SessionMailbox, SharedBuf, SharedMessages, SubagentInfo, ToolPart,
-};
+use maki_config::UiConfig;
 use maki_config::project::{self, GatedFile, TrustQuestion};
-use maki_config::{ModelPolicy, UiConfig};
-use maki_lua::agent_autocmd::HostEvent;
-use maki_lua::{
-    BuiltinAction, EventHandle, HintReader, HintSnapshot, InputDecorate, InputEdit, InputMarks,
-    InputMode, InputRule, InputRulesReader, InputSnapshot, InputSubmit, Key, KeymapReader,
-    LuaCommandReader, PLAN_FORM_SLOT_DEADLINE, PLAN_ROW_HANDLER_DEADLINE, PackCommand,
-    PackPreparation, Permission, PlanActionOutcome, PlanMenu, PlanRowAction, PluginReach, WinView,
-    is_reserved,
+use maki_lua_core::agent_autocmd::HostEvent;
+use maki_lua_core::pack::{PackCommand, PackPreparation};
+use maki_lua_core::plugin_permissions::{Permission, PluginReach};
+use maki_lua_ui::{
+    BuiltinAction, HintReader, HintSnapshot, InputDecorate, InputEdit, InputMarks, InputMode,
+    InputRule, InputRulesReader, InputSnapshot, InputSubmit, Key, KeymapReader, LuaCommandReader,
+    PLAN_FORM_SLOT_DEADLINE, PLAN_ROW_HANDLER_DEADLINE, PlanActionOutcome, PlanMenu, PlanRowAction,
+    WinView, is_reserved,
 };
-use maki_providers::models_cache::ModelList;
-use maki_providers::{ContentBlock, Message, Model, ThinkingConfig, TokenUsage, add_cost};
+use maki_storage::sessions::add_cost;
+use maki_types::event::ToolPart;
+use maki_types::message::{ContentBlock, Message};
+
 use maki_storage::StateDir;
 use maki_storage::input_history::InputHistory;
-use maki_storage::model::persist_thinking;
-use maki_storage::sessions::StoredTokenUsage;
+use maki_types::event::{AgentEvent, Envelope, SubagentInfo};
+use maki_types::mcp::{McpPromptInfo, McpSnapshotReader};
+use maki_types::message::ImageSource;
+use maki_types::snapshot::SharedBuf;
+use maki_wire::session::SessionOperation;
 
-use crate::storage_writer::StorageWriter;
 use ratatui::layout::{Position, Rect};
 
 pub(crate) use crate::agent::QueuedMessage;
@@ -95,19 +110,19 @@ pub(crate) use mode::{Mode, PlanState, PlanTrigger};
 #[cfg(test)]
 use mouse::EDGE_SCROLL_LINES;
 pub(crate) use queue::{MessageQueue, SubmitOutcome};
-use session::Sent;
 pub(crate) use session::session_has_content;
 use session_state::SessionState;
 use shell::ShellPrefix;
 use typeahead::{Hold, InputAt, KeyboardFocus, Pressed, Prompts, Sight, Turn, Typeahead};
 
+/// Where a local agent's paths start; a remote agent's home stays unknown.
+static LOCAL_HOME: LazyLock<Option<PathBuf>> = LazyLock::new(maki_storage::paths::home);
 const CANCEL_MSG: &str = "Cancelled.";
 const MAIN_CHAT: usize = 0;
 const EXIT_WORD: &str = "exit";
 const EXIT_COMMAND: &str = "/exit";
 /// Bypasses the per-run staleness filter because re-bake replies
 /// don't belong to any real agent run.
-pub(crate) const RESTORE_RUN_ID: u64 = u64::MAX;
 const FLASH_CANCEL: &str = "Press esc again to stop...";
 const FLASH_REWIND: &str = "Press esc again to rewind...";
 // Short, because the flash shares the status bar with the model and cost.
@@ -145,17 +160,12 @@ const PLAN_FORM_ANSWER_WAIT: Duration =
 /// still beats it.
 const PLAN_ACTION_ANSWER_WAIT: Duration =
     Duration::from_secs(PLAN_ROW_HANDLER_DEADLINE.as_secs() + PLAN_FORM_QUEUE_SLACK_SECS);
-const FAST_UNSUPPORTED_MSG: &str = "Fast mode needs Anthropic Opus 4.6+ with an API key, or an eligible Codex model with a ChatGPT subscription";
-const THINKING_UNSUPPORTED_MSG: &str = "Thinking requires a model that supports it";
-const FAST_ON_MSG: &str = "Fast mode: on";
-const FAST_PENDING_MSG: &str = "Fast mode: pending model discovery";
-const FAST_OFF_MSG: &str = "Fast mode: off";
 const WORKFLOW_ON_MSG: &str = "Workflow mode: on";
 const WORKFLOW_OFF_MSG: &str = "Workflow mode: off";
+const FAST_ON_MSG: &str = "Fast mode: on";
+const FAST_OFF_MSG: &str = "Fast mode: off";
 pub(crate) const NOTHING_TO_TRUST_MSG: &str = "nothing to trust in this folder";
 const TRUSTED_PREFIX: &str = "Trusted this folder: ";
-const PROVIDER_FOLDED_SUFFIX: &str = ": folded away";
-const PROVIDER_UNFOLDED_SUFFIX: &str = ": unfolded";
 const PACK_CHANGES_DECLINED: &str = "Package changes declined";
 pub(crate) const HELD_KEYS_DROPPED: &str =
     "Dropped the keys typed before a prompt opened, so they could not answer it";
@@ -211,8 +221,6 @@ enum PaletteKey {
 /// The send, the check a plugin's send passes first and the check on the
 /// plugins that wrote the text all read it here, so they cannot disagree.
 enum Sending {
-    /// Retries the turn a login cut short, whatever the input holds.
-    AuthRetry,
     Nothing,
     /// `exit`, which quits like `/exit`.
     Exit,
@@ -221,8 +229,7 @@ enum Sending {
 }
 
 impl Sending {
-    /// What Enter sends {text} as, once the command palette passed it on
-    /// and no login retry waits.
+    /// Classify the text passed on by the command palette.
     fn of(text: &str, has_images: bool) -> Self {
         if text.is_empty() && !has_images {
             return Self::Nothing;
@@ -244,7 +251,7 @@ impl Sending {
             Self::Nothing => None,
             Self::Exit => palette.resolve_for_plugin(EXIT_COMMAND, caller).err(),
             Self::Shell(_) => RUNS_SHELL.refusal(RUN_SHELL_LINE, caller),
-            Self::AuthRetry | Self::Message => SUBMITS_PROMPT.refusal(SEND_MESSAGE, caller),
+            Self::Message => SUBMITS_PROMPT.refusal(SEND_MESSAGE, caller),
         }
     }
 
@@ -253,13 +260,12 @@ impl Sending {
     /// is held to it as well, because the user cannot be trusted to have
     /// read it. A plugin can hide text in more ways than we could ever spot,
     /// like a conceal, a char that draws nothing or a line scrolled away.
-    /// A login retry sends none of the text.
     fn written_as(&self) -> Option<&'static str> {
         match self {
             Self::Exit => Some(WRITTEN_EXIT),
             Self::Shell(_) => Some(WRITTEN_SHELL_LINE),
             Self::Message => Some(WRITTEN_MESSAGE),
-            Self::AuthRetry | Self::Nothing => None,
+            Self::Nothing => None,
         }
     }
 
@@ -365,8 +371,8 @@ impl InputWriter {
 pub(crate) enum Notification {
     TurnComplete { response: Option<String> },
     PermissionRequested { tool: Option<String> },
-    AuthenticationRequired,
     QuestionRequested,
+    AuthenticationRequired,
     PlanReady,
     AgentError { message: String },
 }
@@ -380,8 +386,8 @@ impl Notification {
         match self {
             Self::TurnComplete { .. } => "Turn complete",
             Self::PermissionRequested { .. } => "Permission requested",
-            Self::AuthenticationRequired => "Authentication required",
             Self::QuestionRequested => "Question requested",
+            Self::AuthenticationRequired => "Authentication required",
             Self::PlanReady => "Plan ready",
             Self::AgentError { .. } => "Agent error",
         }
@@ -396,8 +402,8 @@ impl Notification {
                 format!("Permission requested: {tool}")
             }
             Self::PermissionRequested { tool: None } => "Permission requested".into(),
-            Self::AuthenticationRequired => "Authentication required".into(),
             Self::QuestionRequested => "Question requested".into(),
+            Self::AuthenticationRequired => AUTH_EXPIRED_MSG.into(),
             Self::PlanReady => "Plan ready".into(),
             Self::AgentError { message } => message.clone(),
         }
@@ -451,6 +457,7 @@ fn task_id_of(envelope: &Envelope) -> Option<&str> {
 fn started_by(info: &SubagentInfo) -> Option<TaskParent> {
     info.parent_call
         .as_deref()
+        .filter(|call| *call != info.parent_tool_use_id)
         .map(|call| TaskParent::Started(Arc::from(call)))
 }
 
@@ -464,12 +471,6 @@ fn fill_missing_subagent_info(chat: &mut Chat, info: &SubagentInfo) {
     }
     if chat.is_finished() {
         return;
-    }
-    if chat.answer_tx.is_none() {
-        chat.answer_tx.clone_from(&info.answer_tx);
-    }
-    if chat.inbox.is_none() {
-        chat.inbox.clone_from(&info.inbox);
     }
     if chat.model_id.is_none() {
         chat.model_id.clone_from(&info.model);
@@ -553,7 +554,7 @@ pub struct App {
     pub(crate) input_box: InputBox,
     pub(super) command_palette: CommandPalette,
     pub(super) theme_picker: ThemePicker,
-    pub(super) model_picker: ModelPicker,
+    pub(super) remote_model_picker: RemoteModelPicker,
     pub(super) login_picker: LoginPicker,
     pub(super) mcp_picker: McpPicker,
     pub(super) rewind_picker: RewindPicker,
@@ -579,7 +580,7 @@ pub struct App {
     background_deadline: Option<Instant>,
     pub(crate) queue: MessageQueue,
     recoverable_queue: Vec<String>,
-    pub answer_tx: Option<flume::Sender<String>>,
+    pub answer_tx: Option<flume::Sender<AnsweredRequest>>,
     /// Bumped whenever the host opens a prompt, see [`Self::open_prompt`].
     /// The plugin windows that need input count their own, see
     /// [`Self::prompts`].
@@ -611,16 +612,36 @@ pub struct App {
     /// purpose: a kind the project adds mid-session is not something the user
     /// was shown, so `/trust` must not cover it and the next start asks.
     pub(crate) trust_question: Option<TrustQuestion>,
-    pub(crate) usage_slot: Arc<ArcSwapOption<UsageFetchState>>,
-    pub(crate) shared_history: Option<SharedMessages>,
+    /// Where `/trust` records its grant, see `EventLoopParams::trust_store`.
+    pub(crate) trust_store: StateDir,
+    /// Set once when the tab is built. A remote agent refuses everything the
+    /// client could only do with local agent state.
+    pub(crate) backend: AgentBackend,
+    /// The menu last drawn, so a menu the loop publishes repaints an idle tab.
+    remote_menu: Watch<ModelMenu>,
+    /// A remote session's spending, applied on receipt.
+    remote_usage: Option<UsageSlot>,
+    remote_usage_drawn: Watch<SessionUsage>,
+    /// A remote agent's settings, with its menu, the intent and the last
+    /// failure as last drawn.
+    pub(crate) remote_settings: Option<RemoteSettings>,
+    pub(crate) remote_drafts: Option<RemoteDrafts>,
+    /// A remote agent's plan file, under the plan extension.
+    pub(crate) remote_plan: Option<RemotePlan>,
+    /// The session a remote tab is bound to, which names the tab.
+    pub(crate) remote_link: Option<RemoteSession>,
+    /// The text of its last plan write, which a remote tab answers
+    /// `plan_snapshot` with instead of reading a file.
+    remote_plan_text: Option<String>,
+    remote_settings_drawn: Watch<SettingsMenu>,
+    remote_intent: Watch<Intent>,
+    remote_failure: Watch<String>,
+    pub(crate) usage_slot: Arc<ArcSwapOption<UsageFetch>>,
     pub(crate) image_paste_rx: Vec<flume::Receiver<Result<ImageSource, String>>>,
     pub(crate) primary_paste_rx: Vec<flume::Receiver<Option<String>>>,
-    storage_writer: Arc<StorageWriter>,
-    last_sent: Option<Sent>,
     pub(crate) shell: shell::ShellState,
     pub(crate) ui_config: UiConfig,
-    pub(crate) permissions: Arc<PermissionManager>,
-    pub(crate) model_policy: Arc<ModelPolicy>,
+    pub(crate) yolo: session_state::Yolo,
     pub(crate) lua_event_handle: EventHandle,
     /// The spec Lua was last told about. Seeded with the live model rather
     /// than the session's stored one: a restored session may name another
@@ -648,36 +669,36 @@ pub struct App {
     /// plan row handler answers long after the key press that started it.
     pub(super) pending_actions: Vec<Action>,
     typeahead: Typeahead,
-    pub(crate) restore_event_tx: Option<maki_agent::EventSender>,
     pub(super) restoring: Arc<AtomicBool>,
-    /// The agent's mailbox, held here so the live session outlives every
-    /// write of its receipts.
-    pub(crate) mailbox: Option<SessionMailbox>,
+}
+
+/// Where a session in {cwd} runs, the home known only for a local agent.
+fn render_place(cwd: &str, local: bool) -> RenderPlace<'_> {
+    RenderPlace {
+        cwd: Path::new(cwd),
+        home: LOCAL_HOME.as_deref().filter(|_| local),
+    }
 }
 
 impl App {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        model: &Model,
         session: OpenSession,
         storage: StateDir,
-        available_models: Arc<ArcSwapOption<ModelList>>,
         mcp_reader: McpSnapshotReader,
-        mcp_config_errors: McpConfigErrors,
         lua_command_reader: LuaCommandReader,
         keymap_reader: KeymapReader,
         hint_reader: HintReader,
         input_rules_reader: InputRulesReader,
-        storage_writer: Arc<StorageWriter>,
         ui_config: UiConfig,
         input_history_size: usize,
-        permissions: Arc<PermissionManager>,
-        custom_commands: Arc<[maki_agent::command::CustomCommand]>,
+        yolo: bool,
+        custom_commands: Arc<[maki_types::command::CustomCommand]>,
         lua_event_handle: EventHandle,
-        model_policy: Arc<ModelPolicy>,
+        login_catalog: Option<crate::LoginCatalog>,
     ) -> Self {
         scrollbar::set_enabled(ui_config.scrollbar);
-        let state = SessionState::from_session(session, model, &storage);
+        let state = SessionState::from_session(session);
         let typewriter = ui_config.typewriter_ms_per_char;
         let flash = ui_config.flash_duration();
         let mut input_box = InputBox::new(
@@ -692,7 +713,8 @@ impl App {
         input_box
             .buffer
             .set_rules(RuleSet::with_plugins(&input_rules));
-        let mut app = Self {
+        let announced_model_spec = state.session.model.clone();
+        let app = Self {
             chats: vec![Chat::new(
                 state.session.id,
                 None,
@@ -710,9 +732,9 @@ impl App {
                 lua_command_reader,
             ),
             theme_picker: ThemePicker::new(),
-            model_picker: ModelPicker::new(available_models),
-            login_picker: LoginPicker::new(),
-            mcp_picker: McpPicker::new(mcp_reader, mcp_config_errors),
+            remote_model_picker: RemoteModelPicker::new(),
+            login_picker: LoginPicker::new(login_catalog),
+            mcp_picker: McpPicker::new(mcp_reader),
             rewind_picker: RewindPicker::new(),
             alert_modal: AlertModal::new(),
             help_modal: HelpModal::new(),
@@ -747,20 +769,29 @@ impl App {
             background_moves: BackgroundMoves::default(),
             early_finals: HashMap::new(),
             tool_parts: HashMap::new(),
+            trust_store: storage.clone(),
             storage,
             trust_question: None,
+            backend: AgentBackend::Disconnected,
+            remote_menu: Watch::default(),
+            remote_usage: None,
+            remote_usage_drawn: Watch::default(),
+            remote_settings: None,
+            remote_link: None,
+            remote_drafts: None,
+            remote_plan: None,
+            remote_plan_text: None,
+            remote_settings_drawn: Watch::default(),
+            remote_intent: Watch::default(),
+            remote_failure: Watch::default(),
             usage_slot: Arc::new(ArcSwapOption::empty()),
-            shared_history: None,
             image_paste_rx: vec![],
             primary_paste_rx: vec![],
-            storage_writer,
-            last_sent: None,
             shell: shell::ShellState::default(),
             ui_config,
-            permissions,
-            model_policy: Arc::clone(&model_policy),
+            yolo: session_state::Yolo::new(yolo),
             lua_event_handle,
-            announced_model_spec: model.spec(),
+            announced_model_spec,
             announced_input: InputAt::default(),
             input_writer: InputWriter::Untouched,
             input_fired_this_frame: false,
@@ -772,22 +803,9 @@ impl App {
             plan_answers: PlanAnswers::default(),
             pending_actions: Vec::new(),
             typeahead: Typeahead::default(),
-            restore_event_tx: None,
-            mailbox: None,
             restoring: Arc::new(AtomicBool::new(false)),
         };
-        app.model_picker.set_recents(
-            maki_storage::model::read_recents(&app.storage)
-                .into_iter()
-                .filter(|spec| model_policy.allows(spec))
-                .collect(),
-        );
-        app.model_picker
-            .set_collapsed(maki_storage::model::read_collapsed_providers(&app.storage));
-        // The manager arrives forked from the prototype the process was
-        // started with, so a tab that resumes or spawns blank runs on
-        // `--yolo` until its own meta is read back here.
-        app.apply_stored_permissions(&app.state.session.meta);
+        app.apply_stored_yolo(&app.state.session.meta);
         app
     }
 
@@ -857,7 +875,7 @@ impl App {
         let mode = self.sync_input_mode();
         let old = mem::replace(announced, mode);
         if old != mode {
-            self.lua_event_handle.fire(
+            self.lua_event_handle.core.fire(
                 None,
                 HostEvent::ModeChanged {
                     old_mode: old.letter(),
@@ -872,9 +890,9 @@ impl App {
     /// holds, so it leaves out a plugin's own sessions, which wake nobody.
     pub(super) fn input_placeholder(&self) -> Placeholder {
         let chat = &self.chats[self.active_chat];
-        let waiting_on = self.live_mailbox().map_or(0, SessionMailbox::outstanding);
+        let waiting_on = self.outstanding_background();
         if !self.is_main_chat() {
-            if chat.inbox.is_none() && !chat.is_finished() {
+            if chat.remote_inbox.is_none() && !chat.is_finished() {
                 Placeholder::TaskStop
             } else {
                 Placeholder::SubagentQueue
@@ -928,7 +946,11 @@ impl App {
     /// re-stores the running model once it learns its context window, and a
     /// hint has nothing new to draw for that.
     pub(crate) fn emit_model_change(&mut self) {
-        let spec = self.state.model.spec();
+        let spec = self.model_state()["spec"]
+            .as_str()
+            .filter(|spec| !spec.is_empty())
+            .unwrap_or(&self.state.session.model)
+            .to_owned();
         if spec == self.announced_model_spec {
             return;
         }
@@ -939,51 +961,18 @@ impl App {
         });
     }
 
-    /// Takes the spelling `maki.model.set` accepts, which is what the
-    /// `/thinking` plugin passes through. A blank {input} toggles.
-    ///
-    /// Stores the clamped value rather than the typed one, so the status bar
-    /// can never read `off` on a model that is really sending minimal effort.
-    ///
-    /// The value is also written to disk here, and only here: the next run
-    /// seeds its sessions from it (`SessionDefaults`), the same way the model
-    /// is remembered. A clamp on model change is not the user's choice, so it
-    /// does not overwrite the file.
-    pub(crate) fn set_thinking(&mut self, input: &str) -> Result<ThinkingConfig, String> {
-        if !self.state.model.supports_thinking() {
-            return Err(THINKING_UNSUPPORTED_MSG.into());
-        }
-        self.state.thinking = ThinkingConfig::parse(input.trim(), self.state.thinking)
-            .map_err(str::to_owned)?
-            .clamped(&self.state.model);
-        self.state.pending_thinking = None;
-        persist_thinking(&self.storage, self.state.thinking.into());
-        Ok(self.state.thinking)
-    }
-
-    pub(crate) fn set_fast(&mut self, fast: bool) -> Result<(), String> {
-        let model = &self.state.model;
-        if fast && !model.supports_fast() && !model.fast_pending() {
-            return Err(FAST_UNSUPPORTED_MSG.into());
-        }
-        self.state.set_fast(fast);
-        Ok(())
+    /// The agent's session a remote tab is bound to, which names the tab.
+    pub(crate) fn remote_session_id(&self) -> Option<String> {
+        self.remote_link.as_ref()?.name()
     }
 
     /// What `maki.model.get` hands to Lua.
     pub(crate) fn model_state(&self) -> serde_json::Value {
-        let model = &self.state.model;
-        serde_json::json!({
-            "spec": model.spec(),
-            "id": model.id,
-            "provider": model.provider.to_string(),
-            "thinking": self.state.thinking.to_string(),
-            "thinking_shown": self.state.thinking.shown(model).to_string(),
-            "thinking_options": model.thinking_options(),
-            "fast": self.state.fast,
-            "supports_thinking": model.supports_thinking(),
-            "supports_fast": model.supports_fast(),
-        })
+        remote_facade::model_state(
+            self.remote_settings.as_ref(),
+            self.backend.takes_settings(),
+            &self.state.session.model,
+        )
     }
 
     /// What `maki.ui.input` hands to Lua: text and offsets only. The terminal
@@ -1112,14 +1101,13 @@ impl App {
 
     fn input_sending(&self) -> Sending {
         let input = &self.input_box;
-        self.sending(sent_text(input.buffer.value()), input.has_images())
+        Sending::of(sent_text(input.buffer.value()), input.has_images())
     }
 
     /// Sends the input the way Enter does. {sending} is what
     /// [`Self::input_sending`] read it as. It goes out only when {caller} may
     /// send it, see [`send_refusal`], and so may every plugin that wrote it,
-    /// see [`written_refusal`]. A login retry sends none of the text, so it
-    /// leaves the input as it was.
+    /// see [`written_refusal`].
     fn send_input(
         &mut self,
         sending: Sending,
@@ -1134,11 +1122,7 @@ impl App {
                 return Err(refusal);
             }
         }
-        let sub = if matches!(sending, Sending::AuthRetry) {
-            Submission::default()
-        } else {
-            self.input_box.submit().unwrap_or_default()
-        };
+        let sub = self.input_box.submit().unwrap_or_default();
         Ok(self.handle_submit(sub))
     }
 
@@ -1226,11 +1210,7 @@ impl App {
     }
 
     pub(crate) fn record_recent_model(&mut self, spec: &str) {
-        let recents = maki_storage::model::push_recent(&self.storage, spec)
-            .into_iter()
-            .filter(|spec| self.model_policy.allows(spec))
-            .collect();
-        self.model_picker.set_recents(recents);
+        maki_storage::model::push_recent(&self.storage, spec);
     }
 
     pub(crate) fn flash(&mut self, msg: String) {
@@ -1244,7 +1224,26 @@ impl App {
     }
 
     pub(crate) fn fire_session_event(&self, event: HostEvent<'_>) {
+        if let Some(link) = &self.remote_link
+            && link.rewind_tx.is_some()
+            && !matches!(
+                event,
+                HostEvent::TurnStart { .. } | HostEvent::SessionCwdChanged { .. }
+            )
+            && let Some(session_id) = link.session()
+        {
+            let operation = SessionOperation::FireEvent {
+                session_id,
+                event: event.name().to_owned(),
+                data: event.payload(None),
+            };
+            let client = Arc::clone(&link.client);
+            tokio::spawn(async move {
+                let _ = client.session_operation(operation).await;
+            });
+        }
         self.lua_event_handle
+            .core
             .fire(Some(&self.state.session.id), event);
     }
 
@@ -1321,52 +1320,6 @@ impl App {
         }
     }
 
-    fn send_to_agent(&self, subagent_id: Option<&str>, answer: String) {
-        let idx = subagent_id
-            .and_then(|id| self.chat_of_task(id).ok())
-            .unwrap_or(MAIN_CHAT);
-        if let Some(tx) = self.answer_channel(idx) {
-            let _ = tx.try_send(answer);
-        }
-    }
-
-    /// Who hears the user's answer to an ask from {idx}. A tool task without a
-    /// channel of its own shares its turn's. A plugin task without one has
-    /// nobody to ask, so its run fails rather than park, and its caller hears.
-    /// A finished chat has no run left to answer, and the turn's channel is
-    /// not its to borrow.
-    fn answer_channel(&self, idx: usize) -> Option<&flume::Sender<String>> {
-        let chat = &self.chats[idx];
-        if chat.is_finished() {
-            return None;
-        }
-        match (&chat.answer_tx, &chat.plugin) {
-            (Some(tx), _) => Some(tx),
-            (None, None) => self.answer_tx.as_ref(),
-            (None, Some(_)) => None,
-        }
-    }
-
-    /// The main turn waits on expired credentials: its own run or a
-    /// subagent still on it. A task off the turn waits without holding it.
-    fn turn_awaits_auth(&self) -> bool {
-        self.chats
-            .iter()
-            .any(|chat| chat.auth_parked && chat.plugin.is_none())
-    }
-
-    /// One Enter retries every parked run: a lapsed login fails each of
-    /// them, and one left out would wait forever.
-    fn retry_auth(&mut self) {
-        for idx in 0..self.chats.len() {
-            if mem::take(&mut self.chats[idx].auth_parked)
-                && let Some(tx) = self.answer_channel(idx)
-            {
-                let _ = tx.try_send(String::new());
-            }
-        }
-    }
-
     fn scroll_at(&mut self, column: u16, row: u16, delta: i32) -> Option<SelectionZone> {
         if self.btw_modal.is_open() {
             self.btw_modal.scroll(delta);
@@ -1396,7 +1349,6 @@ impl App {
             };
         }
         try_picker!(self.rewind_picker);
-        try_picker!(self.model_picker);
         try_picker!(self.file_picker);
         let zone = self.zone_at(row, column)?.zone;
         self.scroll_zone(zone, delta);
@@ -1475,9 +1427,10 @@ impl App {
             if key::BACKGROUND.matches(key) {
                 return Some(self.run_builtin(BuiltinAction::Background));
             }
-            if let Some(answered) = self.permission_prompt.handle_key(key) {
-                let encoded = TaggedAnswer::new(&answered.id, answered.answer).encode();
-                self.send_to_agent(answered.subagent_id.as_deref(), encoded);
+            if let Some(answered) = self.permission_prompt.handle_key(key)
+                && let Some(tx) = &self.answer_tx
+            {
+                let _ = tx.try_send(answered);
             }
             return Some(vec![]);
         }
@@ -1598,35 +1551,12 @@ impl App {
             });
         }
 
-        if self.model_picker.is_open() {
-            return Some(match self.model_picker.handle_key(key) {
-                ModelPickerAction::Consumed => vec![],
-                ModelPickerAction::Select(spec) => {
-                    vec![Action::ChangeModel(spec)]
-                }
-                ModelPickerAction::AssignTier(spec, tier) => {
-                    vec![Action::AssignTier(spec, tier)]
-                }
-                ModelPickerAction::UnassignTier(spec, tier) => {
-                    vec![Action::UnassignTier(spec, tier)]
-                }
-                // Saved right here instead of going through an `Action`. A fold
-                // only changes how the picker looks, and the state dir lives here.
-                ModelPickerAction::Collapse(slug, folded) => {
-                    maki_storage::model::persist_collapsed_providers(
-                        &self.storage,
-                        self.model_picker.collapsed_providers(),
-                    );
-                    let suffix = if folded {
-                        PROVIDER_FOLDED_SUFFIX
-                    } else {
-                        PROVIDER_UNFOLDED_SUFFIX
-                    };
-                    self.flash(format!("{slug}{suffix}"));
-                    vec![]
-                }
-                ModelPickerAction::Close => vec![],
-            });
+        if self.remote_model_picker.is_open() {
+            if let RemoteModelPickerAction::Select(pick) = self.remote_model_picker.handle_key(key)
+            {
+                self.pick_remote_model(pick);
+            }
+            return Some(vec![]);
         }
 
         if self.login_picker.is_open() {
@@ -1634,10 +1564,22 @@ impl App {
                 LoginPickerAction::Consumed => vec![],
                 LoginPickerAction::Close => vec![],
                 LoginPickerAction::Authenticated { model_spec } => {
-                    vec![Action::ChangeModel(model_spec), Action::RefreshModels]
+                    vec![
+                        Action::ChangeModel(model_spec),
+                        Action::RefreshProvider {
+                            slug: self
+                                .state
+                                .session
+                                .model
+                                .split_once('/')
+                                .map(|(slug, _)| slug)
+                                .unwrap_or_default()
+                                .to_owned(),
+                        },
+                    ]
                 }
                 LoginPickerAction::Configured { slug } => {
-                    vec![Action::RefreshProvider { slug }, Action::RefreshModels]
+                    vec![Action::RefreshProvider { slug }]
                 }
             });
         }
@@ -1764,6 +1706,12 @@ impl App {
     }
 
     fn run_builtin_action(&mut self, action: BuiltinAction) -> (bool, Vec<Action>) {
+        if let Some(feature) = AgentBackend::action_feature(action)
+            && !self.backend.supports(feature)
+        {
+            self.flash(UNAVAILABLE_REMOTE.into());
+            return (false, vec![]);
+        }
         let handled = match action {
             BuiltinAction::FilePicker => {
                 self.file_picker.open(&self.state.session.cwd);
@@ -1788,6 +1736,9 @@ impl App {
                 }
                 ready
             }
+            BuiltinAction::PlanEditor if self.remote_plan.is_some() => {
+                return (true, vec![Action::EditRemotePlan]);
+            }
             BuiltinAction::PlanEditor => {
                 return match self.state.plan.path() {
                     Some(p) => (true, vec![Action::OpenEditor(p.to_path_buf())]),
@@ -1810,10 +1761,7 @@ impl App {
                 self.set_active_chat((self.active_chat + 1).min(self.chats.len() - 1));
                 true
             }
-            BuiltinAction::ModelPicker => {
-                self.model_picker.open(&self.state.model.spec());
-                return (true, vec![Action::RefreshModels]);
-            }
+            BuiltinAction::ModelPicker => return (true, self.open_model_picker()),
             BuiltinAction::InputRaw => {
                 self.input_box.buffer.toggle_raw();
                 true
@@ -1962,7 +1910,7 @@ impl App {
     /// `Ctrl+C` is how the user leaves, and the app has to stay leavable
     /// whatever a plugin bound or how badly its handler is stuck. `Ctrl+Z` is
     /// resolved above every step of the chain, for the same reason. Both come
-    /// from [`maki_lua::RESERVED_KEYS`], the list `maki.keymap.set` refuses
+    /// from [`maki_lua_ui::RESERVED_KEYS`], the list `maki.keymap.set` refuses
     /// and the list a window's `keys` refuses, so neither can be bound nor
     /// claimed.
     ///
@@ -2025,7 +1973,7 @@ impl App {
                 pressed.clone(),
                 self.input_at(),
             );
-            let sent = self.lua_event_handle.run_keybind_callback(ticket);
+            let sent = self.lua_event_handle.ui.run_keybind_callback(ticket);
             hold = sent.then_some(pending);
             sent
         });
@@ -2335,17 +2283,22 @@ impl App {
     /// `maki trust` lives outside the TUI, so without this a "not now" or a
     /// `.maki/` created mid-session is unrecoverable without quitting.
     fn trust_folder(&mut self) -> Vec<Action> {
-        let Some(question) = self.trust_question.clone() else {
+        if let Some(question) = &self.trust_question {
+            if let Err(error) = project::grant(&self.trust_store, question) {
+                self.flash(error);
+                return Vec::new();
+            }
+            let covered: Vec<String> = question.present.iter().map(GatedFile::to_string).collect();
+            self.flash(format!("{TRUSTED_PREFIX}{}", covered.join(", ")));
+        } else if self.backend.is_native() {
             self.flash(NOTHING_TO_TRUST_MSG.into());
             return Vec::new();
-        };
-        if let Err(error) = project::grant(&self.storage, &question) {
-            self.flash(error);
-            return Vec::new();
         }
-        let covered: Vec<String> = question.present.iter().map(GatedFile::to_string).collect();
-        self.flash(format!("{TRUSTED_PREFIX}{}", covered.join(", ")));
-        self.quit_with(ExitRequest::Reload)
+        self.quit_with(if self.backend.is_native() {
+            ExitRequest::Reload
+        } else {
+            ExitRequest::Plugins(PluginOperation::Trust)
+        })
     }
 
     /// An exit the user asks for goes now, never held by
@@ -2361,19 +2314,35 @@ impl App {
     /// background is out: its result wakes a run, and that run's drain exits.
     /// A failed turn exits with its error. Once the deadline lapses the exit
     /// goes, the work stops with the process and the meta keeps its receipts.
+    fn outstanding_background(&self) -> usize {
+        self.remote_usage
+            .as_ref()
+            .and_then(|slot| {
+                slot.load()
+                    .as_ref()
+                    .and_then(|usage| usage.background_tasks)
+            })
+            .unwrap_or_else(|| {
+                self.chats
+                    .iter()
+                    .flat_map(Chat::background_badges)
+                    .filter(|badge| badge.outcome.is_none())
+                    .count()
+            })
+    }
+
     pub(crate) fn awaits_background(&self, now: Instant) -> bool {
         self.exit_on_done
             && self.exit_request == ExitRequest::Success
             && self
                 .background_deadline
                 .is_some_and(|deadline| now < deadline)
-            && self
-                .live_mailbox()
-                .is_some_and(|mailbox| mailbox.outstanding() > 0)
+            && self.outstanding_background() > 0
     }
 
     /// A woken run would clear the error a failed `--exit-on-done` turn
     /// exits with, so such a session takes none.
+    #[cfg(test)]
     pub(crate) fn takes_mailbox_runs(&self) -> bool {
         self.exit_request != ExitRequest::Error
     }
@@ -2382,18 +2351,44 @@ impl App {
         self.exit_request = ExitRequest::None;
     }
 
-    fn sending(&self, text: &str, has_images: bool) -> Sending {
-        if self.turn_awaits_auth() {
-            return Sending::AuthRetry;
+    fn turn_awaits_auth(&self) -> bool {
+        self.chats
+            .iter()
+            .any(|chat| chat.auth_parked && chat.plugin.is_none())
+    }
+
+    fn retry_auth(&mut self) {
+        for idx in 0..self.chats.len() {
+            if !self.chats[idx].auth_parked {
+                continue;
+            }
+            let id = self.chats[idx].task_id().map(|id| id.to_string());
+            let result = self
+                .remote_link
+                .as_ref()
+                .ok_or_else(|| CONNECTION_LOST.to_owned())
+                .and_then(|link| {
+                    link.request::<bool>(|session_id| SessionOperation::RetryAuth {
+                        session_id,
+                        id,
+                    })
+                });
+            match result {
+                Ok(true) => self.chats[idx].auth_parked = false,
+                Ok(false) => self.flash("The agent is no longer waiting for login".into()),
+                Err(error) => self.flash(error),
+            }
         }
-        Sending::of(text, has_images)
     }
 
     pub(crate) fn handle_submit(&mut self, sub: Submission) -> Vec<Action> {
-        let sending = self.sending(&sub.text, !sub.images.is_empty());
+        let retry_only = self.turn_awaits_auth() || self.chats[self.active_chat].auth_parked;
         self.retry_auth();
-        match sending {
-            Sending::AuthRetry | Sending::Nothing => vec![],
+        if retry_only {
+            return vec![];
+        }
+        match Sending::of(&sub.text, !sub.images.is_empty()) {
+            Sending::Nothing => vec![],
             Sending::Exit => self.quit(),
             Sending::Shell(prefix) => self.run_shell_line(prefix),
             Sending::Message if self.is_main_chat() => self.submit_or_queue(sub.into()),
@@ -2447,76 +2442,30 @@ impl App {
         self.stop_task(&id).into_iter().collect()
     }
 
-    fn bill(&mut self, chat_idx: usize, model: &str, usage: StoredTokenUsage) {
-        self.state.token_usage += TokenUsage::from(usage);
-        add_cost(&mut self.state.cost, usage.cost);
-        add_cost(&mut self.chats[chat_idx].cost, usage.cost);
-        add_cost(
-            &mut self.state.subsidised_list_cost,
-            usage.subsidised_list_cost,
-        );
-        add_cost(
-            &mut self.chats[chat_idx].list_cost,
-            usage.subsidised_list_cost,
-        );
-        self.state.session_mut().add_model_usage(model, usage);
-        // A task's cost outlives it on disk, and nothing else writes the meta
-        // between a plugin task's turns.
-        if chat_idx != MAIN_CHAT {
-            self.sync_subagents();
-        }
-    }
-
-    /// Run-scoped delivery for the tab's own agent: restore snapshots fan out
-    /// to every chat, stale runs are dropped, the rest goes to [`Self::deliver`].
+    /// Run-scoped delivery for the tab's agent, dropping stale events.
     fn handle_agent_event(&mut self, envelope: Envelope) -> Vec<Action> {
-        if envelope.run_id == RESTORE_RUN_ID {
-            let (id, snapshot, theme_gen, is_header) = match envelope.event {
-                AgentEvent::ToolSnapshot {
-                    id,
-                    snapshot,
-                    theme_gen,
-                } => (id, snapshot, theme_gen, false),
-                AgentEvent::ToolHeaderSnapshot {
-                    id,
-                    snapshot,
-                    theme_gen,
-                } => (id, snapshot, theme_gen, true),
-                _ => return vec![],
-            };
-            for chat in &mut self.chats {
-                if is_header {
-                    chat.tool_header_snapshot(&id, snapshot.clone(), theme_gen);
-                } else {
-                    chat.tool_snapshot(&id, snapshot.clone(), theme_gen);
-                }
+        if let AgentEvent::PluginTask { plugin, envelope } = envelope.event {
+            if matches!(envelope.event, AgentEvent::Nudge)
+                && let Some(info) = &envelope.subagent
+            {
+                self.open_plugin_task(info, plugin);
+                return vec![];
             }
-            return vec![];
+            return self.deliver(*envelope, Some(plugin));
         }
-        // Taken before the run check, since a moved call keeps reporting
-        // after its turn ended.
+        // The queue owns this input even if a newer run made its error stale.
+        if matches!(envelope.event, AgentEvent::Error { .. }) {
+            let rejected = self.queue.take_rejected();
+            self.restore_queued_input(rejected);
+        }
         if let AgentEvent::ToolParts { id, parts } = envelope.event {
             self.set_parts(id, parts);
             return vec![];
         }
-        // What an adopted subagent sent before its call moved belongs to its
-        // task, not to the run, and may land after the next run started.
         if let Some(plugin) = task_id_of(&envelope).and_then(|id| self.task_plugin(id)) {
             return self.deliver(envelope, Some(plugin));
         }
         if envelope.run_id != self.run_id && !self.is_racing_receipt(&envelope) {
-            // A snapshot dropped here degrades the tool body to llm_output.
-            if let AgentEvent::ToolSnapshot { id, .. }
-            | AgentEvent::ToolHeaderSnapshot { id, .. }
-            | AgentEvent::LiveToolBuf { id, .. } = &envelope.event
-            {
-                tracing::debug!(
-                    tool_id = %id,
-                    event_run_id = envelope.run_id,
-                    current_run_id = self.run_id,
-                    "tool render event dropped: stale run_id"
-                );
-            }
             return vec![];
         }
         self.deliver(envelope, None)
@@ -2537,15 +2486,23 @@ impl App {
     /// the session outlives turns, Esc and rewinds, so the only gate is the
     /// chat session, which the event loop already matched.
     pub(crate) fn deliver(&mut self, envelope: Envelope, plugin: Option<Arc<str>>) -> Vec<Action> {
-        if task_id_of(&envelope).is_some_and(|id| self.deleted_tasks.contains(id)) {
+        let task = task_id_of(&envelope).or({
+            plugin.as_ref().and(match &envelope.event {
+                AgentEvent::ToolDone(done) => Some(done.id.as_str()),
+                AgentEvent::ToolProgress(progress) => Some(progress.id.as_str()),
+                AgentEvent::ToolParts { id, .. }
+                | AgentEvent::ToolMovable { id, .. }
+                | AgentEvent::ToolOutput { id, .. }
+                | AgentEvent::TaskEnded { id, .. } => Some(id.as_str()),
+                _ => None,
+            })
+        });
+        if task.is_some_and(|id| self.deleted_tasks.contains(id)) {
             return vec![];
         }
 
-        if let AgentEvent::SubagentHistory {
-            tool_use_id,
-            messages,
-        } = envelope.event
-        {
+        maki_types::session::record_task_event(self.state.session_mut(), &envelope, plugin.clone());
+        if let AgentEvent::SubagentHistory { tool_use_id, .. } = envelope.event {
             // Workflow sessions use synthetic ids that no ToolDone will match,
             // so we finish them here on SubagentHistory. This event only knows
             // that the transcript closed, so say Unknown and leave the verdict
@@ -2555,9 +2512,6 @@ impl App {
             if let Some(&sub_idx) = self.chat_index.get(tool_use_id.as_str()) {
                 self.chats[sub_idx].mark_finished(TaskOutcome::Unknown, DONE_TEXT);
             }
-            self.state
-                .session_mut()
-                .set_subagent_messages(tool_use_id, messages);
             return vec![];
         }
 
@@ -2595,8 +2549,7 @@ impl App {
             }
         }
 
-        maki_lua::agent_autocmd::dispatch(
-            &self.lua_event_handle,
+        self.lua_event_handle.core.dispatch(
             &self.state.session.id,
             &envelope,
             envelope.subagent.is_some(),
@@ -2607,11 +2560,43 @@ impl App {
             .as_ref()
             .map(|s| s.parent_tool_use_id.clone());
 
+        if let AgentEvent::ToolParts { id, parts } = envelope.event {
+            self.set_parts(id, parts);
+            return vec![];
+        }
+        if let AgentEvent::TaskEnded { id, end } = envelope.event {
+            self.end_task(&id, end.into());
+            return vec![];
+        }
+        if let AgentEvent::TaskQueue { id, snapshot } = envelope.event {
+            if let Some(info) = &envelope.subagent {
+                self.resolve_or_create_chat(info, &plugin);
+            }
+            self.update_task_queue(&id, snapshot);
+            return vec![];
+        }
         let is_plugin_task = plugin.is_some();
         let chat_idx = match envelope.subagent {
             Some(ref subagent) => self.resolve_or_create_chat(subagent, &plugin),
-            // A plugin event without its task must never land in the main chat.
-            None if is_plugin_task => return vec![],
+            None if is_plugin_task => {
+                let id = match &envelope.event {
+                    AgentEvent::ToolProgress(event) => Some(event.id.as_str()),
+                    AgentEvent::ToolOutput { id, .. } | AgentEvent::ToolMovable { id, .. } => {
+                        Some(id.as_str())
+                    }
+                    _ => None,
+                };
+                let Some(idx) = id.and_then(|id| {
+                    self.chat_of_task(id).ok().or_else(|| {
+                        self.chats
+                            .iter()
+                            .position(|chat| chat.tool_message(id).is_some())
+                    })
+                }) else {
+                    return vec![];
+                };
+                idx
+            }
             None => MAIN_CHAT,
         };
         if is_plugin_task && matches!(envelope.event, AgentEvent::StreamClosed) {
@@ -2630,19 +2615,39 @@ impl App {
             }
             return vec![];
         }
+        if chat_idx == MAIN_CHAT
+            && self.status == Status::Idle
+            && matches!(
+                envelope.event,
+                AgentEvent::ThinkingDelta { .. }
+                    | AgentEvent::TextDelta { .. }
+                    | AgentEvent::ToolPending { .. }
+                    | AgentEvent::PromptProgress { .. }
+            )
+        {
+            self.status = Status::Streaming;
+            if self.exit_on_done {
+                self.exit_request = ExitRequest::None;
+            }
+        }
         self.chats[chat_idx].track_run(&envelope.event);
 
-        if let AgentEvent::ToolDone(ref e) = envelope.event {
-            if self.state.mode == Mode::Plan
-                && self.state.plan.path().is_some_and(|pp| e.wrote_to(pp))
-            {
-                self.transition_plan(PlanTrigger::WriteDone);
+        // Taken whatever the mode, so no entry outlives its call.
+        let remote_plan_write = match (&self.remote_plan, &envelope.event) {
+            (Some(plan), AgentEvent::ToolDone(e)) => {
+                plan.take(&e.id).filter(|_| self.state.mode == Mode::Plan)
             }
-            self.state
-                .session_mut()
-                .insert_tool_output(e.id.clone(), e.output.clone(), None);
-            // A receipt does not end the subagent behind it: the call goes
-            // on, and adopting its chat takes it off the turn first.
+            _ => None,
+        };
+        if let Some(written) = &remote_plan_write {
+            let path = PathBuf::from(&written.path);
+            if self.state.plan.path() != Some(path.as_path()) {
+                self.state.plan = PlanState::Drafting(path);
+            }
+            self.remote_plan_text = written.text.clone();
+            self.transition_plan(PlanTrigger::WriteDone);
+        }
+        if let AgentEvent::ToolDone(ref e) = envelope.event {
             if e.backgrounded {
                 self.open_background_call(chat_idx, e);
             } else if let Some(&sub_idx) = self.chat_index.get(&e.id) {
@@ -2677,15 +2682,16 @@ impl App {
             self.retry_info = None;
         }
 
+        // A remote session's numbers come from its usage slot, so a remote
+        // turn only brings its line: billing it again would count it twice.
         if let AgentEvent::TurnComplete(ref tc) = envelope.event {
-            self.bill(
-                chat_idx,
-                &tc.model,
-                tc.usage
-                    .billed_with_subsidised_list_cost(tc.cost, tc.subsidised_list_cost),
-            );
-            let ctx_size = tc.context_size.unwrap_or_else(|| tc.usage.context_tokens());
-            self.set_context_size(chat_idx, ctx_size);
+            if chat_idx != MAIN_CHAT {
+                add_cost(&mut self.chats[chat_idx].cost, tc.cost);
+                self.set_context_size(
+                    chat_idx,
+                    tc.context_size.unwrap_or_else(|| tc.usage.context_tokens()),
+                );
+            }
             self.chats[chat_idx].set_pending_turn_usage(tc.usage.format(tc.cost));
             if let Some(tool_id) = &subagent_id {
                 let formatted = tc.usage.format_sum_cost(self.chats[chat_idx].cost);
@@ -2693,23 +2699,16 @@ impl App {
             }
         }
 
-        // Compaction is the one thing that lowers the context size with no turn
-        // behind it. The number is stored in the session meta and seeds the
-        // next run's gauge, so left stale a session compacted just before exit
-        // gets compacted again on resume.
-        if let AgentEvent::CompactionDone {
-            context_size_after, ..
-        } = envelope.event
-        {
-            self.set_context_size(chat_idx, context_size_after);
+        let result = self.chats[chat_idx].handle_event(envelope.event);
+        if let Some(id) = self.chats[chat_idx].task_id().cloned() {
+            self.sync_parts(&id);
         }
-
-        let plan_path = if self.state.mode == Mode::Plan {
-            self.state.plan.path()
-        } else {
-            None
-        };
-        let result = self.chats[chat_idx].handle_event(envelope.event, plan_path);
+        if let Some(written) = remote_plan_write {
+            self.chats[chat_idx].push(DisplayMessage::plan(
+                written.text.unwrap_or_default(),
+                written.path,
+            ));
+        }
 
         if let ChatEventResult::QueueItemConsumed { text, images } = result {
             if chat_idx == 0 {
@@ -2724,42 +2723,35 @@ impl App {
             id,
             tool,
             scopes,
-            reason,
+            reason: _,
+            choices,
         } = result
         {
-            let project_trusted = self.permissions.project_is_trusted();
             self.open_prompt(|app| {
-                app.permission_prompt.push(
-                    id,
-                    tool,
-                    scopes,
-                    subagent_id.clone(),
-                    project_trusted,
-                    reason,
-                );
+                app.permission_prompt
+                    .push_choices(id, tool, scopes, choices, subagent_id.clone());
             });
             return vec![];
         }
 
         if let ChatEventResult::AuthRequired = result {
+            if self.chats[chat_idx].is_finished() {
+                return vec![];
+            }
             self.chats[chat_idx].push(DisplayMessage::new(
                 DisplayRole::Error,
                 AUTH_EXPIRED_MSG.into(),
             ));
-            if self.answer_channel(chat_idx).is_none() {
-                return vec![];
-            }
-            if chat_idx != MAIN_CHAT {
+            if chat_idx != MAIN_CHAT && self.chats[chat_idx].plugin.is_none() {
                 self.main_chat().push(DisplayMessage::new(
                     DisplayRole::Error,
                     AUTH_EXPIRED_MSG.into(),
                 ));
             }
-            let park = |app: &mut Self| app.chats[chat_idx].auth_parked = true;
             if self.chats[chat_idx].plugin.is_none() {
-                self.open_prompt(park);
-            } else {
-                park(self);
+                self.open_prompt(|app| app.chats[chat_idx].auth_parked = true);
+            } else if self.chats[chat_idx].backs_moved_call {
+                self.chats[chat_idx].auth_parked = true;
             }
             return vec![];
         }
@@ -2790,6 +2782,7 @@ impl App {
             match result {
                 ChatEventResult::Done => {
                     self.status_bar.clear_flash();
+                    self.retire_remote_asks();
                     self.terminalize_turn(MISSING_TOOL_COMPLETION);
                     self.chat_index.clear();
                     self.status = Status::Idle;
@@ -2803,6 +2796,7 @@ impl App {
                 ChatEventResult::Error(message) => {
                     self.status = Status::error(message.clone());
                     self.status_bar.clear_flash();
+                    self.retire_remote_asks();
                     self.main_chat().push(DisplayMessage::new(
                         DisplayRole::Error,
                         cap_error_text(&message),
@@ -2815,9 +2809,9 @@ impl App {
                         self.exit_request = ExitRequest::Error;
                     }
                 }
-                ChatEventResult::AuthRequired
-                | ChatEventResult::PermissionRequest { .. }
-                | ChatEventResult::QueueItemConsumed { .. } => unreachable!(),
+                ChatEventResult::PermissionRequest { .. }
+                | ChatEventResult::QueueItemConsumed { .. }
+                | ChatEventResult::AuthRequired => unreachable!(),
                 ChatEventResult::Continue => {}
             }
         }
@@ -2869,19 +2863,15 @@ impl App {
             self.ui_config.clone(),
             self.lua_event_handle.clone(),
         );
-        chat.set_restore_channel(self.restore_event_tx.clone());
         chat.plugin = plugin.clone();
         chat.clock = Some(TaskClock::start());
         chat.model_id = subagent.model.clone();
         chat.opts = subagent.opts;
-        chat.inbox = subagent.inbox.clone();
-        chat.answer_tx = subagent.answer_tx.clone();
         chat.parent = started_by(subagent);
         if let Some(ref prompt) = subagent.prompt {
             chat.push_user_message(prompt);
         }
         self.chats.push(chat);
-        self.sync_subagents();
         idx
     }
 
@@ -2932,6 +2922,12 @@ impl App {
     /// {depth} is the `maki.api.run_command` hop count, forwarded to a Lua
     /// handler so an alias cycle keeps counting. 0 when the user typed it.
     fn execute_command(&mut self, cmd: ParsedCommand, depth: u8) -> Vec<Action> {
+        if let Some(feature) = AgentBackend::command_feature(&cmd.name)
+            && !self.backend.supports(feature)
+        {
+            self.flash(UNAVAILABLE_REMOTE.into());
+            return vec![];
+        }
         match cmd.name.as_str() {
             "/compact" => {
                 let instructions = (!cmd.args.is_empty()).then(|| cmd.args.clone());
@@ -2969,10 +2965,7 @@ impl App {
                 self.queue.set_focus();
                 vec![]
             }
-            "/model" => {
-                self.model_picker.open(&self.state.model.spec());
-                vec![Action::RefreshModels]
-            }
+            "/model" => self.open_model_picker(),
             "/theme" => {
                 self.theme_picker.open();
                 vec![]
@@ -2981,47 +2974,20 @@ impl App {
                 self.mcp_picker.open();
                 vec![]
             }
+            // The agent owns its credentials, so its own login runs.
+            "/login" if !self.backend.is_native() => vec![Action::RemoteLogin],
             "/login" => {
                 self.login_picker.open(self.storage.clone());
                 vec![]
             }
             "/cd" => self.cmd_cd(&cmd.args),
-            "/yolo" => {
-                let enabled = self.permissions.toggle_yolo();
-                let msg = if enabled {
-                    "YOLO mode enabled"
-                } else {
-                    "YOLO mode disabled"
+            "/yolo" | "/fast" | "/workflow" => {
+                let setting = match cmd.name.as_str() {
+                    "/yolo" => Setting::Yolo,
+                    "/fast" => Setting::Fast,
+                    _ => Setting::Workflow,
                 };
-                self.flash(msg.into());
-                vec![]
-            }
-            "/fast" => {
-                match self.set_fast(!self.state.fast_intent()) {
-                    Ok(()) => self.flash(
-                        if self.state.pending_fast {
-                            FAST_PENDING_MSG
-                        } else if self.state.fast {
-                            FAST_ON_MSG
-                        } else {
-                            FAST_OFF_MSG
-                        }
-                        .into(),
-                    ),
-                    Err(msg) => self.flash(msg),
-                }
-                vec![]
-            }
-            "/workflow" => {
-                self.state.workflow = !self.state.workflow;
-                self.flash(
-                    if self.state.workflow {
-                        WORKFLOW_ON_MSG
-                    } else {
-                        WORKFLOW_OFF_MSG
-                    }
-                    .into(),
-                );
+                self.toggle_remote_setting(setting);
                 vec![]
             }
             EXIT_COMMAND => self.quit(),
@@ -3031,7 +2997,18 @@ impl App {
             "/trust" => self.trust_folder(),
             name @ ("/packupdate" | "/packdel") => {
                 match PackCommand::parse(name, &cmd.args, cmd.bang) {
-                    Ok(command) => vec![Action::PreparePack(command)],
+                    Ok(command) if self.backend.is_native() => vec![Action::PreparePack(command)],
+                    Ok(_) => self.quit_with(ExitRequest::Plugins(if name == "/packupdate" {
+                        PluginOperation::Update {
+                            args: cmd.args,
+                            bang: cmd.bang,
+                        }
+                    } else {
+                        PluginOperation::Delete {
+                            args: cmd.args,
+                            bang: cmd.bang,
+                        }
+                    })),
                     Err(message) => {
                         self.flash(message);
                         vec![]
@@ -3056,7 +3033,7 @@ impl App {
         let Some(lua_cmd) = self.command_palette.find_lua_command(name) else {
             return;
         };
-        self.lua_event_handle.run_command(
+        self.lua_event_handle.ui.run_command(
             Arc::clone(&lua_cmd.plugin),
             Arc::clone(&lua_cmd.name),
             args,
@@ -3093,7 +3070,7 @@ impl App {
             return vec![];
         }
 
-        let prompt_ref = maki_agent::McpPromptRef {
+        let prompt_ref = maki_types::input::McpPromptRef {
             qualified_name: prompt.qualified_name.clone(),
             arguments,
         };
@@ -3152,43 +3129,36 @@ impl App {
     }
 
     fn cmd_cd(&mut self, args: &str) -> Vec<Action> {
-        let path = if args.is_empty() {
-            maki_storage::paths::home().unwrap_or_default()
-        } else {
-            match args.strip_prefix('~') {
-                Some(rest) => {
-                    let home = maki_storage::paths::home().unwrap_or_default();
-                    if rest.is_empty() {
-                        home
-                    } else {
-                        home.join(rest.trim_start_matches('/'))
+        if let Some(link) = &self.remote_link {
+            let path = if args.is_empty() { "~" } else { args }.to_owned();
+            match link.request::<String>(|session_id| SessionOperation::ChangeDirectory {
+                session_id,
+                path,
+            }) {
+                Ok(cwd) => {
+                    self.save_input_history();
+                    if self.backend.is_native() {
+                        if let Err(error) = env::set_current_dir(&cwd) {
+                            self.flash(error.to_string());
+                            return vec![];
+                        }
+                        let max_entries = self.input_box.history().max_entries();
+                        self.input_box.set_history(InputHistory::load(
+                            &self.storage,
+                            Path::new(&cwd),
+                            max_entries,
+                        ));
                     }
+                    self.state.session_mut().set_cwd(cwd.clone());
+                    self.status_bar.refresh_cwd();
+                    self.fire_session_event(HostEvent::SessionCwdChanged { cwd: &cwd });
+                    self.flash(format!("cd {cwd}"));
                 }
-                None => PathBuf::from(args),
+                Err(error) => self.flash(error),
             }
-        };
-        self.save_input_history();
-        match env::set_current_dir(&path) {
-            Ok(()) => {
-                if let Ok(canonical) = env::current_dir() {
-                    let max_entries = self.input_box.history().max_entries();
-                    self.input_box.set_history(InputHistory::load(
-                        &self.storage,
-                        &canonical,
-                        max_entries,
-                    ));
-                    self.state
-                        .session_mut()
-                        .set_cwd(canonical.to_string_lossy().into_owned());
-                    self.fire_session_event(HostEvent::SessionCwdChanged {
-                        cwd: &canonical.to_string_lossy(),
-                    });
-                }
-                self.status_bar.refresh_cwd();
-                self.flash(format!("cd {}", path.display()))
-            }
-            Err(e) => self.flash(format!("cd: {e}")),
+            return vec![];
         }
+        self.flash(UNAVAILABLE_REMOTE.into());
         vec![]
     }
 
@@ -3203,7 +3173,7 @@ impl App {
             &self.file_picker,
             &self.rewind_picker,
             &self.theme_picker,
-            &self.model_picker,
+            &self.remote_model_picker,
             &self.login_picker,
             &self.mcp_picker,
             &self.pack_review,
@@ -3222,7 +3192,7 @@ impl App {
             &mut self.file_picker,
             &mut self.rewind_picker,
             &mut self.theme_picker,
-            &mut self.model_picker,
+            &mut self.remote_model_picker,
             &mut self.login_picker,
             &mut self.mcp_picker,
             &mut self.pack_review,
@@ -3240,21 +3210,15 @@ impl App {
         self.permission_prompt.is_open() || self.turn_awaits_auth() || self.float_mgr.needs_input()
     }
 
-    /// True while `recoverable_queue` holds user text captured at an agent
-    /// error; a background run would wipe it (`start_run` clears the queue).
-    pub(crate) fn holds_recovery_text(&self) -> bool {
-        !self.recoverable_queue.is_empty()
-    }
-
     pub(crate) fn attention(&self) -> Option<Notification> {
+        if self.turn_awaits_auth() {
+            return Some(Notification::AuthenticationRequired);
+        }
         if let Some(tool) = self.permission_prompt.tool() {
             let tool = (!matches!(tool, maki_config::ToolKey::Wildcard))
                 .then(|| normalize_preview(&tool.to_string()))
                 .flatten();
             return Some(Notification::PermissionRequested { tool });
-        }
-        if self.turn_awaits_auth() {
-            return Some(Notification::AuthenticationRequired);
         }
         if self.status != Status::Streaming && self.plan_form_open() {
             return Some(Notification::PlanReady);
@@ -3297,7 +3261,6 @@ impl App {
             | self.status_bar.poll_branch_update()
             | self.status_bar.clear_expired_hint()
             | self.mcp_picker.refresh()
-            | self.model_picker.refresh()
             | self.usage_modal.poll(&self.usage_slot)
             | self.hints.poll(self.hint_reader.load_full())
             | self.poll_input_rules()
@@ -3306,7 +3269,15 @@ impl App {
             | self.tick_file_picker()
             | self.tick_input_changed()
             | self.tick_background_moves()
-            | Dirty::any(self.chats.iter_mut().map(Chat::tick))
+            | self.poll_remote_menu()
+            | self.poll_remote_usage()
+            | self.poll_remote_settings()
+            | self.tick_chats()
+    }
+
+    fn tick_chats(&mut self) -> Dirty {
+        let place = render_place(&self.state.session.cwd, self.backend.is_native());
+        Dirty::any(self.chats.iter_mut().map(|chat| chat.tick(place)))
     }
 
     /// Both halves of the plan surface the Lua host answers asynchronously:
@@ -3419,14 +3390,14 @@ impl App {
         if lost_pick {
             self.flash(FLASH_PLAN_ACTION_LOST.into());
         }
-        let Some(path) = path.filter(|_| self.lua_event_handle.plan_form_layered()) else {
+        let Some(path) = path.filter(|_| self.lua_event_handle.ui.plan_form_layered()) else {
             self.open_plan_form(builtin_menu());
             return;
         };
         // The last draft's menu is not this draft's, and the chain has not
         // answered with one yet.
         self.plan_form.forget_menu();
-        let answer = self.lua_event_handle.open_plan_form(
+        let answer = self.lua_event_handle.ui.open_plan_form(
             path.to_owned(),
             self.state.session.id.to_string(),
             builtin_rows(),
@@ -3524,6 +3495,154 @@ impl App {
         self.chat_index.clear();
     }
 
+    /// The remote agent's task ended because its link did. This is about the
+    /// session, not one run, so it bypasses run-id filtering: whatever was in
+    /// flight ends here, unsent messages go back into the input with their
+    /// images, and no later prompt is accepted.
+    pub(crate) fn connection_lost(&mut self) {
+        if self.backend == AgentBackend::Disconnected {
+            return;
+        }
+        self.backend = AgentBackend::Disconnected;
+        self.permission_prompt.close();
+        if self.status == Status::Streaming {
+            self.terminalize_turn(CONNECTION_LOST);
+        }
+        self.status = Status::error(CONNECTION_LOST.into());
+        self.main_chat().push(DisplayMessage::new(
+            DisplayRole::Error,
+            CONNECTION_LOST.into(),
+        ));
+        let messages = self.queue.take_messages();
+        self.restore_queued_input(messages);
+        self.chat_index.clear();
+        if self.exit_on_done {
+            self.exit_request = ExitRequest::Error;
+        }
+    }
+
+    fn restore_queued_input(&mut self, messages: Vec<(String, Vec<ImageSource>)>) {
+        if messages.is_empty() {
+            return;
+        }
+        let mut text = String::new();
+        for (queued, images) in messages {
+            text.push_str(&queued);
+            text.push('\n');
+            for image in images {
+                self.input_box.attach_image(image);
+            }
+        }
+        text.push_str(&self.input_box.draft_text());
+        self.input_box.set_input(text.trim_end());
+    }
+
+    /// Draws the history a loaded remote session replayed, and sizes the
+    /// gauge from it as a run's `Done` would.
+    /// Its usage arrives through the slot the replay seeded.
+    pub(crate) fn draw_remote_replay(
+        &mut self,
+        replay: Vec<SessionUpdate>,
+        extensions: &Agreed,
+        unreadable: usize,
+    ) {
+        remote_replay::draw(self.main_chat(), replay, extensions);
+        if unreadable > 0 {
+            self.flash(MALFORMED_UPDATE.into());
+        }
+    }
+
+    /// The slot a remote session publishes its spending to, watched afresh
+    /// so a new session's first snapshot always draws.
+    pub(crate) fn watch_remote_usage(&mut self, slot: Option<UsageSlot>) {
+        self.remote_usage = slot;
+        self.remote_usage_drawn = Watch::default();
+    }
+
+    /// Session state, so it is applied whatever run is current.
+    fn poll_remote_usage(&mut self) -> Dirty {
+        let Some(slot) = &self.remote_usage else {
+            return Dirty::NO;
+        };
+        let dirty = self.remote_usage_drawn.poll(slot.load_full());
+        if dirty != Dirty::NO
+            && let Some(usage) = self.remote_usage_drawn.get().cloned()
+        {
+            self.apply_remote_usage(usage);
+        }
+        dirty
+    }
+
+    /// A fresh slot per quota fetch, so an older answer, of another
+    /// provider or another session, lands where nobody looks.
+    pub(crate) fn fresh_usage_slot(&mut self, provider: String) -> Arc<ArcSwapOption<UsageFetch>> {
+        let slot = Arc::new(ArcSwapOption::from_pointee(UsageFetch {
+            provider,
+            state: UsageFetchState::Loading,
+        }));
+        self.usage_slot = Arc::clone(&slot);
+        slot
+    }
+
+    fn apply_remote_usage(&mut self, usage: SessionUsage) {
+        // The agent's ledger, so `/usage` reads a remote session as it reads
+        // a local one. The session is never saved from here.
+        if let Some(ledger) = usage.ledger {
+            self.state.token_usage = ledger.total;
+            *self.state.session_mut().usage_by_model_mut() = ledger.by_model;
+        }
+        self.set_context_size(MAIN_CHAT, usage.used);
+        if usage.window > 0 {
+            self.state.context_window = usage.window;
+        }
+        self.state.cost = usage.cost;
+        self.chats[MAIN_CHAT].cost = usage.cost;
+        self.state.subsidised_list_cost = usage.list_cost;
+        self.chats[MAIN_CHAT].list_cost = usage.list_cost;
+        self.state.subsidised_by = usage.subsidised_by.map(Arc::from);
+    }
+
+    fn poll_remote_menu(&mut self) -> Dirty {
+        match &self.remote_settings {
+            Some(models) => self.remote_menu.poll(models.models.load_full()),
+            None => Dirty::NO,
+        }
+    }
+
+    /// The name the agent gave its current model, as last drawn.
+    pub(super) fn remote_model_name(&self) -> Option<&str> {
+        self.remote_menu.get()?.current_name()
+    }
+
+    /// A remote agent's models are its own, so its picker lists them and
+    /// asks this machine's providers nothing.
+    fn open_model_picker(&mut self) -> Vec<Action> {
+        match self
+            .remote_settings
+            .as_ref()
+            .and_then(|models| models.models.load_full())
+        {
+            Some(menu) => self.remote_model_picker.open(&menu),
+            None => self.flash(UNAVAILABLE_REMOTE.into()),
+        }
+        vec![]
+    }
+
+    /// The agent switches when the next prompt goes out, which is also when
+    /// a refusal can be reported against something.
+    fn pick_remote_model(&mut self, pick: ModelPick) {
+        if let Some(models) = &self.remote_settings {
+            models.pick(pick);
+            self.flash(MODEL_NEXT_PROMPT.into());
+        }
+    }
+
+    /// A remote agent's asks end with its run: the loop has already answered
+    /// them cancelled, so their prompts would only take answers nobody reads.
+    fn retire_remote_asks(&mut self) {
+        self.permission_prompt.close();
+    }
+
     /// Terminalizes every tool left in progress when a turn ends, sparing
     /// shell commands that outlive the agent.
     fn terminalize_turn(&mut self, message: &str) {
@@ -3546,7 +3665,6 @@ impl App {
             }
         });
         self.forget_untasked_parts();
-        self.sync_subagents();
     }
 
     pub fn flush_all_chats(&mut self) {
@@ -3600,7 +3718,7 @@ impl App {
         }
         try_picker!(self.rewind_picker);
         try_picker!(self.theme_picker);
-        try_picker!(self.model_picker);
+        try_picker!(self.remote_model_picker);
         try_picker!(self.login_picker);
         try_picker!(self.mcp_picker);
         if self.dispatch_on_screen_windows(&pressed, turn)
@@ -3618,6 +3736,9 @@ impl App {
                 self.plan_answers.abandon();
                 self.plan_form.hide();
                 vec![]
+            }
+            PlanFormAction::OpenEditor if self.remote_plan.is_some() => {
+                vec![Action::EditRemotePlan]
             }
             PlanFormAction::OpenEditor => match self.state.plan.path() {
                 Some(p) => vec![Action::OpenEditor(p.to_path_buf())],
@@ -3657,6 +3778,7 @@ impl App {
                 // cannot answer for the rows the user saw.
                 let answer = self
                     .lua_event_handle
+                    .ui
                     .run_plan_action(session, generation, row, path, parallel);
                 let pick = self.plan_answers.abandon();
                 self.plan_answers.action = Some(PlanAction {
@@ -3681,13 +3803,14 @@ impl App {
         };
         let path = self.state.plan.path().map(|p| p.display().to_string());
         let ready = self.state.plan.is_ready();
-        let content = if ready {
-            self.state
+        let content = match (ready, &self.remote_plan) {
+            (false, _) => None,
+            (true, Some(_)) => self.remote_plan_text.clone(),
+            (true, None) => self
+                .state
                 .plan
                 .path()
-                .and_then(|p| std::fs::read_to_string(p).ok())
-        } else {
-            None
+                .and_then(|p| std::fs::read_to_string(p).ok()),
         };
         serde_json::json!({
             "mode": mode,
@@ -3697,14 +3820,27 @@ impl App {
         })
     }
 
+    /// A remote agent's plan comes over the link, sanitized for the chat;
+    /// a failed read leaves the chat without it, since the agent reads its
+    /// own file to implement it.
+    fn plan_text(&mut self, path: &Path) -> Option<String> {
+        let Some(plan) = &self.remote_plan else {
+            return Some(std::fs::read_to_string(path).unwrap_or_default());
+        };
+        match plan.read() {
+            Ok(read) => Some(sanitize_display(&read.text.unwrap_or_default()).into_owned()),
+            Err(error) => {
+                self.flash(error);
+                None
+            }
+        }
+    }
+
     fn implement_plan(&mut self, clear_context: bool) -> Vec<Action> {
         let parallel = self.plan_form.parallel();
         self.plan_form.reset();
         let plan_snapshot = match std::mem::take(&mut self.state.plan) {
-            PlanState::Ready(p) => Some((
-                std::fs::read_to_string(&p).unwrap_or_default(),
-                p.display().to_string(),
-            )),
+            PlanState::Ready(p) => Some((self.plan_text(&p), p.display().to_string())),
             _ => None,
         };
 
@@ -3722,8 +3858,10 @@ impl App {
             } else {
                 format!("{IMPLEMENT_MSG_PREFIX} at `{path_str}`.")
             };
-            self.main_chat()
-                .push(DisplayMessage::plan(content, path_str));
+            if let Some(content) = content {
+                self.main_chat()
+                    .push(DisplayMessage::plan(content, path_str));
+            }
             text
         } else {
             format!("{}.", IMPLEMENT_MSG_PREFIX)

@@ -1,30 +1,34 @@
 //! Rebuilds display messages from stored sessions. Tool outputs get syntax
 //! highlighted, missing outputs fall back to plain text from `ToolResult`.
 
+use maki_types::inbox::InboxSnapshot;
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
 use std::sync::Arc;
 
 use crate::app::tasks::{TaskClock, TaskOutcome, TaskParent, TaskStatus};
 use crate::components::input::Draft;
-use crate::components::messages::{ClickOutcome, MessagesPanel, PromptProgress, ScrollPos};
-use crate::components::tool_display::append_annotation;
+use crate::components::messages::{
+    CallData, ClickOutcome, MessagesPanel, PromptProgress, RenderPlace, ScrollPos,
+};
 use crate::components::{
     BackgroundBadge, BackgroundOutcome, DisplayMessage, DisplayRole, ToolRole, ToolStatus,
 };
 use crate::markdown::truncate_output;
+use maki_types::display_order::observation_detail;
+use maki_types::snapshot::BufferSnapshot;
 
 use crate::selection::{DocPos, RowPos, Selection};
-use maki_agent::tools::{MAIN_TASK_ID, ToolInvocation, ToolRegistry, WRITE_TOOL_NAME};
-use maki_agent::types::ALLOWED_BY;
-use maki_agent::{
-    AgentEvent, BufferSnapshot, DisplayItem, SharedBuf, SteerKind, SubagentInbox, ToolDoneEvent,
-    ToolOutput, ToolStartEvent, display_order, observation_detail,
-};
 use maki_config::{ToolKey, ToolOutputLines, UiConfig};
-use maki_lua::{LuaCommandInfo, WinView};
-use maki_providers::{ContentBlock, ImageSource, Message, RequestOptions, Role};
+use maki_lua_ui::{LuaCommandInfo, WinView};
 use maki_storage::id::MakiId;
+use maki_types::display_order::{DisplayItem, display_order};
+use maki_types::event::{
+    ALLOWED_BY, AgentEvent, PermissionChoice, SteerKind, ToolDoneEvent, ToolStartEvent,
+};
+use maki_types::message::{ContentBlock, ImageSource, Message, Role};
+use maki_types::thinking::RequestOptions;
+use maki_types::tool::MAIN_TASK_ID;
+use maki_types::tool::{ToolChild, ToolData, ToolOutput};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Color;
@@ -52,13 +56,14 @@ pub enum ChatEventResult {
         images: Vec<ImageSource>,
     },
     Error(String),
+    AuthRequired,
     PermissionRequest {
         id: String,
         tool: ToolKey,
         scopes: Vec<String>,
         reason: Option<String>,
+        choices: Vec<PermissionChoice>,
     },
-    AuthRequired,
 }
 
 /// A call this chat's agent started that has not reported done.
@@ -94,13 +99,7 @@ pub struct Chat {
     /// A subagent's own settings; `None` on the main chat, which reads the
     /// session's.
     pub opts: Option<RequestOptions>,
-    /// A running subagent's inbox for messages typed in its chat. Taken when
-    /// the chat finishes, since nothing would drain it after that.
-    pub(crate) inbox: Option<Arc<SubagentInbox>>,
-    /// Where a subagent's permission answers go. It lives until the chat
-    /// finishes, not the turn, so a subagent moved off its turn can still be
-    /// answered.
-    pub(crate) answer_tx: Option<flume::Sender<String>>,
+    pub(crate) remote_inbox: Option<InboxSnapshot>,
     /// Parked while another chat is in front, see `App::set_active_chat`.
     pub(crate) draft: Draft,
     pending_turn_usage: Option<String>,
@@ -122,7 +121,7 @@ impl Chat {
         task_id: Option<&str>,
         name: String,
         ui_config: UiConfig,
-        lua_event_handle: maki_lua::EventHandle,
+        lua_event_handle: crate::EventHandle,
     ) -> Self {
         let mut messages_panel = MessagesPanel::new(ui_config, lua_event_handle);
         messages_panel.set_chat(session_id, task_id.map(Arc::from));
@@ -139,8 +138,7 @@ impl Chat {
             context_size: 0,
             model_id: None,
             opts: None,
-            inbox: None,
-            answer_tx: None,
+            remote_inbox: None,
             draft: Draft::default(),
             pending_turn_usage: None,
             messages_panel,
@@ -152,10 +150,6 @@ impl Chat {
     /// The handle `maki.task` addresses a task by, see `app::tasks`.
     pub(crate) fn task_id(&self) -> Option<&Arc<str>> {
         self.messages_panel.task_id()
-    }
-
-    pub(crate) fn request_restores(&self, items: Vec<maki_lua::RestoreItem>) {
-        self.messages_panel.request_restores(items);
     }
 
     pub(crate) fn task_id_or_main(&self) -> Arc<str> {
@@ -187,11 +181,7 @@ impl Chat {
     pub(crate) fn track_run(&mut self, event: &AgentEvent) {
         let idle = match event {
             AgentEvent::Done { .. } | AgentEvent::Error { .. } => true,
-            AgentEvent::SubagentHistory { .. }
-            | AgentEvent::StreamClosed
-            | AgentEvent::ToolSnapshot { .. }
-            | AgentEvent::ToolHeaderSnapshot { .. }
-            | AgentEvent::LiveToolBuf { .. } => return,
+            AgentEvent::SubagentHistory { .. } | AgentEvent::StreamClosed => return,
             _ => false,
         };
         self.auth_parked = false;
@@ -204,11 +194,7 @@ impl Chat {
         self.pending_turn_usage = Some(usage);
     }
 
-    pub(crate) fn set_restore_channel(&mut self, event_tx: Option<maki_agent::EventSender>) {
-        self.messages_panel.set_restore_channel(event_tx);
-    }
-
-    pub fn handle_event(&mut self, event: AgentEvent, plan_path: Option<&Path>) -> ChatEventResult {
+    pub fn handle_event(&mut self, event: AgentEvent) -> ChatEventResult {
         match event {
             AgentEvent::ThinkingDelta { text } => {
                 self.messages_panel.clear_prompt_progress();
@@ -232,19 +218,8 @@ impl Chat {
                 self.messages_panel.tool_output(&id, &content)
             }
             AgentEvent::ToolDone(e) => {
-                let plan_write = plan_path.filter(|pp| e.wrote_to(pp));
-                let is_full_write = &*e.tool == WRITE_TOOL_NAME;
                 self.running_calls.retain(|call| call.id != e.id);
                 self.messages_panel.tool_done(*e);
-                if let Some(pp) = plan_write {
-                    let content = if is_full_write {
-                        std::fs::read_to_string(pp).unwrap_or_default()
-                    } else {
-                        String::new()
-                    };
-                    self.messages_panel
-                        .push(DisplayMessage::plan(content, pp.display().to_string()));
-                }
             }
             AgentEvent::TurnComplete(turn) => {
                 for block in turn.message.content {
@@ -263,7 +238,9 @@ impl Chat {
                     self.messages_panel.set_turn_usage_on_last_tool(usage);
                 }
             }
-            AgentEvent::AutoCompacting { .. } => {
+            // A compaction the user asked for has its own line already.
+            AgentEvent::AutoCompacting { manual: true, .. } => {}
+            AgentEvent::AutoCompacting { manual: false, .. } => {
                 self.messages_panel.flush();
                 self.messages_panel.push(DisplayMessage::new(
                     DisplayRole::Assistant,
@@ -281,7 +258,7 @@ impl Chat {
                 self.messages_panel.set_tool_movable(&id, movable);
             }
             // Parts belong to `/tasks`, which the App keeps, never to a transcript.
-            AgentEvent::ToolParts { .. } => {}
+            AgentEvent::ToolParts { .. } | AgentEvent::TaskEnded { .. } => {}
             AgentEvent::Retry { .. } => unreachable!("handled before handle_event"),
             AgentEvent::Done { .. } => {
                 self.messages_panel.flush();
@@ -296,12 +273,14 @@ impl Chat {
                 tool,
                 scopes,
                 reason,
+                choices,
             } => {
                 return ChatEventResult::PermissionRequest {
                     id,
                     tool,
                     scopes,
                     reason,
+                    choices,
                 };
             }
             AgentEvent::Steered { kind, text } => {
@@ -321,21 +300,6 @@ impl Chat {
                 .annotate_tool(&id, &format!("{ALLOWED_BY} {plugin}")),
             AgentEvent::AuthRequired => {
                 return ChatEventResult::AuthRequired;
-            }
-            AgentEvent::ToolSnapshot {
-                id,
-                snapshot,
-                theme_gen,
-            } => {
-                self.messages_panel.tool_snapshot(&id, snapshot, theme_gen);
-            }
-            AgentEvent::ToolHeaderSnapshot {
-                id,
-                snapshot,
-                theme_gen,
-            } => {
-                self.messages_panel
-                    .tool_header_snapshot(&id, snapshot, theme_gen);
             }
             AgentEvent::Nudge => {
                 self.messages_panel.flush();
@@ -358,10 +322,14 @@ impl Chat {
                     end.map(BackgroundOutcome::from),
                 ));
             }
-            AgentEvent::SubagentHistory { .. } | AgentEvent::StreamClosed => {}
-            AgentEvent::LiveToolBuf { id, body } => {
-                self.messages_panel.register_live_buf(id, body);
-            }
+            AgentEvent::ToolProgress(e) => self.messages_panel.tool_progress(*e),
+            AgentEvent::PluginTask { .. }
+            | AgentEvent::ContextReset { .. }
+            | AgentEvent::TaskQueue { .. }
+            | AgentEvent::SubagentHistory { .. }
+            | AgentEvent::StreamClosed
+            | AgentEvent::QueueUpdated(_) => {}
+
             AgentEvent::PromptProgress {
                 processed,
                 total,
@@ -426,7 +394,16 @@ impl Chat {
         self.messages_panel.set_accent(color);
     }
 
-    pub fn tick(&mut self) -> Dirty {
+    /// Sends what the renderers owe for {place}, then takes in what they
+    /// and the other pollers answered.
+    /// Keeps {place} for the restores asked for before the first tick, as a
+    /// session load does.
+    pub(crate) fn keep_place(&mut self, place: RenderPlace<'_>) {
+        self.messages_panel.keep_place(place);
+    }
+
+    pub(crate) fn tick(&mut self, place: RenderPlace<'_>) -> Dirty {
+        self.messages_panel.send_renders(place);
         self.messages_panel.tick()
     }
 
@@ -472,26 +449,6 @@ impl Chat {
 
     pub fn toggle_click(&mut self, row: u16, area: Rect) -> ClickOutcome {
         self.messages_panel.toggle_click(row, area)
-    }
-
-    pub fn tool_snapshot(
-        &mut self,
-        tool_id: &str,
-        snapshot: BufferSnapshot,
-        theme_gen: Option<u64>,
-    ) {
-        self.messages_panel
-            .tool_snapshot(tool_id, snapshot, theme_gen);
-    }
-
-    pub fn tool_header_snapshot(
-        &mut self,
-        tool_id: &str,
-        snapshot: BufferSnapshot,
-        theme_gen: Option<u64>,
-    ) {
-        self.messages_panel
-            .tool_header_snapshot(tool_id, snapshot, theme_gen);
     }
 
     pub fn stream_reset(&mut self) {
@@ -567,12 +524,14 @@ impl Chat {
             return;
         }
         self.messages_panel.flush();
-        self.answer_tx = None;
         self.auth_parked = false;
         if let Some(clock) = &mut self.clock {
             clock.stop();
         }
-        let undelivered = self.inbox.take().map_or(0, |inbox| inbox.len());
+        let undelivered = self
+            .remote_inbox
+            .take()
+            .map_or(0, |inbox| inbox.texts.len());
         if undelivered > 0 {
             self.messages_panel.push(DisplayMessage::new(
                 DisplayRole::Error,
@@ -626,12 +585,8 @@ impl Chat {
         self.messages_panel.tool_message(tool_id)
     }
 
-    pub(crate) fn live_buf(&self, tool_id: &str) -> Option<Arc<SharedBuf>> {
-        self.messages_panel.live_buf(tool_id)
-    }
-
-    pub(crate) fn register_live_buf(&mut self, tool_id: String, buf: Arc<SharedBuf>) {
-        self.messages_panel.register_live_buf(tool_id, buf);
+    pub(crate) fn set_snapshot(&mut self, tool_id: &str, snapshot: BufferSnapshot) {
+        self.messages_panel.set_snapshot(tool_id, snapshot);
     }
 
     pub(crate) fn settle_tool(&mut self, tool_id: &str, status: ToolStatus) {
@@ -654,9 +609,33 @@ impl Chat {
         self.messages_panel.background_badges()
     }
 
+    pub(crate) fn forget_times(&mut self) {
+        self.messages_panel.forget_times();
+    }
+
     pub fn load_messages(&mut self, msgs: Vec<DisplayMessage>) {
         self.running_calls.clear();
         self.messages_panel.load_messages(msgs);
+    }
+
+    /// After [`Self::load_messages`], and before [`Self::request_restores`]
+    /// with the same {restores}, which then skips every call a renderer or
+    /// the default draws.
+    pub(crate) fn call_data(&self, id: &str) -> Option<CallData> {
+        self.messages_panel.call_data(id)
+    }
+
+    pub(crate) fn show_child(
+        &mut self,
+        id: &str,
+        child: &ToolChild,
+        streams: &[(Vec<u32>, String)],
+    ) {
+        self.messages_panel.show_child(id, child, streams);
+    }
+
+    pub(crate) fn route_loaded(&mut self, tool_data: &HashMap<String, Arc<ToolData>>) {
+        self.messages_panel.route_loaded(tool_data);
     }
 
     pub fn push_user_message(&mut self, text: impl Into<String>) {
@@ -737,11 +716,11 @@ impl Chat {
 pub fn history_to_display(
     messages: &[Message],
     tool_outputs: &HashMap<String, Arc<ToolOutput>>,
+    tool_data: &HashMap<String, Arc<ToolData>>,
     tool_output_lines: &ToolOutputLines,
-) -> (Vec<DisplayMessage>, Vec<maki_lua::RestoreItem>) {
+) -> Vec<DisplayMessage> {
     let results = build_tool_results_map(messages);
     let mut display = Vec::new();
-    let mut restore_items: Vec<maki_lua::RestoreItem> = Vec::new();
     for item in display_order(messages) {
         let msg = match item {
             DisplayItem::Message(msg) => msg,
@@ -796,10 +775,13 @@ pub fn history_to_display(
                             id, name, input, ..
                         } => {
                             let static_name = name.as_str();
-                            let reg = ToolRegistry::global();
-                            let tool_call: Option<Box<dyn ToolInvocation>> =
-                                reg.get(name).and_then(|entry| entry.try_parse(input));
-                            let summary = reg.resolve_header(name, input);
+                            let data = tool_data.get(id.as_str()).map(Arc::as_ref);
+                            // What ran, after the input hooks, when the call
+                            // was stored with it.
+                            let input = data.map_or(input, |data| &data.input);
+                            let summary = data
+                                .map(|data| data.summary.clone())
+                                .unwrap_or_else(|| name.clone());
                             let (status, result_text) = results
                                 .get(id.as_str())
                                 .map(|(err, text)| {
@@ -812,7 +794,7 @@ pub fn history_to_display(
                                 })
                                 .unwrap_or((ToolStatus::Success, None));
                             let stored = tool_outputs.get(id.as_str());
-                            let (text, truncated_lines, tool_output, mut annotation) =
+                            let (text, truncated_lines, tool_output, annotation) =
                                 build_loaded_tool(
                                     static_name,
                                     &summary,
@@ -820,38 +802,7 @@ pub fn history_to_display(
                                     result_text,
                                     tool_output_lines,
                                 );
-                            if let Some(ta) =
-                                tool_call.as_deref().and_then(|tc| tc.start_annotation())
-                            {
-                                append_annotation(&mut annotation, &ta);
-                            }
-                            let output = stored
-                                .map(|o| o.as_text())
-                                .or_else(|| result_text.map(str::to_owned))
-                                .unwrap_or_default();
-                            let state = stored.and_then(|o| o.state().cloned());
-                            // Structured outputs (e.g. Diff) render natively
-                            // in Rust with full fidelity; a Lua restore
-                            // snapshot would replace that with a poorer text
-                            // view.
-                            let rust_rendered =
-                                stored.is_some_and(|o| o.structured_display_text().is_some());
-                            if !rust_rendered {
-                                restore_items.push(maki_lua::RestoreItem {
-                                    tool: Arc::from(static_name),
-                                    tool_use_id: id.clone(),
-                                    output,
-                                    input: input.clone(),
-                                    is_error: status == ToolStatus::Error,
-                                    tool_output_lines: *tool_output_lines,
-                                    theme_gen: None,
-                                    clicks: Vec::new(),
-                                    state,
-                                    session_id: None,
-                                    task_id: None,
-                                    reason: maki_lua::RestoreReason::Load,
-                                });
-                            }
+
                             display.push(DisplayMessage {
                                 role: DisplayRole::Tool(Box::new(ToolRole {
                                     id: id.clone(),
@@ -886,57 +837,7 @@ pub fn history_to_display(
             }
         }
     }
-    (display, restore_items)
-}
-
-fn notice(text: String, detail: Option<String>) -> DisplayMessage {
-    task_notice(text, detail, None)
-}
-
-fn task_notice(
-    text: String,
-    detail: Option<String>,
-    task_end: Option<BackgroundOutcome>,
-) -> DisplayMessage {
-    DisplayMessage {
-        detail,
-        task_end,
-        ..DisplayMessage::new(DisplayRole::Notice, text)
-    }
-}
-
-/// `ToolResult` is gone after session load, so we rebuild from
-/// whatever the `DisplayMessage` kept. A rerender: the transcript was
-/// already replayed once, this asks for one call's buf again.
-pub(crate) fn restore_item_for(
-    msg: &DisplayMessage,
-    tool_output_lines: maki_config::ToolOutputLines,
-    theme_gen: u64,
-) -> Option<maki_lua::RestoreItem> {
-    let DisplayRole::Tool(role) = &msg.role else {
-        return None;
-    };
-    let input = msg.tool_raw_input.as_deref()?;
-    let stored = msg.tool_output.as_deref()?;
-    if stored.structured_display_text().is_some() {
-        return None;
-    }
-    let output = stored.as_text();
-    let state = stored.state().cloned();
-    Some(maki_lua::RestoreItem {
-        tool: role.name.clone(),
-        tool_use_id: role.id.clone(),
-        output,
-        input: input.clone(),
-        is_error: role.status == ToolStatus::Error,
-        tool_output_lines,
-        theme_gen: Some(theme_gen),
-        clicks: Vec::new(),
-        state,
-        session_id: None,
-        task_id: None,
-        reason: maki_lua::RestoreReason::Rerender,
-    })
+    display
 }
 
 /// Mirrors the live `tool_done` path so restored sessions
@@ -1015,15 +916,31 @@ fn build_tool_results_map(messages: &[Message]) -> HashMap<&str, (bool, &str)> {
     map
 }
 
+fn notice(text: String, detail: Option<String>) -> DisplayMessage {
+    task_notice(text, detail, None)
+}
+
+fn task_notice(
+    text: String,
+    detail: Option<String>,
+    task_end: Option<BackgroundOutcome>,
+) -> DisplayMessage {
+    DisplayMessage {
+        detail,
+        task_end,
+        ..DisplayMessage::new(DisplayRole::Notice, text)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::components::IMAGE_PLACEHOLDER;
-    use maki_agent::{
-        AgentEvent, RunTotals, ToolDoneEvent, ToolOutput, ToolStartEvent, TurnCompleteEvent,
-    };
     use maki_config::UiConfig;
-    use maki_providers::{ImageMediaType, TaskEnd, TaskSettled};
+    use maki_types::event::RunTotals;
+    use maki_types::event::{AgentEvent, ToolDoneEvent, ToolStartEvent, TurnCompleteEvent};
+    use maki_types::message::{ImageMediaType, TaskEnd, TaskSettled};
+    use maki_types::tool::{DEFAULT_DATA_VERSION, ToolOutput};
     use test_case::test_case;
 
     const IMAGE_DATA: &str = "dGVzdA==";
@@ -1055,7 +972,7 @@ mod tests {
             content: vec![ContentBlock::Image { source: image() }],
             ..Default::default()
         };
-        let (display, _) = history_to_display(
+        let display = history_to_display(
             &[
                 Message::user_with_images(text.into(), vec![image()]),
                 hidden,
@@ -1064,6 +981,7 @@ mod tests {
                 assistant,
             ],
             &empty_outputs(),
+            &HashMap::new(),
             &ToolOutputLines::default(),
         );
         assert_eq!(display.len(), 2);
@@ -1080,13 +998,10 @@ mod tests {
     #[test]
     fn queued_user_images_reach_display() {
         let mut chat = chat();
-        let result = chat.handle_event(
-            AgentEvent::QueueItemConsumed {
-                text: String::new(),
-                images: vec![image()],
-            },
-            None,
-        );
+        let result = chat.handle_event(AgentEvent::QueueItemConsumed {
+            text: String::new(),
+            images: vec![image()],
+        });
         let ChatEventResult::QueueItemConsumed { text, images } = result else {
             panic!("{EXPECTED_QUEUE_DELIVERY}");
         };
@@ -1103,25 +1018,23 @@ mod tests {
     fn turn_complete_delivers_images_without_replaying_text(text: &str) {
         let mut chat = chat();
         text_delta(&mut chat, text);
-        chat.handle_event(
-            AgentEvent::TurnComplete(Box::new(TurnCompleteEvent {
-                message: Message {
-                    role: Role::Assistant,
-                    content: vec![
-                        ContentBlock::Text { text: text.into() },
-                        ContentBlock::Image { source: image() },
-                    ],
-                    ..Default::default()
-                },
-                usage: Default::default(),
-                model: String::new(),
-                cost: None,
-                subsidised_list_cost: None,
-                context_size: None,
-                context_window: 0,
-            })),
-            None,
-        );
+        chat.handle_event(AgentEvent::TurnComplete(Box::new(TurnCompleteEvent {
+            message: Message {
+                role: Role::Assistant,
+                content: vec![
+                    ContentBlock::Text { text: text.into() },
+                    ContentBlock::Image { source: image() },
+                ],
+                ..Default::default()
+            },
+            usage: Default::default(),
+            model: String::new(),
+            cost: None,
+            subsidised_list_cost: None,
+            subsidised_by: None,
+            context_size: None,
+            context_window: 0,
+        })));
         let image_index = usize::from(!text.is_empty());
         assert_eq!(chat.message_count(), image_index + 1);
         if !text.is_empty() {
@@ -1144,20 +1057,11 @@ mod tests {
             input: None,
             raw_input: None,
             output: None,
-            render_header: None,
+            data_version: DEFAULT_DATA_VERSION,
         }))
     }
 
     fn tool_done(id: &str, tool: &str, output: ToolOutput) -> AgentEvent {
-        tool_done_with_written_path(id, tool, output, None)
-    }
-
-    fn tool_done_with_written_path(
-        id: &str,
-        tool: &str,
-        output: ToolOutput,
-        written_path: Option<String>,
-    ) -> AgentEvent {
         AgentEvent::ToolDone(Box::new(ToolDoneEvent {
             call: None,
             id: id.into(),
@@ -1165,25 +1069,11 @@ mod tests {
             output: Arc::new(output),
             is_error: false,
             annotation: None,
-            written_path,
+            written_path: None,
+            data: None,
+
             backgrounded: false,
         }))
-    }
-
-    fn write_output(path: &str) -> (ToolOutput, Option<String>) {
-        (
-            ToolOutput::Plain(format!("wrote 42 bytes to {path}").into()),
-            Some(path.to_owned()),
-        )
-    }
-
-    fn edit_output(path: &str) -> ToolOutput {
-        ToolOutput::Diff {
-            path: path.into(),
-            before: String::new(),
-            after: String::new(),
-            summary: String::new(),
-        }
     }
 
     fn empty_outputs() -> HashMap<String, Arc<ToolOutput>> {
@@ -1205,7 +1095,7 @@ mod tests {
             None,
             MAIN_NAME.into(),
             UiConfig::default(),
-            maki_lua::EventHandle::disconnected_for_test(),
+            crate::EventHandle::disconnected_for_test(),
         )
     }
 
@@ -1215,7 +1105,7 @@ mod tests {
             Some(TASK_ID),
             SUBAGENT_NAME.into(),
             UiConfig::default(),
-            maki_lua::EventHandle::disconnected_for_test(),
+            crate::EventHandle::disconnected_for_test(),
         )
     }
 
@@ -1224,19 +1114,16 @@ mod tests {
     }
 
     fn text_delta(chat: &mut Chat, text: &str) {
-        chat.handle_event(AgentEvent::TextDelta { text: text.into() }, None);
+        chat.handle_event(AgentEvent::TextDelta { text: text.into() });
     }
 
     #[test]
     fn tool_lifecycle() {
         let mut chat = chat();
-        chat.handle_event(tool_start("t1", "bash"), None);
+        chat.handle_event(tool_start("t1", "bash"));
         assert_eq!(chat.in_progress_count(), 1);
 
-        chat.handle_event(
-            tool_done("t1", "bash", ToolOutput::Plain("ok".into())),
-            None,
-        );
+        chat.handle_event(tool_done("t1", "bash", ToolOutput::Plain("ok".into())));
         assert_eq!(chat.in_progress_count(), 0);
     }
 
@@ -1247,72 +1134,18 @@ mod tests {
     fn a_call_a_plugin_allowed_is_marked_on_its_row_once() {
         const PLUGIN: &str = "automode";
         let mut chat = chat();
-        chat.handle_event(tool_start("t1", "code_execution"), None);
+        chat.handle_event(tool_start("t1", "code_execution"));
         for _ in 0..2 {
-            chat.handle_event(
-                AgentEvent::AllowedByPlugin {
-                    id: "t1".into(),
-                    plugin: PLUGIN.into(),
-                },
-                None,
-            );
+            chat.handle_event(AgentEvent::AllowedByPlugin {
+                id: "t1".into(),
+                plugin: PLUGIN.into(),
+            });
         }
         let row = chat.message_at(0).expect("the tool row");
         assert_eq!(
             row.annotation.as_deref(),
             Some(format!("{ALLOWED_BY} {PLUGIN}").as_str())
         );
-    }
-
-    #[test]
-    fn plan_write_renders_file_content() {
-        let mut chat = chat();
-        let dir = tempfile::tempdir().unwrap();
-        let plan_path = dir.path().join("plan.md");
-        std::fs::write(&plan_path, "# My Plan\n\n- Step 1").unwrap();
-        let plan_str = plan_path.to_str().unwrap();
-
-        chat.handle_event(tool_start("w1", "write"), Some(plan_path.as_path()));
-        let (output, wp) = write_output(plan_str);
-        chat.handle_event(
-            tool_done_with_written_path("w1", "write", output, wp),
-            Some(plan_path.as_path()),
-        );
-
-        assert!(chat.last_message_is_plan());
-        let last = chat.last_message_text();
-        assert!(last.contains("# My Plan"));
-    }
-
-    #[test]
-    fn plan_write_ignores_different_path() {
-        let mut chat = chat();
-        let plan_path = Path::new("/plans/123.md");
-        chat.handle_event(tool_start("w1", "write"), Some(plan_path));
-        let (output, wp) = write_output("src/main.rs");
-        chat.handle_event(
-            tool_done_with_written_path("w1", "write", output, wp),
-            Some(plan_path),
-        );
-        assert!(!chat.last_message_is_plan());
-    }
-
-    #[test]
-    fn plan_edit_shows_path_only() {
-        let mut chat = chat();
-        let dir = tempfile::tempdir().unwrap();
-        let plan_path = dir.path().join("plan.md");
-        std::fs::write(&plan_path, "# My Plan\n\n- Step 1").unwrap();
-        let plan_str = plan_path.to_str().unwrap();
-
-        chat.handle_event(tool_start("e1", "edit"), Some(plan_path.as_path()));
-        chat.handle_event(
-            tool_done("e1", "edit", edit_output(plan_str)),
-            Some(plan_path.as_path()),
-        );
-
-        assert!(chat.last_message_is_plan());
-        assert!(chat.last_message_text().is_empty());
     }
 
     #[test]
@@ -1325,9 +1158,13 @@ mod tests {
             ..Default::default()
         }];
         assert!(
-            history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default())
-                .0
-                .is_empty()
+            history_to_display(
+                &msgs,
+                &empty_outputs(),
+                &HashMap::new(),
+                &ToolOutputLines::default()
+            )
+            .is_empty()
         );
     }
 
@@ -1335,7 +1172,12 @@ mod tests {
     #[test_case(Message::context_update("<context-update>Date is now tomorrow.</context-update>".into(), Default::default()) ; "context_update")]
     fn history_hides_host_messages_but_keeps_the_prompt(host: Message) {
         let msgs = vec![host, Message::user(USER_TEXT.into())];
-        let display = history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default()).0;
+        let display = history_to_display(
+            &msgs,
+            &empty_outputs(),
+            &HashMap::new(),
+            &ToolOutputLines::default(),
+        );
         let shown: Vec<(DisplayRole, &str)> = display
             .iter()
             .map(|d| (d.role.clone(), d.text.as_str()))
@@ -1358,8 +1200,12 @@ mod tests {
         let saved = serde_json::to_string(&[observation, next]).unwrap();
         let restored: Vec<Message> = serde_json::from_str(&saved).unwrap();
 
-        let display =
-            history_to_display(&restored, &empty_outputs(), &ToolOutputLines::default()).0;
+        let display = history_to_display(
+            &restored,
+            &empty_outputs(),
+            &HashMap::new(),
+            &ToolOutputLines::default(),
+        );
 
         let shown: Vec<(DisplayRole, &str)> = display
             .iter()
@@ -1389,9 +1235,9 @@ mod tests {
         let display = history_to_display(
             &[observation],
             &empty_outputs(),
+            &HashMap::new(),
             &ToolOutputLines::default(),
-        )
-        .0;
+        );
 
         assert_eq!(display[0].detail.as_deref(), Some(detail));
         assert_eq!(display[0].task_end, task_end);
@@ -1426,7 +1272,12 @@ mod tests {
             "output",
             is_error,
         );
-        let display = history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default()).0;
+        let display = history_to_display(
+            &msgs,
+            &empty_outputs(),
+            &HashMap::new(),
+            &ToolOutputLines::default(),
+        );
         assert_eq!(display.len(), 1);
         assert!(matches!(&display[0].role, DisplayRole::Tool(t) if t.status == expected));
     }
@@ -1458,7 +1309,12 @@ mod tests {
                 ..Default::default()
             },
         ];
-        let display = history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default()).0;
+        let display = history_to_display(
+            &msgs,
+            &empty_outputs(),
+            &HashMap::new(),
+            &ToolOutputLines::default(),
+        );
         assert_eq!(display.len(), 4);
         assert_eq!(display[0].role, DisplayRole::User);
         assert_eq!(display[1].role, DisplayRole::Assistant);
@@ -1506,7 +1362,12 @@ mod tests {
             let discriminant = std::mem::discriminant(&output);
             let msgs = tool_use_pair(tool_name, input_json, "ok", false);
             let outputs = HashMap::from([("t1".into(), Arc::new(output))]);
-            let display = history_to_display(&msgs, &outputs, &ToolOutputLines::default()).0;
+            let display = history_to_display(
+                &msgs,
+                &outputs,
+                &HashMap::new(),
+                &ToolOutputLines::default(),
+            );
             assert_eq!(
                 std::mem::discriminant(display[0].tool_output.as_deref().unwrap()),
                 discriminant,
@@ -1529,7 +1390,12 @@ mod tests {
             false,
         );
         let outputs = HashMap::from([("t1".into(), Arc::new(write_output))]);
-        let display = history_to_display(&msgs, &outputs, &ToolOutputLines::default()).0;
+        let display = history_to_display(
+            &msgs,
+            &outputs,
+            &HashMap::new(),
+            &ToolOutputLines::default(),
+        );
         assert!(display[0].annotation.is_some());
     }
 
@@ -1543,7 +1409,12 @@ mod tests {
             &joined,
             false,
         );
-        let display = history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default()).0;
+        let display = history_to_display(
+            &msgs,
+            &empty_outputs(),
+            &HashMap::new(),
+            &ToolOutputLines::default(),
+        );
         let line_count = display[0].text.lines().count();
         assert!(
             line_count < long_output.len(),
@@ -1559,7 +1430,12 @@ mod tests {
             "1: fn main() {}",
             false,
         );
-        let display = history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default()).0;
+        let display = history_to_display(
+            &msgs,
+            &empty_outputs(),
+            &HashMap::new(),
+            &ToolOutputLines::default(),
+        );
         assert!(display[0].tool_output.is_none());
         assert!(display[0].text.contains("fn main"));
     }
@@ -1580,123 +1456,60 @@ mod tests {
             ],
             ..Default::default()
         }];
-        let display = history_to_display(&msgs, &HashMap::new(), &ToolOutputLines::default()).0;
+        let display = history_to_display(
+            &msgs,
+            &HashMap::new(),
+            &HashMap::new(),
+            &ToolOutputLines::default(),
+        );
         assert_eq!(display.len(), 2);
         assert_eq!(display[0].role, DisplayRole::Thinking);
         assert_eq!(display[0].text, "reasoning");
         assert_eq!(display[1].role, DisplayRole::Assistant);
     }
 
-    const RESTORE_OUTPUT: &str = "rendered output";
-
-    fn tool_msg_with_input(tool: &str) -> DisplayMessage {
-        let mut msg = DisplayMessage::new(DisplayRole::User, String::new());
-        msg.role = DisplayRole::Tool(Box::new(ToolRole {
-            id: "t1".into(),
-            status: ToolStatus::Success,
-            name: tool.into(),
-        }));
-        msg.tool_raw_input = Some(Arc::new(serde_json::json!({ "q": tool })));
-        msg.tool_output = Some(Arc::new(ToolOutput::Plain(RESTORE_OUTPUT.into())));
-        msg
-    }
-
-    const RESTORE_THEME_GEN: u64 = 7;
-
     #[test]
-    fn restore_item_for_round_trips_fields() {
-        let msg = tool_msg_with_input("bash");
-        let item = restore_item_for(&msg, ToolOutputLines::default(), RESTORE_THEME_GEN)
-            .expect("tool message with input and output must produce a RestoreItem");
-        assert_eq!(&*item.tool, "bash");
-        assert_eq!(item.tool_use_id, "t1");
-        assert!(!item.is_error);
-        assert_eq!(item.output, RESTORE_OUTPUT);
-        assert_eq!(item.theme_gen, Some(RESTORE_THEME_GEN));
-        assert_eq!(item.input, serde_json::json!({ "q": "bash" }));
-    }
-
-    #[test]
-    fn restore_item_for_skips_structured_outputs_rust_renders() {
-        let mut msg = tool_msg_with_input("edit");
-        msg.tool_output = Some(Arc::new(edit_output("/src/main.rs")));
-        assert!(restore_item_for(&msg, ToolOutputLines::default(), RESTORE_THEME_GEN).is_none());
-    }
-
-    #[test]
-    fn history_structured_output_produces_no_restore_item() {
-        let msgs = tool_use_pair(
-            "edit",
-            serde_json::json!({"path": "a", "old_string": "x", "new_string": "y"}),
-            "edited a",
-            false,
-        );
-        let outputs = HashMap::from([("t1".to_owned(), Arc::new(edit_output("a")))]);
-        let (_, items) = history_to_display(&msgs, &outputs, &ToolOutputLines::default());
-        assert!(items.is_empty(), "Rust owns Diff rendering on restore");
-
-        let (_, items) = history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default());
-        assert_eq!(items.len(), 1, "text-only history still restores via Lua");
-    }
-
-    #[test]
-    fn restore_item_for_returns_none_when_data_missing() {
-        let tol = ToolOutputLines::default();
-
-        let plain = DisplayMessage::new(DisplayRole::Assistant, "hi".into());
-        assert!(restore_item_for(&plain, tol, RESTORE_THEME_GEN).is_none());
-
-        let mut no_input = tool_msg_with_input("bash");
-        no_input.tool_raw_input = None;
-        assert!(restore_item_for(&no_input, tol, RESTORE_THEME_GEN).is_none());
-
-        let mut no_output = tool_msg_with_input("bash");
-        no_output.tool_output = None;
-        assert!(restore_item_for(&no_output, tol, RESTORE_THEME_GEN).is_none());
+    fn a_manual_compaction_start_draws_no_automatic_line() {
+        let mut chat = chat();
+        chat.handle_event(AgentEvent::AutoCompacting {
+            context_size: 0,
+            context_window: 0,
+            manual: true,
+        });
+        assert_eq!(chat.message_count(), 0);
     }
 
     #[test]
     fn compaction_done_flushes_streaming_buffers() {
         let mut chat = chat();
 
-        chat.handle_event(
-            AgentEvent::AutoCompacting {
-                context_size: 0,
-                context_window: 0,
-            },
-            None,
-        );
+        chat.handle_event(AgentEvent::AutoCompacting {
+            context_size: 0,
+            context_window: 0,
+            manual: false,
+        });
         assert_eq!(chat.message_count(), 1);
 
-        chat.handle_event(
-            AgentEvent::TextDelta {
-                text: "summary".into(),
-            },
-            None,
-        );
-        chat.handle_event(
-            AgentEvent::ThinkingDelta {
-                text: "thinking".into(),
-            },
-            None,
-        );
+        chat.handle_event(AgentEvent::TextDelta {
+            text: "summary".into(),
+        });
+        chat.handle_event(AgentEvent::ThinkingDelta {
+            text: "thinking".into(),
+        });
         assert!(!chat.streaming_text_is_empty());
         assert!(!chat.streaming_thinking_is_empty());
 
-        chat.handle_event(
-            AgentEvent::CompactionDone {
-                context_size_before: 0,
-                context_size_after: 0,
-                context_window: 0,
-                summary: String::new(),
-            },
-            None,
-        );
+        chat.handle_event(AgentEvent::CompactionDone {
+            context_size_before: 0,
+            context_size_after: 0,
+            context_window: 0,
+            summary: String::new(),
+        });
         assert!(chat.streaming_text_is_empty());
         assert!(chat.streaming_thinking_is_empty());
         assert_eq!(chat.message_count(), 3);
 
-        chat.handle_event(AgentEvent::TextDelta { text: "new".into() }, None);
+        chat.handle_event(AgentEvent::TextDelta { text: "new".into() });
         chat.flush();
         assert_eq!(chat.message_count(), 4);
         assert_eq!(chat.last_message_text(), "new");
@@ -1849,13 +1662,10 @@ mod tests {
     #[test_case(SteerKind::Continued, CONTINUED_PREFIX ; "continued")]
     fn steered_shows_one_prefixed_assistant_message(kind: SteerKind, prefix: &str) {
         let mut chat = chat();
-        chat.handle_event(
-            AgentEvent::Steered {
-                kind,
-                text: STEER_TEXT.into(),
-            },
-            None,
-        );
+        chat.handle_event(AgentEvent::Steered {
+            kind,
+            text: STEER_TEXT.into(),
+        });
         assert_eq!(chat.message_count(), 1);
         let text = chat.last_message_text();
         assert!(
@@ -1868,15 +1678,13 @@ mod tests {
     #[test]
     fn permission_request_carries_reason() {
         let mut chat = chat();
-        let result = chat.handle_event(
-            AgentEvent::PermissionRequest {
-                id: TASK_ID.into(),
-                tool: ToolKey::native("bash"),
-                scopes: Vec::new(),
-                reason: Some(ASK_REASON.into()),
-            },
-            None,
-        );
+        let result = chat.handle_event(AgentEvent::PermissionRequest {
+            id: TASK_ID.into(),
+            tool: ToolKey::native("bash"),
+            scopes: Vec::new(),
+            reason: Some(ASK_REASON.into()),
+            choices: Vec::new(),
+        });
         let ChatEventResult::PermissionRequest { id, reason, .. } = result else {
             panic!("{EXPECTED_PERMISSION_REQUEST}");
         };

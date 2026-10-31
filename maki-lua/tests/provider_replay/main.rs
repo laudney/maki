@@ -14,6 +14,7 @@ use maki_agent::tools::ToolRegistry;
 use maki_config::providers::builtin_provider;
 use maki_config::{PROVIDER_BUILTINS, PluginsConfig};
 use maki_lua::PluginHost;
+
 use maki_providers::plugin;
 use maki_providers::test_support::isolated_home;
 use maki_providers::{Model, ResolvedAuth, ThinkingSupport, Timeouts};

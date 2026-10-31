@@ -8,7 +8,7 @@ use std::thread;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use color_eyre::eyre::{Result, ensure};
 use image::{DynamicImage, ImageDecoder, ImageReader, Limits};
-use maki_providers::ImageSource;
+use maki_types::message::ImageSource;
 use ratatui::layout::Size;
 use ratatui_image::{
     FontSize,
@@ -265,7 +265,7 @@ mod tests {
     use base64::{Engine, engine::general_purpose::STANDARD};
     use color_eyre::eyre::Result;
     use image::{DynamicImage, ImageFormat};
-    use maki_providers::{IMAGE_PLACEHOLDER, ImageMediaType, ImageSource};
+    use maki_types::message::{IMAGE_PLACEHOLDER, ImageMediaType, ImageSource};
     use ratatui::layout::Size;
     use ratatui_image::{
         FontSize,

@@ -2,13 +2,12 @@ use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
 use crate::agent::QueuedMessage;
+use crate::agent::capabilities::{Feature, UNAVAILABLE_REMOTE};
 use crate::components::Status;
 use crate::theme;
-use maki_agent::{AgentInput, AgentMode, InputSource};
-use maki_lua::agent_autocmd::HostEvent;
-use maki_providers::RequestOptions;
-use maki_storage::StateDir;
-use maki_storage::plans;
+use maki_lua_core::agent_autocmd::HostEvent;
+use maki_types::input::{AgentInput, AgentMode, InputSource};
+use maki_types::thinking::RequestOptions;
 use ratatui::style::{Color, Modifier, Style};
 
 use super::App;
@@ -64,14 +63,6 @@ impl PlanState {
     pub(crate) fn is_ready(&self) -> bool {
         matches!(self, Self::Ready(_))
     }
-
-    pub(crate) fn allocate_path(&mut self, storage: &StateDir) {
-        if matches!(self, Self::None) {
-            *self = Self::Drafting(
-                plans::new_plan_path(storage).unwrap_or_else(|_| PathBuf::from("plans/plan.md")),
-            );
-        }
-    }
 }
 
 impl App {
@@ -102,8 +93,8 @@ impl App {
         }
     }
 
+    /// A remote agent keeps its own plan file, so only the mode is set.
     pub(super) fn enter_plan(&mut self) {
-        self.state.plan.allocate_path(&self.storage);
         self.state.mode = Mode::Plan;
     }
 
@@ -118,6 +109,10 @@ impl App {
     }
 
     pub(super) fn toggle_mode(&mut self) -> Vec<super::Action> {
+        if !self.backend.supports(Feature::ModeChange) {
+            self.flash(UNAVAILABLE_REMOTE.into());
+            return vec![];
+        }
         match self.state.mode {
             Mode::Build => self.enter_plan(),
             Mode::Plan => self.state.mode = Mode::Build,
@@ -125,15 +120,10 @@ impl App {
         vec![]
     }
 
+    /// A remote prompt sends only the mode id, so its plan path stays empty.
     pub(crate) fn agent_mode(&self) -> AgentMode {
         match self.state.mode {
-            Mode::Plan => match self.state.plan.path() {
-                Some(p) => AgentMode::Plan(p.to_path_buf()),
-                None => {
-                    debug_assert!(false, "Plan mode without path - invariant violated");
-                    AgentMode::Build
-                }
-            },
+            Mode::Plan => AgentMode::Plan(PathBuf::new()),
             Mode::Build => AgentMode::Build,
         }
     }

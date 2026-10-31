@@ -8,3 +8,6 @@ agent = true
 session_read = true
 session_write = true
 session_settings = true
+
+[ui.permissions]
+session_write = true

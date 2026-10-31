@@ -32,7 +32,7 @@ function Toast.show(text, opts)
   width = math.min(width, MAX_WIDTH)
 
   -- A live buffer would steal the output pane of whatever tool raised us.
-  local buf = maki.ui.buf({ scratch = true })
+  local buf = maki.ui.buf()
   buf:set_lines(lines)
   local win = maki.ui.open_win(buf, {
     title = opts.title,

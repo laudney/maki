@@ -41,8 +41,8 @@ function M.build_skill_list(skills)
   return "\n\n<available_skills>\n" .. table.concat(lines, "\n") .. "\n</available_skills>"
 end
 
--- `parse_output` must stay the exact inverse: the view is drawn from
--- this text, live and on restore.
+-- `parse_output` must stay the exact inverse: a call saved without its
+-- state draws from this text.
 function M.format_output(location, content)
   local lines = { location }
   for i, line in ipairs(maki.split(content, "\n")) do

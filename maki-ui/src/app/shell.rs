@@ -7,11 +7,13 @@ use std::time::{Duration, Instant};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
-use maki_agent::{
-    AgentConfig, CancelToken, CancelTrigger, ToolDoneEvent, ToolInput, ToolOutput, ToolStartEvent,
-};
-use maki_config::ShellPreference;
-use maki_providers::{Message, shell_command, strip_provider_keys};
+use maki_config::shell_command;
+use maki_config::{AgentConfig, ShellPreference};
+use maki_lua_core::provider_hooks::sanitize_child_env;
+use maki_types::cancel::{CancelToken, CancelTrigger};
+use maki_types::event::{ToolDoneEvent, ToolStartEvent};
+use maki_types::message::Message;
+use maki_types::tool::{DEFAULT_DATA_VERSION, ToolInput, ToolOutput};
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::Command;
 use tokio::time::timeout_at;
@@ -129,7 +131,7 @@ impl App {
                     }),
                     raw_input: None,
                     output: None,
-                    render_header: None,
+                    data_version: DEFAULT_DATA_VERSION,
                 });
             }
             ShellEvent::Output { id, content } => {
@@ -158,6 +160,8 @@ impl App {
                     is_error,
                     annotation: None,
                     written_path: None,
+                    data: None,
+
                     backgrounded: false,
                 });
                 if let Some(msg) = result_msg {
@@ -219,7 +223,7 @@ async fn run_command(
     shell: &ShellPreference,
 ) -> Result<String, String> {
     let mut std_cmd = shell_command(command, shell);
-    strip_provider_keys(&mut std_cmd).env("GIT_TERMINAL_PROMPT", "0");
+    sanitize_child_env(&mut std_cmd).env("GIT_TERMINAL_PROMPT", "0");
 
     #[cfg(unix)]
     unsafe {
@@ -243,7 +247,7 @@ async fn run_command(
     if let Some(stderr) = child.stderr.take() {
         spawn_line_reader(BufReader::new(stderr), line_tx.clone());
     }
-    let mut guard = maki_agent::ChildGuard::new(child);
+    let mut guard = maki_storage::child_guard::ChildGuard::new(child);
     drop(line_tx);
 
     let mut output = String::new();

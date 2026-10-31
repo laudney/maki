@@ -61,7 +61,6 @@ local function strip_html(html)
 end
 
 local truncate = require("maki.truncate")
-local ToolView = require("maki.tool_view")
 local output_limits = require("maki.output_limits")
 
 local opts = maki.api.register_options(output_limits.extend({
@@ -71,11 +70,6 @@ local opts = maki.api.register_options(output_limits.extend({
     desc = "Stop reading a response after this many bytes.",
   },
 }))
-
-local function web_view_opts(ctx)
-  local tol = ctx:tool_output_lines()
-  return { max_lines = (tol and tol.web) or 3, keep = "head" }
-end
 
 maki.api.register_tool({
   name = "webfetch",
@@ -97,17 +91,14 @@ maki.api.register_tool({
   },
   permission = "net",
   permission_scopes = "url",
+  -- The state keeps the whole page text when the model gets it cut.
 
-  header = function(input)
+  summary = function(input)
     local fmt = input.format
     if fmt and fmt ~= DEFAULT_FORMAT then
       return input.url .. " [" .. fmt .. "]"
     end
     return input.url
-  end,
-
-  restore = function(_input, output, _is_error, ctx)
-    return ToolView.restore(output, web_view_opts(ctx))
   end,
 
   handler = function(input, ctx)
@@ -154,10 +145,11 @@ maki.api.register_tool({
     end
 
     local llm_output = truncate(body, max_lines, max_bytes)
+    local kept = llm_output ~= body and #body <= output_limits.STATE_TEXT_MAX_BYTES
 
     return {
       llm_output = llm_output,
-      body = ToolView.restore(body, web_view_opts(ctx)),
+      state = kept and { text = body } or nil,
     }
   end,
 })

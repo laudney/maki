@@ -17,6 +17,8 @@ use crossterm::event::{DisableFocusChange, EnableFocusChange};
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use maki_config::NotificationMethod;
 
+use crate::agent::LoginInvocation;
+
 const FALLBACK_NOTIFICATION_MESSAGE: &str = "Maki needs attention";
 const NOTIFICATION_TITLE: &str = "Maki";
 const BELL_SEQUENCE: &str = "\u{7}";
@@ -430,6 +432,76 @@ pub(crate) fn open_in_editor(
     }
 }
 
+/// Runs a remote agent's terminal login in this terminal, with the TUI
+/// torn down and restored whatever happens. The terminal is cooked while it
+/// runs, so Ctrl+C signals the whole foreground group: a no-op `SIGINT`
+/// handler keeps this process alive meanwhile. A handler, not an ignored
+/// signal, because `exec` resets handlers in the child, so the login can
+/// still be interrupted, and an ignored signal would be inherited.
+pub(crate) fn run_login(
+    login: &LoginInvocation,
+    terminal: &mut ratatui::DefaultTerminal,
+) -> Result<std::process::ExitStatus, String> {
+    // Up for the whole cooked interval, the teardown and resume included.
+    let shield = InterruptShield::raise();
+    teardown();
+    let result = ProcessCommand::new(&login.program)
+        .args(&login.args)
+        .envs(&login.env)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status();
+    resume(terminal);
+    drop(shield);
+    result.map_err(|e| format!("Failed to run {}: {e}", login.program))
+}
+
+/// A no-op `SIGINT` handler while it lives, the previous action after.
+#[cfg(unix)]
+struct InterruptShield(libc::sigaction);
+
+#[cfg(unix)]
+extern "C" fn on_interrupt(_: libc::c_int) {}
+
+#[cfg(unix)]
+impl InterruptShield {
+    fn raise() -> Self {
+        // SAFETY: a zeroed `sigaction` is a valid value to fill in, and the
+        // handler does nothing, so it is async-signal-safe.
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = on_interrupt as *const () as libc::sighandler_t;
+            libc::sigemptyset(&mut action.sa_mask);
+            let mut previous: libc::sigaction = std::mem::zeroed();
+            libc::sigaction(libc::SIGINT, &action, &mut previous);
+            Self(previous)
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for InterruptShield {
+    fn drop(&mut self) {
+        // SAFETY: the action is what `sigaction` handed back for this signal.
+        unsafe {
+            libc::sigaction(libc::SIGINT, &self.0, std::ptr::null_mut());
+        }
+    }
+}
+
+/// Unused elsewhere: `maki connect` offers the terminal login only where
+/// the shield and the agent's own process group exist.
+#[cfg(not(unix))]
+struct InterruptShield;
+
+#[cfg(not(unix))]
+impl InterruptShield {
+    fn raise() -> Self {
+        Self
+    }
+}
+
 pub(crate) fn copy_to_clipboard(text: &str) -> Result<(), String> {
     let mut sequence = String::new();
     CopyToClipboard::to_clipboard_from(text)
@@ -447,6 +519,28 @@ pub(crate) fn copy_to_clipboard(text: &str) -> Result<(), String> {
 mod tests {
     use super::*;
     use test_case::test_case;
+
+    /// A Ctrl+C during the login must spare this process, and the login
+    /// child must still be interruptible: a handler, unlike an ignored
+    /// signal, does not survive `exec`.
+    #[cfg(unix)]
+    #[test]
+    fn the_shield_spares_this_process_and_not_the_child() {
+        let shield = InterruptShield::raise();
+        // SAFETY: raising a signal whose handler does nothing.
+        unsafe {
+            libc::raise(libc::SIGINT);
+        }
+        let traps = ProcessCommand::new("sh")
+            .args(["-c", "trap"])
+            .output()
+            .unwrap();
+        drop(shield);
+        assert!(
+            String::from_utf8_lossy(&traps.stdout).trim().is_empty(),
+            "the child starts with every signal at its default"
+        );
+    }
 
     fn env<'a>(term_program: Option<&'a str>) -> TerminalEnvironment<'a> {
         TerminalEnvironment {

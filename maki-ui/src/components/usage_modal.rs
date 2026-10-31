@@ -7,8 +7,8 @@ use crossterm::event::{KeyCode, KeyEvent};
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
 use maki_config::ClockFormat;
-use maki_providers::{Model, ModelUsageRow, ProviderUsage, TokenUsage, format_tokens, model_cost};
 use maki_storage::sessions::StoredTokenUsage;
+use maki_types::usage::{ModelUsageRow, ProviderUsage, TokenUsage, format_tokens};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
@@ -34,6 +34,15 @@ const WEEK: i64 = 7 * DAY;
 
 /// Live provider quota fetch, shared from the event loop. A detached task
 /// drops the answer into the slot, and [`UsageModal::poll`] is what notices.
+/// Every fetch gets a fresh slot, so an older answer lands where nobody
+/// looks.
+pub struct UsageFetch {
+    /// The provider asked, named when the fetch starts: the model may have
+    /// moved on by the time the answer lands.
+    pub provider: String,
+    pub state: UsageFetchState,
+}
+
 pub enum UsageFetchState {
     Loading,
     Ready(ProviderUsage),
@@ -43,22 +52,21 @@ pub enum UsageFetchState {
 
 pub struct UsageModalContext<'a> {
     pub total: &'a TokenUsage,
-    /// What the session billed, from [`maki_providers::session_cost`]. `None`
+    /// What the host billed. `None`
     /// means nothing here is priced, so the modal shows tokens only.
     pub total_cost: Option<f64>,
     /// What the session would have billed at the provider's published list
     /// price, shown next to `total_cost` only when `model` is subsidised.
     pub total_list_cost: Option<f64>,
     pub by_model: &'a HashMap<String, StoredTokenUsage>,
-    pub model: &'a Model,
-    pub fast: bool,
+    pub subsidy_source: Option<&'a str>,
     pub clock_format: ClockFormat,
 }
 
 pub struct UsageModal {
     open: bool,
     scroll: ModalScroll,
-    quota: Watch<UsageFetchState>,
+    quota: Watch<UsageFetch>,
 }
 
 impl UsageModal {
@@ -73,7 +81,7 @@ impl UsageModal {
     /// Picks up a finished quota fetch. Nothing wakes the loop when the task
     /// stores its result, so an unpolled modal sits on `Loading` until the
     /// user happens to press a key.
-    pub fn poll(&mut self, slot: &ArcSwapOption<UsageFetchState>) -> Dirty {
+    pub fn poll(&mut self, slot: &ArcSwapOption<UsageFetch>) -> Dirty {
         if !self.open {
             return Dirty::NO;
         }
@@ -153,7 +161,7 @@ impl UsageModal {
 
 fn build_lines(
     ctx: &UsageModalContext,
-    quota: Option<&UsageFetchState>,
+    quota: Option<&UsageFetch>,
     theme: &crate::theme::Theme,
 ) -> Vec<Line<'static>> {
     let mut lines: Vec<Line> = Vec::new();
@@ -168,14 +176,14 @@ fn build_lines(
         ctx.total,
         ctx.total_cost,
         ctx.total_list_cost,
-        ctx.model.subsidy_source(),
+        ctx.subsidy_source,
         theme,
     )));
 
-    if let Some(state) = quota {
+    if let Some(UsageFetch { provider, state }) = quota {
         lines.push(Line::default());
         lines.push(Line::from(Span::styled(
-            format!("{PREFIX}{} quota", ctx.model.provider_display_name()),
+            format!("{PREFIX}{provider} quota"),
             theme.keybind_section,
         )));
         lines.extend(quota_lines(state, theme, ctx.clock_format));
@@ -212,11 +220,10 @@ fn build_lines(
     lines.push(Line::from(header_row(model_w, theme)));
 
     for (id, usage) in entries {
-        let cost = model_cost(id, usage, ctx.model, ctx.fast);
         lines.push(Line::from(model_row(
             id,
             usage,
-            cost,
+            usage.cost,
             model_w,
             fg,
             theme.status_dim,
@@ -470,10 +477,10 @@ fn relative(seconds: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::components::{buffer_text, test_model};
+    use crate::components::buffer_text;
     use crate::repaint::expect::{OWED, QUIET};
     use crossterm::event::KeyModifiers;
-    use maki_providers::UsageLimit;
+    use maki_types::usage::UsageLimit;
     use std::sync::Arc;
     use test_case::test_case;
 
@@ -486,6 +493,7 @@ mod tests {
     const ONE_MILLION_TEXT: &str = "1.0m";
     const UNKNOWN_MODEL: &str = "a-model-no-table-has-ever-heard-of";
     const NO_COST_TEXT: &str = "-";
+    const QUOTA_PROVIDER: &str = "Asked Provider";
 
     fn line_texts(lines: &[Line<'static>]) -> Vec<String> {
         lines
@@ -611,15 +619,13 @@ mod tests {
         total: &TokenUsage,
         total_cost: Option<f64>,
         by_model: &HashMap<String, StoredTokenUsage>,
-        model: &Model,
     ) -> Vec<String> {
         let ctx = UsageModalContext {
             total,
             total_cost,
             total_list_cost: None,
             by_model,
-            model,
-            fast: false,
+            subsidy_source: None,
             clock_format: ClockFormat::Hour24,
         };
         line_texts(&build_lines(&ctx, None, &crate::theme::current()))
@@ -631,17 +637,16 @@ mod tests {
     /// since charging it the selected model's rates invents a bill.
     #[test]
     fn model_rows_show_what_was_recorded_and_never_todays_price() {
-        let model = test_model();
         let total = TokenUsage {
             input: 2 * ONE_MILLION,
             ..Default::default()
         };
         let by_model = HashMap::from([
-            (model.id.clone(), stored(Some(RECORDED_COST))),
+            ("recorded-model".into(), stored(Some(RECORDED_COST))),
             (UNKNOWN_MODEL.to_string(), stored(None)),
         ]);
 
-        let rows = modal_rows(&total, Some(RECORDED_COST), &by_model, &model);
+        let rows = modal_rows(&total, Some(RECORDED_COST), &by_model);
         let row = |id: &str| {
             rows.iter()
                 .find(|t| t.contains(id))
@@ -649,7 +654,7 @@ mod tests {
                 .clone()
         };
 
-        let recorded_row = row(&model.id);
+        let recorded_row = row("recorded-model");
         assert!(recorded_row.contains(RECORDED_TEXT), "{recorded_row}");
         assert!(!recorded_row.contains(REPRICED_TEXT), "{recorded_row}");
 
@@ -665,14 +670,12 @@ mod tests {
     #[test_case(Some(RECORDED_COST) => Some(RECORDED_TEXT.to_string()) ; "prints_the_bill_it_was_handed")]
     #[test_case(None                => None                            ; "unpriced_session_shows_tokens_only")]
     fn totals_row_never_re_prices_the_counters(total_cost: Option<f64>) -> Option<String> {
-        let model = test_model();
-        assert!(!model.pricing.is_zero(), "the fallback must be tempting");
         let total = TokenUsage {
             input: ONE_MILLION,
             ..Default::default()
         };
 
-        let rows = modal_rows(&total, total_cost, &HashMap::new(), &model);
+        let rows = modal_rows(&total, total_cost, &HashMap::new());
         // With no breakdown, the totals row is the only one carrying counters.
         let totals = rows
             .iter()
@@ -683,21 +686,26 @@ mod tests {
             .map(|(_, cost)| cost.trim().to_string())
     }
 
-    fn slot(state: UsageFetchState) -> ArcSwapOption<UsageFetchState> {
-        ArcSwapOption::from_pointee(state)
+    fn slot(state: UsageFetchState) -> ArcSwapOption<UsageFetch> {
+        ArcSwapOption::from_pointee(fetch(state))
+    }
+
+    fn fetch(state: UsageFetchState) -> UsageFetch {
+        UsageFetch {
+            provider: QUOTA_PROVIDER.into(),
+            state,
+        }
     }
 
     fn render(modal: &mut UsageModal) -> String {
         let backend = ratatui::backend::TestBackend::new(120, 30);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        let model = test_model();
         let ctx = UsageModalContext {
             total: &TokenUsage::default(),
             total_cost: None,
             total_list_cost: None,
             by_model: &HashMap::new(),
-            model: &model,
-            fast: false,
+            subsidy_source: None,
             clock_format: ClockFormat::Hour24,
         };
         terminal
@@ -729,7 +737,7 @@ mod tests {
         assert_eq!(modal.poll(&slot), Dirty::YES, "{OWED}");
         assert_eq!(modal.poll(&slot), Dirty::NO, "{QUIET}");
 
-        slot.store(Some(Arc::new(UsageFetchState::Unsupported)));
+        slot.store(Some(Arc::new(fetch(UsageFetchState::Unsupported))));
         assert_eq!(
             modal.poll(&slot),
             Dirty::YES,
@@ -761,6 +769,17 @@ mod tests {
             render(&mut modal).contains(NO_USAGE_ENDPOINT),
             "a reopened modal still shows the last answer it saw"
         );
+    }
+
+    /// The quota is headed by the provider that was asked, which a model
+    /// switch since may have replaced.
+    #[test]
+    fn the_quota_is_headed_by_the_provider_asked() {
+        let slot = slot(UsageFetchState::Unsupported);
+        let mut modal = UsageModal::new();
+        modal.toggle();
+        assert_eq!(modal.poll(&slot), Dirty::YES, "{OWED}");
+        assert!(render(&mut modal).contains(&format!("{QUOTA_PROVIDER} quota")));
     }
 
     #[test]

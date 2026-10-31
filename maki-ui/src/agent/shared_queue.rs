@@ -7,12 +7,17 @@
 //! set it.
 
 use std::borrow::Cow;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use maki_agent::{
-    AgentInput, AgentMode, EarlierInput, ExtractedCommand, ImageSource, InterruptSource,
-};
+use maki_types::input::{AgentInput, AgentMode, SessionInput};
+use maki_types::message::ImageSource;
+
+use maki_storage::id::MakiId;
+use maki_storage::sessions::{QueueReceipt, QueueStatus};
+use maki_wire::sanitize::sanitize_display;
+
+pub(crate) use maki_types::input::merge_inputs;
 
 use crate::components::input::Submission;
 use crate::components::queue_panel::QueueEntry;
@@ -20,7 +25,25 @@ use crate::theme;
 
 const COMPACT_LABEL: &str = "/compact";
 
-type Items = Arc<Mutex<VecDeque<QueueItem>>>;
+type Items = Arc<Mutex<QueueState>>;
+
+#[derive(Default)]
+struct QueueState {
+    unsent: VecDeque<QueueItem>,
+    hosted: Vec<HostedItem>,
+    rejected: BTreeMap<u64, QueueItem>,
+    cancellations: Vec<MakiId>,
+}
+
+struct HostedItem {
+    id: MakiId,
+    tag: Option<u64>,
+    item: QueueItem,
+    accepted: bool,
+    started: bool,
+    cancelled: bool,
+}
+
 /// What a message must agree on with its neighbours to share their turn.
 type BatchKey = (AgentMode, bool);
 
@@ -38,6 +61,7 @@ impl From<Submission> for QueuedMessage {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct QueuedInput {
     pub(crate) text: String,
     pub(crate) input: AgentInput,
@@ -49,31 +73,7 @@ pub(crate) struct QueuedInput {
     pub(crate) displayed: bool,
 }
 
-impl QueuedInput {
-    /// The set of messages this one may share a turn with, or `None` when it
-    /// has to run alone: the agent resolves one MCP prompt per run. `mode` is
-    /// a permission boundary and `workflow` picks the tool catalog, so a
-    /// message queued under either may not execute under another one.
-    ///
-    /// Destructured on purpose: a new `AgentInput` field then has to be
-    /// classified here instead of silently merging across.
-    fn batch_key(&self) -> Option<BatchKey> {
-        let AgentInput {
-            mode,
-            workflow,
-            prompt,
-            message: _,
-            images: _,
-            preamble: _,
-            earlier: _,
-            thinking: _,
-            fast: _,
-            source: _,
-        } = &self.input;
-        prompt.is_none().then(|| (mode.clone(), *workflow))
-    }
-}
-
+#[derive(Clone)]
 pub(crate) struct Compaction {
     pub(crate) run_id: u64,
     pub(crate) instructions: Option<String>,
@@ -91,6 +91,7 @@ impl Compaction {
     }
 }
 
+#[derive(Clone)]
 pub(crate) enum QueueItem {
     Message(QueuedInput),
     Compact(Compaction),
@@ -123,6 +124,13 @@ impl QueueRun {
 }
 
 impl QueueItem {
+    pub(crate) fn run_id(&self) -> u64 {
+        match self {
+            Self::Message(item) => item.run_id,
+            Self::Compact(item) => item.run_id,
+        }
+    }
+
     fn as_queue_entry(&self) -> QueueEntry<'static> {
         match self {
             Self::Message(queued) => QueueEntry {
@@ -139,9 +147,16 @@ impl QueueItem {
         }
     }
 
+    fn into_draft(self) -> (String, Vec<ImageSource>) {
+        match self {
+            Self::Message(queued) => (queued.text, queued.input.images),
+            Self::Compact(compact) => (compact.label().into_owned(), Vec::new()),
+        }
+    }
+
     fn batch_key(&self) -> Option<BatchKey> {
         match self {
-            Self::Message(queued) => queued.batch_key(),
+            Self::Message(queued) => queued.input.batch_key(),
             Self::Compact(_) => None,
         }
     }
@@ -174,7 +189,7 @@ pub(crate) struct QueueReceiver {
 
 pub(crate) fn queue() -> (QueueSender, QueueReceiver) {
     let (notify_tx, notify_rx) = flume::bounded(1);
-    let items: Items = Arc::new(Mutex::new(VecDeque::new()));
+    let items: Items = Arc::default();
     (
         QueueSender {
             items: Arc::clone(&items),
@@ -186,17 +201,40 @@ pub(crate) fn queue() -> (QueueSender, QueueReceiver) {
 
 impl QueueSender {
     pub(crate) fn push(&self, entry: QueueItem) {
-        lock(&self.items).push_back(entry);
+        lock(&self.items).unsent.push_back(entry);
         let _ = self.notify_tx.try_send(());
     }
 
     pub(crate) fn remove(&self, index: usize) -> Option<QueueItem> {
-        let mut items = lock(&self.items);
-        (index < items.len()).then(|| items.remove(index)).flatten()
+        let mut state = lock(&self.items);
+        let hosted: Vec<_> = state
+            .hosted
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| !item.started && !item.cancelled && item.item.visible_in_panel())
+            .map(|(pos, _)| pos)
+            .collect();
+        let item = if let Some(&pos) = hosted.get(index) {
+            let item = &mut state.hosted[pos];
+            item.cancelled = true;
+            let (id, item) = (item.id, item.item.clone());
+            state.cancellations.push(id);
+            Some(item)
+        } else {
+            state.unsent.remove(index.saturating_sub(hosted.len()))
+        };
+        let _ = self.notify_tx.try_send(());
+        item
     }
 
     pub(crate) fn len(&self) -> usize {
-        lock(&self.items).len()
+        let state = lock(&self.items);
+        state.unsent.len()
+            + state
+                .hosted
+                .iter()
+                .filter(|item| !item.started && !item.cancelled)
+                .count()
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -204,11 +242,51 @@ impl QueueSender {
     }
 
     pub(crate) fn clear(&self) {
-        lock(&self.items).clear();
+        let mut state = lock(&self.items);
+        state.unsent.clear();
+        state.rejected.clear();
+        let ids: Vec<_> = state
+            .hosted
+            .iter_mut()
+            .filter(|item| !item.started && !item.cancelled)
+            .map(|item| {
+                item.cancelled = true;
+                item.id
+            })
+            .collect();
+        state.cancellations.extend(ids);
+        let _ = self.notify_tx.try_send(());
+    }
+
+    pub(crate) fn take_messages(&self) -> Vec<(String, Vec<ImageSource>)> {
+        let mut state = lock(&self.items);
+        let rejected = std::mem::take(&mut state.rejected);
+        let mut pending: Vec<_> = state
+            .hosted
+            .extract_if(.., |item| !item.accepted)
+            .map(|item| (item.tag, item.item))
+            .chain(rejected.into_iter().map(|(tag, item)| (Some(tag), item)))
+            .collect();
+        pending.sort_by_key(|(tag, _)| *tag);
+        pending
+            .into_iter()
+            .map(|(_, item)| item)
+            .chain(std::mem::take(&mut state.unsent))
+            .map(QueueItem::into_draft)
+            .collect()
+    }
+
+    pub(crate) fn take_rejected(&self) -> Vec<(String, Vec<ImageSource>)> {
+        std::mem::take(&mut lock(&self.items).rejected)
+            .into_values()
+            .map(QueueItem::into_draft)
+            .collect()
     }
 
     pub(crate) fn text_messages(&self) -> Vec<String> {
-        lock(&self.items)
+        let state = lock(&self.items);
+        state
+            .unsent
             .iter()
             .filter(|item| item.visible_in_panel())
             .filter_map(|item| match item {
@@ -219,15 +297,17 @@ impl QueueSender {
     }
 
     pub(crate) fn panel_len(&self) -> usize {
-        lock(&self.items)
-            .iter()
-            .filter(|item| item.visible_in_panel())
-            .count()
+        self.panel_entries().len()
     }
 
     pub(crate) fn panel_entries(&self) -> Vec<QueueEntry<'static>> {
-        lock(&self.items)
+        let state = lock(&self.items);
+        state
+            .hosted
             .iter()
+            .filter(|item| !item.started && !item.cancelled)
+            .map(|item| &item.item)
+            .chain(state.unsent.iter())
             .filter(|item| item.visible_in_panel())
             .map(QueueItem::as_queue_entry)
             .collect()
@@ -238,29 +318,141 @@ impl QueueReceiver {
     /// Takes the next item plus every message queued right behind it that
     /// shares its batch key.
     pub(crate) fn pop_run(&self) -> Option<QueueRun> {
-        let mut items = lock(&self.items);
-        let first = match items.pop_front()? {
-            QueueItem::Compact(compaction) => return Some(QueueRun::Compact(compaction)),
-            QueueItem::Message(first) => first,
-        };
-        let key = first.batch_key();
-        let mut run = vec![first];
-        while key.is_some() && items.front().and_then(QueueItem::batch_key) == key {
-            let Some(QueueItem::Message(next)) = items.pop_front() else {
-                break;
-            };
-            run.push(next);
-        }
-        Some(QueueRun::Messages(run))
+        pop_run_from(&mut lock(&self.items).unsent)
     }
 
     /// Runs `publish` under the queue lock, so a drain event can never
     /// interleave with a concurrent push.
     pub(crate) fn publish_if_empty(&self, publish: impl FnOnce()) {
         let items = lock(&self.items);
-        if items.is_empty() {
+        if items.unsent.is_empty() && items.hosted.is_empty() {
             publish();
         }
+    }
+
+    pub(crate) fn submit(&self, tag: u64) -> Option<(MakiId, QueueItem)> {
+        let mut state = lock(&self.items);
+        let item = state.unsent.pop_front()?;
+        let id = MakiId::generate();
+        state.hosted.push(HostedItem {
+            id,
+            tag: Some(tag),
+            item: item.clone(),
+            accepted: false,
+            started: false,
+            cancelled: false,
+        });
+        Some((id, item))
+    }
+
+    pub(crate) fn reject(&self, tag: u64) {
+        lock(&self.items)
+            .hosted
+            .retain(|item| item.tag != Some(tag));
+    }
+
+    pub(crate) fn submit_if_live<T>(&self, id: MakiId, send: impl FnOnce() -> T) -> Option<T> {
+        let state = lock(&self.items);
+        state
+            .hosted
+            .iter()
+            .any(|item| item.id == id && !item.cancelled)
+            .then(send)
+    }
+
+    pub(crate) fn cancelled(&self, id: MakiId) -> bool {
+        lock(&self.items)
+            .hosted
+            .iter()
+            .any(|item| item.id == id && item.cancelled)
+    }
+
+    pub(crate) fn restore_hosted(&self, id: MakiId, input: SessionInput, run_id: u64) {
+        let mut state = lock(&self.items);
+        if state.hosted.iter().any(|item| item.id == id) {
+            return;
+        }
+        let item = match input {
+            SessionInput::Prompt(mut input) => {
+                input.message = sanitize_display(&input.message).into_owned();
+                QueueItem::Message(QueuedInput {
+                    text: input.message.clone(),
+                    input,
+                    run_id,
+                    displayed: false,
+                })
+            }
+            SessionInput::Compact(input) => QueueItem::Compact(Compaction {
+                run_id,
+                instructions: input
+                    .instructions
+                    .map(|text| sanitize_display(&text).into_owned()),
+                workflow: input.workflow,
+            }),
+        };
+        state.hosted.push(HostedItem {
+            id,
+            tag: None,
+            item,
+            accepted: true,
+            started: false,
+            cancelled: false,
+        });
+    }
+
+    pub(crate) fn acknowledge(&self, tag: u64, accepted: bool) -> Option<MakiId> {
+        let mut state = lock(&self.items);
+        let pos = state.hosted.iter().position(|item| item.tag == Some(tag))?;
+        let item = &mut state.hosted[pos];
+        item.accepted = accepted;
+        let id = item.id;
+        if !accepted {
+            let item = state.hosted.remove(pos);
+            if !item.cancelled {
+                state.rejected.insert(tag, item.item);
+            }
+        }
+        Some(id)
+    }
+
+    pub(crate) fn receipt(&self, receipt: &QueueReceipt) -> Option<(u64, Option<QueueItem>)> {
+        let mut state = lock(&self.items);
+        let pos = state.hosted.iter().position(|item| item.id == receipt.id)?;
+        let item = &mut state.hosted[pos];
+        item.accepted = true;
+        let run_id = item.item.run_id();
+        let started = matches!(
+            receipt.status,
+            QueueStatus::Running
+                | QueueStatus::Done
+                | QueueStatus::Error
+                | QueueStatus::Interrupted
+        );
+        let consumed = (started && !item.started).then(|| item.item.clone());
+        item.started |= started;
+        if !matches!(receipt.status, QueueStatus::Queued | QueueStatus::Running) {
+            state.hosted.remove(pos);
+        }
+        Some((run_id, consumed))
+    }
+
+    pub(crate) fn cancel_hosted(&self, min_run_id: u64) -> Vec<MakiId> {
+        let mut state = lock(&self.items);
+        let mut ids: Vec<_> = state
+            .hosted
+            .iter_mut()
+            .filter(|item| item.item.run_id() < min_run_id && !item.cancelled)
+            .map(|item| {
+                item.cancelled = true;
+                item.id
+            })
+            .collect();
+        ids.append(&mut state.cancellations);
+        ids
+    }
+
+    pub(crate) fn has_hosted(&self) -> bool {
+        !lock(&self.items).hosted.is_empty()
     }
 
     pub(crate) async fn recv_notify(&self) -> Result<(), flume::RecvError> {
@@ -268,28 +460,22 @@ impl QueueReceiver {
     }
 }
 
-impl InterruptSource for QueueReceiver {
-    fn poll(&self) -> Option<ExtractedCommand> {
-        Some(match self.pop_run()? {
-            QueueRun::Compact(compaction) => ExtractedCommand::Compact(compaction.instructions),
-            QueueRun::Messages(run) => {
-                ExtractedCommand::Interrupt(run.into_iter().map(|queued| queued.input).collect())
-            }
-        })
+/// Takes the next item plus every message queued right behind it that
+/// shares its batch key, from a queue the caller holds locked.
+fn pop_run_from(items: &mut VecDeque<QueueItem>) -> Option<QueueRun> {
+    let first = match items.pop_front()? {
+        QueueItem::Compact(compaction) => return Some(QueueRun::Compact(compaction)),
+        QueueItem::Message(first) => first,
+    };
+    let key = first.input.batch_key();
+    let mut run = vec![first];
+    while key.is_some() && items.front().and_then(QueueItem::batch_key) == key {
+        let Some(QueueItem::Message(next)) = items.pop_front() else {
+            break;
+        };
+        run.push(next);
     }
-}
-
-/// Folds a run of queued messages into one agent input. The last message
-/// drives the run and the earlier ones ride in front of it as their own user
-/// messages, so each keeps its images and the model answers the burst in one
-/// request. They stay messages rather than preamble, so `agent.user_message`
-/// gets to judge every one. The run shares one mode and one workflow by
-/// construction, so only the preferences (thinking, fast) come from the last
-/// message, the user's most recent intent.
-pub(crate) fn merge_inputs(mut inputs: Vec<AgentInput>) -> Option<AgentInput> {
-    let mut last = inputs.pop()?;
-    last.earlier = inputs.into_iter().map(EarlierInput::from).collect();
-    Some(last)
+    Some(QueueRun::Messages(run))
 }
 
 #[cfg(test)]
@@ -298,7 +484,8 @@ mod tests {
     use std::sync::Barrier;
     use std::thread;
 
-    use maki_agent::{ImageMediaType, InputSource, McpPromptRef};
+    use maki_types::input::{InputSource, McpPromptRef};
+    use maki_types::message::ImageMediaType;
 
     use super::*;
     use test_case::test_case;
@@ -308,8 +495,8 @@ mod tests {
     const THIRD: &str = "third";
     const PROMPT_NAME: &str = "server/review";
     const PLAN_PATH: &str = "plan.md";
-    const NOT_AN_INTERRUPT: &str = "expected an interrupt carrying the queued messages";
-    const GUIDANCE: &str = "keep the failing test names";
+    const FIRST_TAG: u64 = 1;
+    const SECOND_TAG: u64 = 2;
 
     fn input(message: &str) -> AgentInput {
         AgentInput {
@@ -383,6 +570,24 @@ mod tests {
         runs
     }
 
+    #[test]
+    fn rejected_messages_keep_submission_order_when_replies_arrive_reversed() {
+        let (tx, rx) = queue();
+        tx.push(message(FIRST));
+        tx.push(message(SECOND));
+        rx.submit(FIRST_TAG).unwrap();
+        rx.submit(SECOND_TAG).unwrap();
+        rx.acknowledge(SECOND_TAG, false);
+        rx.acknowledge(FIRST_TAG, false);
+        tx.push(message(THIRD));
+        let recovered: Vec<_> = tx
+            .take_messages()
+            .into_iter()
+            .map(|(text, _)| text)
+            .collect();
+        assert_eq!(recovered, [FIRST, SECOND, THIRD]);
+    }
+
     #[test_case(message(FIRST), true  ; "deferred_message_visible")]
     #[test_case(QueueItem::Message(QueuedInput { displayed: true, ..queued(FIRST, 0) }), false ; "displayed_message_hidden")]
     #[test_case(compact(None), true  ; "compact_visible")]
@@ -450,32 +655,6 @@ mod tests {
         let mut run = QueueRun::Messages(vec![queued(FIRST, 1), queued(SECOND, 2)]);
 
         assert_eq!(run.drop_cancelled(min_run_id), expected);
-    }
-
-    #[test]
-    fn poll_hands_the_whole_message_run_to_one_turn() {
-        let (tx, rx) = queue();
-        for text in [FIRST, SECOND, THIRD] {
-            tx.push(message(text));
-        }
-
-        let Some(ExtractedCommand::Interrupt(inputs)) = rx.poll() else {
-            panic!("{NOT_AN_INTERRUPT}");
-        };
-        let messages: Vec<_> = inputs.iter().map(|i| i.message.as_str()).collect();
-
-        assert_eq!(messages, [FIRST, SECOND, THIRD]);
-        assert!(rx.poll().is_none());
-    }
-
-    #[test]
-    fn poll_carries_compact_guidance() {
-        let (tx, rx) = queue();
-        tx.push(compact(Some(GUIDANCE)));
-
-        assert!(
-            matches!(rx.poll(), Some(ExtractedCommand::Compact(Some(extra))) if extra == GUIDANCE)
-        );
     }
 
     #[test_case(&[FIRST] ; "single_message_stays_alone")]

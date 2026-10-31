@@ -41,9 +41,9 @@ use crate::{
 use maki_config::{ModelPolicy, ToolOutputLines};
 use maki_storage::id::SessionRef;
 
-const MAX_REAUTH_ATTEMPTS: u32 = 2;
 /// One compaction is the whole remedy for an overflowing prompt, so a second
 /// overflow in a row means it did not help and retrying only burns a summary.
+const MAX_REAUTH_ATTEMPTS: u32 = 2;
 const MAX_OVERFLOW_RECOVERIES: u32 = 1;
 const NUDGE_PROMPT: &str = "You just executed tool calls but returned an empty response. Please process the tool results above and continue with the task.";
 /// A model that stalls once often stalls again on the retry, so it gets
@@ -120,6 +120,9 @@ pub struct AgentParams {
     pub config: AgentConfig,
     pub tool_output_lines: ToolOutputLines,
     pub permissions: Arc<PermissionManager>,
+    /// The session's working directory when the run starts, which its
+    /// tool calls carry in their `ToolContext`.
+    pub working_dir: Arc<Path>,
     pub session_id: Option<SessionRef>,
     /// The chat session a plugin runs this agent for in the background, `None`
     /// for anything the user watches. Its file writes are denied while the
@@ -182,6 +185,7 @@ pub struct Agent<'h> {
     reauth_attempts: u32,
     overflow_recoveries: u32,
     permissions: Arc<PermissionManager>,
+    working_dir: Arc<Path>,
     opts: RequestOptions,
     session_id: Option<SessionRef>,
     background_for: BackgroundFor,
@@ -211,6 +215,7 @@ impl<'h> Agent<'h> {
             config: params.config,
             tool_output_lines: params.tool_output_lines,
             permissions: params.permissions,
+            working_dir: params.working_dir,
             timeouts: params.timeouts,
             history: run.history,
             gauge: run.gauge,
@@ -269,9 +274,6 @@ impl<'h> Agent<'h> {
         self
     }
 
-    /// On an auth error, emits [`AgentEvent::AuthRequired`] and waits on the
-    /// user response channel for a re-login instead of failing the run. Only
-    /// a frontend that answers that event may set it, and subagents inherit it.
     pub fn with_reauth(mut self, reauth: bool) -> Self {
         self.reauth = reauth;
         self
@@ -814,7 +816,9 @@ impl<'h> Agent<'h> {
     }
 
     fn steer(&self, kind: SteerKind, text: String) -> Result<(), AgentError> {
-        self.event_tx.send(AgentEvent::Steered { kind, text })
+        self.event_tx
+            .send(AgentEvent::Steered { kind, text })
+            .map_err(AgentError::from)
     }
 
     /// True when a layer kept the run going, with its message now last in
@@ -925,29 +929,28 @@ impl<'h> Agent<'h> {
     }
 
     fn emit_turn_complete(&self, response: &StreamResponse) -> Result<(), AgentError> {
-        let cost = self.model.billed_cost(&response.usage, self.opts.fast);
+        let turn = TurnCompleteEvent {
+            message: response.message.clone(),
+            usage: response.usage,
+            model: self.model.id.clone(),
+            cost: self.model.billed_cost(&response.usage, self.opts.fast),
+            subsidised_list_cost: self
+                .model
+                .subsidised_list_cost(&response.usage, self.opts.fast),
+            subsidised_by: self.model.subsidised_by.clone(),
+            context_size: Some(self.gauge.size()),
+            context_window: self.model.context_window,
+        };
         // The ledger banks the un-subsidised list price for every model, not
         // just subsidised ones, so `Done.list_cost` is a real total on a
         // metered run instead of the auto-compaction turns alone. The two
         // agree on a subsidised model, which is why the event can narrow to
         // the reference figure the UI shows beside its `$0` bill.
-        self.ledger.add(
-            response.usage,
-            cost,
-            self.model.list_cost(&response.usage, self.opts.fast),
-        );
+        self.ledger
+            .bill(&turn, self.model.list_cost(&response.usage, self.opts.fast));
         self.event_tx
-            .send(AgentEvent::TurnComplete(Box::new(TurnCompleteEvent {
-                message: response.message.clone(),
-                usage: response.usage,
-                model: self.model.id.clone(),
-                cost,
-                subsidised_list_cost: self
-                    .model
-                    .subsidised_list_cost(&response.usage, self.opts.fast),
-                context_size: Some(self.gauge.size()),
-                context_window: self.model.context_window,
-            })))
+            .send(AgentEvent::TurnComplete(Box::new(turn)))
+            .map_err(AgentError::from)
     }
 
     fn emit_done(&self, reason: DoneReason) -> Result<(), AgentError> {
@@ -959,15 +962,17 @@ impl<'h> Agent<'h> {
             %reason,
             "agent run completed"
         );
-        self.event_tx.send(AgentEvent::Done {
-            usage: totals.usage,
-            cost: totals.cost,
-            list_cost: totals.list_cost,
-            context_size: self.gauge.size(),
-            context_window: self.model.context_window,
-            num_turns: self.num_turns,
-            reason,
-        })
+        self.event_tx
+            .send(AgentEvent::Done {
+                usage: totals.usage,
+                cost: totals.cost,
+                list_cost: totals.list_cost,
+                context_size: self.gauge.size(),
+                context_window: self.model.context_window,
+                num_turns: self.num_turns,
+                reason,
+            })
+            .map_err(AgentError::from)
     }
 
     /// The turn came back without text, so [`Message::empty_marker`] takes its
@@ -1035,6 +1040,7 @@ impl<'h> Agent<'h> {
             tool_output_lines: self.tool_output_lines,
             output_mode: ToolOutputMode::Compact,
             permissions: Arc::clone(&self.permissions),
+            working_dir: Arc::clone(&self.working_dir),
             timeouts: self.timeouts,
             file_access: Arc::clone(&self.file_access),
             prompt_slots: Arc::clone(&self.prompt_slots),
@@ -1046,6 +1052,7 @@ impl<'h> Agent<'h> {
             audience: self.audience,
             local_tools: Arc::clone(&self.local_tools),
             live_sink: None,
+            progress: None,
             model_policy: Arc::clone(&self.model_policy),
         }
     }
@@ -1070,6 +1077,7 @@ impl<'h> Agent<'h> {
         self.event_tx.send(AgentEvent::AutoCompacting {
             context_size: self.gauge.size(),
             context_window: self.model.context_window,
+            manual: false,
         })?;
         self.do_compact(steer).await
     }
@@ -1121,9 +1129,7 @@ impl<'h> Agent<'h> {
             context_size: context_size_before,
         };
         let Compacted {
-            usage: compaction_usage,
-            summary,
-            carried,
+            summary, carried, ..
         } = compaction::compact_history(
             &*compact_provider,
             &compact_model,
@@ -1134,16 +1140,9 @@ impl<'h> Agent<'h> {
             instructions,
             carry_len,
             self.timeouts.retry,
+            Some(&self.ledger),
         )
         .await?;
-        // The summariser can be a different model, so price this with
-        // `compact_model` and not `self.model`. `list_cost` gates `fast`
-        // against whichever one it gets, and is the un-subsidised price the
-        // ledger wants either way.
-        let compact_cost = compact_model.billed_cost(&compaction_usage, self.opts.fast);
-        let compact_list_cost = compact_model.list_cost(&compaction_usage, self.opts.fast);
-        self.ledger
-            .add(compaction_usage, compact_cost, compact_list_cost);
         let carry_from = self.history.len() - carried;
         self.rollback_len = carry_from;
         self.carry_from = carry_from;
@@ -1169,7 +1168,13 @@ impl<'h> Agent<'h> {
         let Some(ref source) = self.interrupt_source else {
             return Ok(false);
         };
-        let Some(cmd) = source.poll() else {
+        let polled = source.poll(&self.cancel, &self.mode).await;
+        // A source that waited may have been cut short by Esc, and going on
+        // would end the run on the last turn's stop reason.
+        if self.cancel.is_cancelled() {
+            return Err(AgentError::Cancelled);
+        }
+        let Some(cmd) = polled else {
             return Ok(false);
         };
         // True only when something new landed for the model. Going on without
@@ -1214,6 +1219,13 @@ impl<'h> Agent<'h> {
                 else {
                     return Ok(false);
                 };
+                // A host that draws compactions from events alone needs the
+                // start, and `manual` keeps it off the automatic line.
+                self.event_tx.send(AgentEvent::AutoCompacting {
+                    context_size: self.gauge.size(),
+                    context_window: self.model.context_window,
+                    manual: true,
+                })?;
                 self.do_compact(steer).await?;
                 Ok(true)
             }
@@ -1268,9 +1280,9 @@ mod tests {
 
     use super::compaction::FIELD_CONTINUE;
     use super::*;
-    use crate::agent::Transcript;
     use crate::agent::frame::RunContext;
     use crate::agent::hook::testing::{Seen, script};
+    use crate::agent::{Transcript, transcript_into_session};
     use crate::mcp::test_support::stub_session;
     use crate::mcp::tool_names;
     use crate::permissions::PermissionManager;
@@ -1279,8 +1291,8 @@ mod tests {
     use crate::template::Vars;
     use crate::tools::RequestTools;
     use crate::tools::{
-        DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, MovedCall, ParseError, Tool,
-        ToolExecResult, ToolInvocation, ToolRegistry, ToolSource,
+        DescriptionContext, ExecFuture, MovedCall, ParseError, Tool, ToolExecResult,
+        ToolInvocation, ToolRegistry,
     };
     use crate::{EarlierInput, Envelope, ToolOutput};
 
@@ -1313,8 +1325,14 @@ mod tests {
     }
 
     impl InterruptSource for MockInterruptSource {
-        fn poll(&self) -> Option<ExtractedCommand> {
-            self.commands.lock().unwrap().pop_front()
+        fn poll<'a>(
+            &'a self,
+            _: &'a CancelToken,
+            _: &'a AgentMode,
+        ) -> BoxFuture<'a, Option<ExtractedCommand>> {
+            Box::pin(std::future::ready(
+                self.commands.lock().unwrap().pop_front(),
+            ))
         }
     }
 
@@ -1513,6 +1531,7 @@ mod tests {
                     ProjectConfig::for_project(Path::new("/tmp")),
                     Arc::default(),
                 )),
+                working_dir: Arc::from(Path::new("/tmp")),
                 session_id: None,
                 background_for: BackgroundFor::None,
                 task_id: None,
@@ -2037,7 +2056,11 @@ mod tests {
     }
 
     impl InterruptSource for NotifyOnce {
-        fn poll(&self) -> Option<ExtractedCommand> {
+        fn poll<'a>(
+            &'a self,
+            _: &'a CancelToken,
+            _: &'a AgentMode,
+        ) -> BoxFuture<'a, Option<ExtractedCommand>> {
             if self.armed.swap(false, Ordering::Relaxed) {
                 SessionMailbox::notify(
                     self.session,
@@ -2047,7 +2070,7 @@ mod tests {
                 )
                 .unwrap();
             }
-            None
+            Box::pin(std::future::ready(None))
         }
     }
 
@@ -2406,12 +2429,16 @@ mod tests {
     }
 
     impl InterruptSource for ModelPicker {
-        fn poll(&self) -> Option<ExtractedCommand> {
+        fn poll<'a>(
+            &'a self,
+            _: &'a CancelToken,
+            _: &'a AgentMode,
+        ) -> BoxFuture<'a, Option<ExtractedCommand>> {
             self.slot.store(Arc::new(ModelSlot {
                 model: self.model.clone(),
                 provider: Arc::clone(&self.provider),
             }));
-            None
+            Box::pin(std::future::ready(None))
         }
     }
 
@@ -2839,15 +2866,16 @@ mod tests {
         ]
     }
 
-    /// Stored by `into_session` and opened the way every resume opens one.
+    /// Stored by `transcript_into_session` and opened the way every resume
+    /// opens one.
     fn imported(facts: Option<PromptFacts>, messages: Vec<Message>) -> History {
-        let mut session = Transcript {
+        let transcript = Transcript {
             facts,
             messages,
             ..Transcript::default()
-        }
-        .into_session(StoredSession::new("", HERE_CWD))
-        .unwrap();
+        };
+        let mut session =
+            transcript_into_session(transcript, StoredSession::new("", HERE_CWD)).unwrap();
         History::restored(session.drain_messages()).with_frame(session.frame().cloned())
     }
 
@@ -3859,6 +3887,64 @@ mod tests {
         )));
     }
 
+    const CALL_ID: &str = "t1";
+
+    /// Every call of a turn waits in the history, with the output and data
+    /// its `ToolDone` carried, for the writer that saves it, and is handed
+    /// over once.
+    #[test]
+    fn a_finished_call_waits_in_the_history_with_its_data() {
+        crate::test_block_on(async {
+            let mut history = History::new(Vec::new()).capturing_calls();
+            let (mut agent, event_rx) = make_agent(
+                MockProvider::new(vec![
+                    tool_call_response("glob", CALL_ID),
+                    text_response(StopReason::EndTurn),
+                ]),
+                &mut history,
+            );
+            let _ = agent.run(default_input()).await;
+            drop(agent);
+            let done = drain_events(&event_rx)
+                .into_iter()
+                .find_map(|e| match e.event {
+                    AgentEvent::ToolDone(done) => Some(done),
+                    _ => None,
+                })
+                .expect("the call finished");
+
+            let calls = history.take_calls();
+            let [(id, output, Some(data))] = calls.as_slice() else {
+                panic!("one call with data, got {}", calls.len());
+            };
+            assert_eq!(id, CALL_ID);
+            assert!(Arc::ptr_eq(output, &done.output));
+            assert!(Arc::ptr_eq(data, done.data.as_ref().unwrap()));
+            assert!(history.has_unsaved());
+            assert!(history.take_calls().is_empty());
+        });
+    }
+
+    /// Only the writer that saves the calls asks for them, so a TUI or Lua
+    /// session history keeps none.
+    #[test]
+    fn a_history_without_capture_collects_no_calls() {
+        crate::test_block_on(async {
+            let mut history = History::new(Vec::new());
+            let (mut agent, _event_rx) = make_agent(
+                MockProvider::new(vec![
+                    tool_call_response("glob", CALL_ID),
+                    text_response(StopReason::EndTurn),
+                ]),
+                &mut history,
+            );
+            let _ = agent.run(default_input()).await;
+            drop(agent);
+
+            assert!(history.take_calls().is_empty());
+        });
+    }
+
     #[test_case(
         vec![
             tool_call_response("glob", "t1"),
@@ -3959,8 +4045,8 @@ mod tests {
     struct MovingInvocation;
 
     impl ToolInvocation for MovingInvocation {
-        fn start_header(&self) -> HeaderFuture {
-            HeaderFuture::Ready(HeaderResult::plain(MOVING_TOOL.into()))
+        fn start_summary(&self) -> BoxFuture<'_, Option<String>> {
+            Box::pin(std::future::ready(Some(MOVING_TOOL.into())))
         }
         fn execute<'a>(self: Box<Self>, _ctx: &'a ToolContext) -> ExecFuture<'a> {
             Box::pin(async {
@@ -4005,12 +4091,7 @@ mod tests {
         let (mut agent, event_rx) = make_agent(MockProvider::new(responses), &mut history);
         let registry = ToolRegistry::new();
         registry
-            .register(
-                Arc::new(MovingTool),
-                ToolSource::Lua {
-                    plugin: MOVING_TOOL.into(),
-                },
-            )
+            .register(Arc::new(MovingTool), MOVING_TOOL.into())
             .unwrap();
         agent.registry = Arc::new(registry);
         let _ = agent.run(default_input()).await;
@@ -4427,7 +4508,11 @@ mod tests {
     }
 
     impl InterruptSource for InterruptWhenSpent {
-        fn poll(&self) -> Option<ExtractedCommand> {
+        fn poll<'a>(
+            &'a self,
+            _: &'a CancelToken,
+            _: &'a AgentMode,
+        ) -> BoxFuture<'a, Option<ExtractedCommand>> {
             let stops = self
                 .seen
                 .lock()
@@ -4435,9 +4520,10 @@ mod tests {
                 .iter()
                 .filter(|(slot, _)| *slot == AgentSlot::Stop)
                 .count();
-            (stops >= MAX_STOP_CONTINUATIONS as usize)
+            let cmd = (stops >= MAX_STOP_CONTINUATIONS as usize)
                 .then(|| self.cmd.lock().unwrap().take())
-                .flatten()
+                .flatten();
+            Box::pin(std::future::ready(cmd))
         }
     }
 

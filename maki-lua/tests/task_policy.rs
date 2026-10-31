@@ -8,15 +8,12 @@ use std::sync::Arc;
 use std::thread;
 
 use common::{
-    Chat, WAIT, call_ctx, done_text, exec, next_event, next_task_done, request_move, wait_live_buf,
-    wait_movable,
+    Chat, WAIT, call_ctx, done_text, exec, next_event, next_task_done, request_move, wait_movable,
+    wait_progress,
 };
 use maki_agent::tools::test_support::stub_ctx;
 use maki_agent::tools::{ToolContext, ToolRegistry};
-use maki_agent::{
-    AgentEvent, AgentMode, BufferSnapshot, CancelToken, Envelope, SharedBuf, ToolDoneEvent,
-    ToolOutput,
-};
+use maki_agent::{AgentEvent, AgentMode, CancelToken, Envelope, ToolDoneEvent, ToolOutput};
 use maki_lua::test_support::runtime;
 use maki_lua::{MoveOutcome, PluginHost};
 use serde_json::{Value, json};
@@ -56,7 +53,6 @@ const TASK_DEFAULT_MAX_CONCURRENT: u64 = 8;
 const FIRST_CALL_ID: &str = "toolu_first";
 const SECOND_CALL_ID: &str = "toolu_second";
 const MOVED_RECEIPT: &str = "Subagent parked";
-const WAITING_FOR_SLOT: &str = "waiting for a free subagent slot";
 /// Mirrors the task plugin's `FOREGROUND_NOTE` wording.
 const FOREGROUND_NOTE_HEAD: &str = "Could not start in the background (";
 const FOREGROUND_NOTE_TAIL: &str = "Ran in the foreground.";
@@ -768,10 +764,6 @@ impl ModelCall {
     }
 }
 
-fn buf_text(buf: &SharedBuf) -> String {
-    BufferSnapshot::from_arc(buf.read()).text()
-}
-
 fn reply_text(done: ToolDoneEvent) -> String {
     let text = done.output.as_text();
     assert!(!done.is_error, "task call failed: {text}");
@@ -783,8 +775,6 @@ fn a_moved_task_keeps_its_slot_and_the_next_task_waits_visibly() {
     let mut opts = serde_json::Map::new();
     opts.insert("max_concurrent".into(), json!(1));
     let (reg, host) = load_task_host_with_opts(opts);
-    host.ui_attachment().attach();
-    let ui = host.ui_action_rx();
     let chat = Chat::live();
     let (_run_trigger, run) = CancelToken::new();
 
@@ -797,12 +787,12 @@ fn a_moved_task_keeps_its_slot_and_the_next_task_waits_visibly() {
     );
     let mut showed_waiting_row = false;
     next_event(&first.events, |event| {
-        showed_waiting_row |= matches!(event, AgentEvent::LiveToolBuf { .. });
+        showed_waiting_row |= matches!(event, AgentEvent::ToolProgress(_));
         matches!(&event, AgentEvent::ToolMovable { movable: true, .. }).then_some(())
     });
     assert!(!showed_waiting_row, "a free slot needs no waiting row");
     assert_eq!(
-        request_move(&host.event_handle(), FIRST_CALL_ID),
+        request_move(&host.agent_handle(), FIRST_CALL_ID),
         MoveOutcome::Moved
     );
     let receipt = first.finish();
@@ -817,11 +807,10 @@ fn a_moved_task_keeps_its_slot_and_the_next_task_waits_visibly() {
         SECOND_CALL_ID,
         task_input(SCENARIO_PARKED_SECOND, None),
     );
-    let waiting = wait_live_buf(&second.events, SECOND_CALL_ID);
-    assert_eq!(buf_text(&waiting), WAITING_FOR_SLOT);
+    wait_progress(&second.events, SECOND_CALL_ID);
     wait(&reg, json!({ "acquires": 2 }));
     assert_eq!(
-        request_move(&host.event_handle(), SECOND_CALL_ID),
+        request_move(&host.agent_handle(), SECOND_CALL_ID),
         MoveOutcome::NoHook
     );
     assert!(second.result.is_empty());
@@ -830,21 +819,15 @@ fn a_moved_task_keeps_its_slot_and_the_next_task_waits_visibly() {
     wait(&reg, json!({ "parked": SCENARIO_PARKED }));
     release(&reg, SCENARIO_PARKED);
     assert_eq!(
-        done_text(&next_task_done(&ui)),
+        done_text(&next_task_done(&chat.events)),
         (PLAIN_TEXT.to_owned(), false)
     );
     assert_eq!(probe(&reg)["released"], json!(1));
 
     wait(&reg, json!({ "parked": SCENARIO_PARKED_SECOND }));
-    assert_eq!(buf_text(&waiting), "");
     wait_movable(&second.events, SECOND_CALL_ID);
     release(&reg, SCENARIO_PARKED_SECOND);
     let result = second.finish();
     assert!(!result.backgrounded);
     assert_eq!(reply_text(result), PLAIN_TEXT);
-    let final_body = next_event(&second.events, |event| match event {
-        AgentEvent::ToolSnapshot { snapshot, .. } => Some(snapshot.text()),
-        _ => None,
-    });
-    assert!(final_body.contains(PLAIN_TEXT), "{final_body}");
 }

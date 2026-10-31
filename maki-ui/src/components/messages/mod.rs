@@ -1,13 +1,16 @@
 mod render;
+mod route;
 mod scroll;
 mod segment;
 mod selection;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use self::route::{CallData, RenderPlace};
 pub use self::scroll::ScrollPos;
 
 use self::render::RenderCursor;
+use self::route::{RenderJob, RoutedCall, draws_from_data};
 use self::scroll::Layout;
 use self::segment::{Segment, SegmentCache};
 
@@ -15,7 +18,7 @@ use super::tool_display::{
     MOVABLE_HINT, RenderCtx, RoleStyle, ToolLines, append_annotation, append_right_info,
     assistant_style, build_instructions_lines, build_tool_lines, done_style, error_style,
     format_timestamp_now, hint_columns, instructions_search_text, notice_style, outcome_glyph,
-    search_text_for, thinking_style, truncate_to_header, user_style,
+    sanitize_lines, search_text_for, thinking_style, truncate_to_header, user_style,
 };
 use super::{
     BackgroundBadge, BackgroundOutcome, DisplayMessage, DisplayRole, IMAGE_PLACEHOLDER, ToolRole,
@@ -27,25 +30,29 @@ use crate::markdown::{hr_line, plain_lines, text_to_lines, truncate_output};
 use crate::render_worker::RenderWorker;
 use crate::selection::{DocPos, RowPos, Selection};
 use crate::splash::{ColorTransition, Splash};
-use crate::terminal_image;
-use crate::theme;
-use crate::update;
+use crate::{terminal_image, theme, update};
 use maki_config::{ClockFormat, ThinkingLines, ToolOutputLines, UiConfig};
 use ratatui_image::picker::Picker;
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::mem;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::scrollbar::{self, render_vertical_scrollbar};
 use super::streaming_content::StreamingContent;
 use super::thinking;
-use maki_agent::{
-    BufWatch, BufferSnapshot, EventSender, ImageSource, InstructionBlock, NO_FILES_FOUND,
-    SharedBuf, ToolDoneEvent, ToolOutput, ToolStartEvent,
-};
-use maki_lua::{EventHandle, LuaCommandInfo, WARM_TOOL_CAP, WinView};
+use crate::EventHandle;
+use maki_types::event::{ToolDoneEvent, ToolStartEvent};
+use maki_types::message::ImageSource;
+use maki_types::snapshot::BufferSnapshot;
+use maki_types::tool::{InstructionBlock, NO_FILES_FOUND, ToolOutput};
+struct SessionPlace {
+    cwd: std::path::PathBuf,
+    home: Option<std::path::PathBuf>,
+}
+use maki_lua_ui::{LuaCommandInfo, RenderReason, RenderRoute, WinView};
 use maki_storage::id::{MakiId, SessionRef};
 
 use ratatui::Frame;
@@ -54,7 +61,6 @@ use ratatui::layout::Rect;
 use crate::repaint::{Cadence, Dirty};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
-use tracing::warn;
 
 const REFLOW_MARGIN_VIEWPORTS: u32 = 1;
 /// How far outside the drawn range an image keeps its encoded protocol.
@@ -104,35 +110,35 @@ pub struct MessagesPanel {
     expanded_tools: HashMap<String, SectionFlags>,
     /// Per-tool log of post-completion click rows, replayed on restore.
     lua_clicks: HashMap<String, Vec<usize>>,
-    live_bufs: HashMap<String, BufWatch>,
-    /// Bufs of finished tools we keep polling so runtime-side warm
-    /// clicks stay visible. Purely local: every finished-tool click
-    /// carries a restore fallback, so we never track the runtime's
-    /// warm cache.
-    watched_bufs: VecDeque<(String, BufWatch)>,
     tool_output_lines: ToolOutputLines,
     lua_event_handle: EventHandle,
-    restore_event_tx: Option<EventSender>,
     thinking_lines: ThinkingLines,
     /// The reader's click on the live thinking, handed to its message by
     /// [`Self::flush_thinking`].
     live_thinking_expanded: bool,
     clock_format: ClockFormat,
-    /// One re-bake per tool per generation; `snapshot_theme_gen`
-    /// only bumps when colors actually land.
-    rebake_requested: HashMap<String, u64>,
     prompt_progress: Option<PromptProgress>,
     /// The chat this panel shows, stamped on every restore it requests so a
     /// plugin files the call where the live one went.
     session_id: Option<SessionRef>,
     task_id: Option<Arc<str>>,
+    /// Where the session runs, which a restore draws its paths against.
+    place: Option<SessionPlace>,
     /// Where the streaming segments start. `view` drops and rebuilds them
     /// every frame, so they always sit at the end of the cache.
     live_start: usize,
+    /// Each call's route, by tool use id, see [`route`]. A call without one
+    /// has no data and takes the legacy path.
+    routes: HashMap<String, RoutedCall>,
+    /// The renderer requests owed or in flight, by tool use id.
+    render_jobs: HashMap<String, RenderJob>,
+    /// The routing table generation the routes were last checked against.
+    routes_seen: u64,
 }
 
 impl MessagesPanel {
     pub fn new(ui_config: UiConfig, lua_event_handle: EventHandle) -> Self {
+        let routes_seen = lua_event_handle.ui.renderer_routes().generation();
         let thinking = thinking_style();
         let assistant = assistant_style();
         let ms = ui_config.typewriter_ms_per_char;
@@ -166,24 +172,20 @@ impl MessagesPanel {
             accent: ColorTransition::new(theme::current().mode_build),
             expanded_tools: HashMap::new(),
             lua_clicks: HashMap::new(),
-            live_bufs: HashMap::new(),
-            watched_bufs: VecDeque::new(),
             tool_output_lines: ui_config.tool_output_lines,
             lua_event_handle,
-            restore_event_tx: None,
             thinking_lines: ui_config.thinking_lines,
             live_thinking_expanded: false,
             clock_format: ui_config.clock_format,
-            rebake_requested: HashMap::new(),
             prompt_progress: None,
             session_id: None,
             task_id: None,
+            place: None,
             live_start: 0,
+            routes: HashMap::new(),
+            render_jobs: HashMap::new(),
+            routes_seen,
         }
-    }
-
-    pub fn set_restore_channel(&mut self, event_tx: Option<EventSender>) {
-        self.restore_event_tx = event_tx;
     }
 
     pub(crate) fn set_chat(&mut self, session_id: MakiId, task_id: Option<Arc<str>>) {
@@ -195,25 +197,22 @@ impl MessagesPanel {
         self.session_id.as_ref().map(SessionRef::id)
     }
 
-    fn stamp_chat(&self, item: &mut maki_lua::RestoreItem) {
-        item.session_id = self.session_id.clone();
-        item.task_id = self.task_id.clone();
+    /// Keeps {place} for the restores this panel asks for.
+    pub(crate) fn keep_place(&mut self, place: RenderPlace<'_>) {
+        let kept = self
+            .place
+            .as_ref()
+            .is_some_and(|kept| kept.cwd == place.cwd && kept.home.as_deref() == place.home);
+        if !kept {
+            self.place = Some(SessionPlace {
+                cwd: place.cwd.to_path_buf(),
+                home: place.home.map(Path::to_path_buf),
+            });
+        }
     }
 
     pub(crate) fn task_id(&self) -> Option<&Arc<str>> {
         self.task_id.as_ref()
-    }
-
-    pub(crate) fn request_restores(&self, items: Vec<maki_lua::RestoreItem>) {
-        let Some(tx) = &self.restore_event_tx else {
-            return;
-        };
-        let theme_gen = crate::theme::generation();
-        for mut item in items {
-            item.theme_gen = Some(theme_gen);
-            self.stamp_chat(&mut item);
-            self.lua_event_handle.request_restore(item, tx.clone());
-        }
     }
 
     /// Hands back the index of the message, which [`Self::replace`] needs to
@@ -240,9 +239,8 @@ impl MessagesPanel {
         self.cache.clear();
         self.expanded_tools.clear();
         self.lua_clicks.clear();
-        self.live_bufs.clear();
-        self.watched_bufs.clear();
-        self.rebake_requested.clear();
+        self.routes.clear();
+        self.render_jobs.clear();
         self.highlight_segment = None;
         self.live_thinking_expanded = false;
     }
@@ -254,6 +252,17 @@ impl MessagesPanel {
     pub fn text_delta(&mut self, text: &str) {
         self.flush_thinking();
         self.streaming_text.push(text);
+    }
+
+    /// Rows drawn from history were not run now, and history keeps no time,
+    /// so they show none, and their renderers draw them as loaded, as a
+    /// loaded session's rows do.
+    pub(crate) fn forget_times(&mut self) {
+        for msg in &mut self.messages {
+            msg.timestamp = None;
+        }
+        self.draw_owed_as_load();
+        self.cache.clear();
     }
 
     pub fn tool_pending(&mut self, id: String, name: &str) {
@@ -269,6 +278,7 @@ impl MessagesPanel {
     }
 
     pub fn tool_start(&mut self, event: ToolStartEvent) {
+        self.route_start(&event);
         if let Some(msg) = self.find_tool_msg_mut(&event.id) {
             if let DisplayRole::Tool(t) = &mut msg.role {
                 t.name = Arc::clone(&event.tool);
@@ -278,7 +288,6 @@ impl MessagesPanel {
             msg.tool_raw_input = event.raw_input.map(Arc::new);
             msg.tool_output = event.output.map(Arc::new);
             msg.annotation = event.annotation;
-            msg.render_header = event.render_header;
             self.rebuild_tool_segment(&event.id);
             return;
         }
@@ -295,7 +304,6 @@ impl MessagesPanel {
         msg.tool_raw_input = event.raw_input.map(Arc::new);
         msg.tool_output = event.output.map(Arc::new);
         msg.annotation = event.annotation;
-        msg.render_header = event.render_header;
         msg.timestamp = Some(format_timestamp_now(self.clock_format));
         self.messages.push(msg);
     }
@@ -319,7 +327,7 @@ impl MessagesPanel {
     }
 
     pub fn tool_done(&mut self, event: ToolDoneEvent) {
-        let had_live_buf = self.retire_live_buf(&event.id);
+        self.route_done(&event.id, event.data.as_ref());
         let Some(msg) = self
             .messages
             .iter_mut()
@@ -352,16 +360,6 @@ impl MessagesPanel {
             ToolOutput::Plain(text) | ToolOutput::Markdown(text) | ToolOutput::ReadDir(text)
                 if msg.render_snapshot.is_none() =>
             {
-                if had_live_buf && !event.backgrounded {
-                    // The plugin streamed a body buf but no snapshot ever
-                    // landed: this is the raw llm_output glitch users report.
-                    warn!(
-                        tool_id = %event.id,
-                        tool = %event.tool,
-                        is_error = event.is_error,
-                        "live buf had no snapshot at tool_done; falling back to llm_output"
-                    );
-                }
                 let tr = truncate_output(&text.text, self.tool_output_lines.get(&event.tool));
                 msg.truncated_lines = tr.skipped;
                 if !tr.kept.is_empty() {
@@ -380,7 +378,6 @@ impl MessagesPanel {
 
     /// Ends a row that no `ToolDone` will reach.
     pub fn settle_tool(&mut self, tool_id: &str, status: ToolStatus) {
-        self.retire_live_buf(tool_id);
         self.update_tool(tool_id, |msg| {
             if let DisplayRole::Tool(tool) = &mut msg.role {
                 tool.status = status;
@@ -421,16 +418,8 @@ impl MessagesPanel {
         self.find_tool_msg(tool_id).cloned()
     }
 
-    /// The buf a running tool streams into, live or still watched.
-    pub fn live_buf(&self, tool_id: &str) -> Option<Arc<SharedBuf>> {
-        self.live_bufs
-            .get(tool_id)
-            .or_else(|| {
-                self.watched_bufs
-                    .iter()
-                    .find_map(|(id, watch)| (id == tool_id).then_some(watch))
-            })
-            .map(|watch| Arc::clone(watch.buf()))
+    pub fn set_snapshot(&mut self, tool_id: &str, snapshot: BufferSnapshot) {
+        self.update_tool(tool_id, |msg| msg.render_snapshot = Some(snapshot));
     }
 
     pub fn update_tool_summary(&mut self, tool_id: &str, summary: &str) {
@@ -439,24 +428,6 @@ impl MessagesPanel {
 
     pub fn annotate_tool(&mut self, tool_id: &str, note: &str) {
         self.update_tool(tool_id, |msg| append_annotation(&mut msg.annotation, note));
-    }
-
-    pub fn tool_snapshot(
-        &mut self,
-        tool_id: &str,
-        snapshot: BufferSnapshot,
-        theme_gen: Option<u64>,
-    ) {
-        self.store_snapshot(tool_id, snapshot, false, theme_gen);
-    }
-
-    pub fn tool_header_snapshot(
-        &mut self,
-        tool_id: &str,
-        snapshot: BufferSnapshot,
-        theme_gen: Option<u64>,
-    ) {
-        self.store_snapshot(tool_id, snapshot, true, theme_gen);
     }
 
     /// A subagent stamps its own cumulative usage on the task header, and that
@@ -546,6 +517,8 @@ impl MessagesPanel {
                 is_error: true,
                 annotation: None,
                 written_path: None,
+                data: None,
+
                 backgrounded: false,
             });
         }
@@ -568,10 +541,7 @@ impl MessagesPanel {
             .collect();
 
         for id in &affected_ids {
-            // The stale-run_id filter drops these tools' ToolDone events,
-            // so retire their live bufs here: keeps them clickable via
-            // the warm path and stops them being polled forever.
-            self.retire_live_buf(id);
+            self.owe_draw(id, RenderReason::Live);
             self.rebuild_tool_segment(id);
         }
     }
@@ -636,13 +606,11 @@ impl MessagesPanel {
     }
 
     #[cfg(test)]
-    pub fn rebake_requested_gen(&self, tool_id: &str) -> Option<u64> {
-        self.rebake_requested.get(tool_id).copied()
-    }
-
-    #[cfg(test)]
     pub fn snapshot_gen_of(&self, tool_id: &str) -> Option<u64> {
-        self.current_snapshot_gen(tool_id)
+        self.messages
+            .iter()
+            .rfind(|msg| matches!(&msg.role, DisplayRole::Tool(role) if role.id == tool_id))
+            .map(|msg| msg.snapshot_theme_gen)
     }
 
     #[cfg(test)]
@@ -826,36 +794,10 @@ impl MessagesPanel {
             let buf_row = seg
                 .source_line_at(pos.row, width)
                 .map_or(0, |l| seg.buf_row(l));
-            if self.tool_in_progress(tool_id) {
-                self.lua_event_handle
-                    .request_click(tool_id.to_owned(), buf_row);
+            if self.route_of(tool_id) == RenderRoute::Renderer {
+                let tool_id = tool_id.to_owned();
+                self.click_rendered(&tool_id, buf_row);
                 return true;
-            }
-            // Recorded even when the warm path serves the click: theme
-            // rebake and session restore replay the full sequence.
-            self.lua_clicks
-                .entry(tool_id.to_owned())
-                .or_default()
-                .push(buf_row);
-            let item = self.lua_restore_item(tool_id).map(|mut item| {
-                item.clicks = self.lua_clicks[tool_id].clone();
-                item
-            });
-            let Some(tx) = self.restore_event_tx.clone() else {
-                return true;
-            };
-            let eh = &self.lua_event_handle;
-            // Watching the buf means a runtime-side warm click would be
-            // visible here, so try the fast path; the fallback item lets
-            // the runtime degrade to restore+replay if its cache is cold.
-            // Without the buf only a fresh restore can show the result.
-            match (self.watching(tool_id), item) {
-                (true, Some(item)) => {
-                    eh.request_click_with_fallback(tool_id.to_owned(), buf_row, item, tx);
-                }
-                (true, None) => eh.request_click(tool_id.to_owned(), buf_row),
-                (false, Some(item)) => eh.request_restore(item, tx),
-                (false, None) => {}
             }
             return true;
         }
@@ -901,12 +843,11 @@ impl MessagesPanel {
         msg.tool_output.as_deref()?.owned_instructions()
     }
 
-    /// Drains the highlight worker, every live tool buffer and the finished
-    /// image decodes. These used to run inside [`Self::view`], which is why a
+    /// Drains the highlight worker, renderer replies and image decodes. These used to run inside [`Self::view`], which is why a
     /// running tool had to claim it was animating: it was the only way to keep
     /// them fed.
     pub fn tick(&mut self) -> Dirty {
-        let mut dirty = self.drain_highlights() | self.poll_live_bufs() | self.refresh_images();
+        let mut dirty = self.drain_highlights() | self.poll_renders() | self.refresh_images();
         if self.show_idle_splash() {
             dirty |= self.idle_splash.poll_update(update::latest_version());
         }
@@ -1214,46 +1155,6 @@ impl MessagesPanel {
         selection::extract_selection_text(&self.cache, self.viewport_width, sel, msg_area)
     }
 
-    fn tool_in_progress(&self, tool_id: &str) -> bool {
-        self.messages
-            .iter()
-            .rev()
-            .find_map(|m| match &m.role {
-                DisplayRole::Tool(t) if t.id == tool_id => Some(t.status),
-                _ => None,
-            })
-            .is_some_and(|s| s == ToolStatus::InProgress)
-    }
-
-    fn watching(&self, tool_id: &str) -> bool {
-        self.watched_bufs.iter().any(|(id, _)| id == tool_id)
-    }
-
-    fn stop_watching(&mut self, tool_id: &str) {
-        self.watched_bufs.retain(|(id, _)| id != tool_id);
-    }
-
-    /// Moves a finished tool's live buf to the watched set, flushing any
-    /// last dirty lines. Called on completion and on cancellation, so
-    /// `live_bufs` never leaks entries that outlive their tool, and the capped
-    /// watched set keeps what `tick` polls bounded.
-    /// Returns whether a live buf existed for this id.
-    fn retire_live_buf(&mut self, id: &str) -> bool {
-        let Some(mut watch) = self.live_bufs.remove(id) else {
-            return false;
-        };
-        if let Some(snapshot) = watch.changed() {
-            self.store_snapshot(id, snapshot, false, None);
-        }
-        // A part's tab registers the same buf again on every report.
-        self.watched_bufs.retain(|(watched, _)| watched != id);
-        self.watched_bufs.push_back((id.to_owned(), watch));
-        if self.watched_bufs.len() > WARM_TOOL_CAP {
-            self.watched_bufs.pop_front();
-        }
-        true
-    }
-
     fn has_snapshot(&self, tool_id: &str) -> bool {
         self.messages
             .iter()
@@ -1261,111 +1162,22 @@ impl MessagesPanel {
             .is_some_and(|m| m.render_snapshot.is_some())
     }
 
-    fn lua_restore_item(&self, tool_id: &str) -> Option<maki_lua::RestoreItem> {
-        let msg = self
+    /// Draw renderer snapshots again when the theme changes.
+    fn rebake_stale_snapshots(&mut self, current_gen: u64) {
+        let rendered: Vec<_> = self
             .messages
             .iter()
-            .rfind(|m| matches!(&m.role, DisplayRole::Tool(t) if t.id == tool_id))?;
-        self.restore_item_for(msg, self.theme_generation)
-    }
-
-    fn restore_item_for(
-        &self,
-        msg: &DisplayMessage,
-        theme_gen: u64,
-    ) -> Option<maki_lua::RestoreItem> {
-        let mut item = crate::chat::restore_item_for(msg, self.tool_output_lines, theme_gen)?;
-        self.stamp_chat(&mut item);
-        Some(item)
-    }
-
-    /// Re-restores every snapshot still painted with old-theme colors.
-    /// Replies carry a generation so stale ones can't overwrite fresher colors.
-    fn rebake_stale_snapshots(&mut self, current_gen: u64) {
-        let Some(tx) = self.restore_event_tx.clone() else {
-            return;
-        };
-        let eh = &self.lua_event_handle;
-        self.rebake_requested.retain(|_, g| *g >= current_gen);
-        let mut requested = Vec::new();
-        for msg in &self.messages {
-            let DisplayRole::Tool(role) = &msg.role else {
-                continue;
-            };
-            if !self.should_request_rebake(
-                &role.id,
-                msg.snapshot_is_stale(current_gen),
-                current_gen,
-            ) {
-                continue;
-            }
-            if let Some(mut item) = self.restore_item_for(msg, current_gen) {
-                item.clicks = self.lua_clicks.get(&role.id).cloned().unwrap_or_default();
-                eh.request_restore(item, tx.clone());
-                requested.push(role.id.clone());
-            }
-        }
-        for id in requested {
-            // The watched buf still carries old-theme lines; clicks in
-            // the rebake window must go through restore, not warm.
-            self.stop_watching(&id);
-            self.rebake_requested.insert(id, current_gen);
-        }
-    }
-
-    fn should_request_rebake(&self, tool_id: &str, stale: bool, current_gen: u64) -> bool {
-        stale && self.rebake_requested.get(tool_id) != Some(&current_gen)
-    }
-
-    /// Live snapshots (`None`) get the panel's current generation.
-    /// Re-bake replies are monotonic: drop if something newer landed.
-    fn resolve_snapshot_gen(&self, tool_id: &str, incoming: Option<u64>) -> Option<u64> {
-        let Some(incoming_gen) = incoming else {
-            return Some(self.theme_generation);
-        };
-        match self.current_snapshot_gen(tool_id) {
-            Some(applied) if applied > incoming_gen => None,
-            _ => Some(incoming_gen),
-        }
-    }
-
-    fn current_snapshot_gen(&self, tool_id: &str) -> Option<u64> {
-        self.messages
-            .iter()
-            .rfind(|m| matches!(&m.role, DisplayRole::Tool(t) if t.id == tool_id))
-            .map(|m| m.snapshot_theme_gen)
-    }
-
-    fn store_snapshot(
-        &mut self,
-        tool_id: &str,
-        snapshot: BufferSnapshot,
-        is_header: bool,
-        theme_gen: Option<u64>,
-    ) {
-        if theme_gen.is_some() {
-            // A generation only comes with restore replies. The restore
-            // superseded the old live view (and evicted the runtime's
-            // warm handle), so its buf must not overwrite this snapshot.
-            self.stop_watching(tool_id);
-        }
-        let Some(applied_gen) = self.resolve_snapshot_gen(tool_id, theme_gen) else {
-            return;
-        };
-        if let Some(msg) = self.find_tool_msg_mut(tool_id) {
-            if is_header {
-                msg.text = snapshot.first_line_text();
-                msg.render_header = Some(snapshot);
-            } else {
-                msg.render_snapshot = Some(snapshot);
-            }
-            msg.snapshot_theme_gen = applied_gen;
-            self.rebuild_tool_segment(tool_id);
-        } else {
-            warn!(
-                tool_id,
-                is_header, "snapshot dropped: no tool message with this id"
-            );
+            .filter_map(|msg| {
+                let DisplayRole::Tool(role) = &msg.role else {
+                    return None;
+                };
+                (self.route_of(&role.id) == RenderRoute::Renderer
+                    && msg.snapshot_is_stale(current_gen))
+                .then(|| role.id.clone())
+            })
+            .collect();
+        for id in rendered {
+            self.owe_draw(&id, RenderReason::Rerender);
         }
     }
 
@@ -1389,47 +1201,21 @@ impl MessagesPanel {
         }
     }
 
-    pub fn register_live_buf(&mut self, id: String, body: Arc<SharedBuf>) {
-        let mut watch = BufWatch::new(body);
-        if self.find_tool_msg(&id).is_some()
-            && let Some(snapshot) = watch.changed()
-        {
-            self.store_snapshot(&id, snapshot, false, None);
-        }
-        self.live_bufs.insert(id, watch);
-    }
-
-    /// Snapshots are baked at the last width `view` saw, and a resize
-    /// invalidates every segment anyway (see `width_changed` in `view`), so
-    /// polling ahead of the frame that reflows them is safe.
-    fn poll_live_bufs(&mut self) -> Dirty {
-        let updated: Vec<_> = self
-            .live_bufs
-            .iter_mut()
-            .chain(
-                self.watched_bufs
-                    .iter_mut()
-                    .map(|(id, watch)| (&*id, watch)),
-            )
-            .filter_map(|(id, watch)| watch.changed().map(|snapshot| (id.clone(), snapshot)))
-            .collect();
-        let dirty = Dirty::from(!updated.is_empty());
-        for (tool_id, snapshot) in updated {
-            self.store_snapshot(&tool_id, snapshot, false, None);
-        }
-        dirty
-    }
-
+    /// {from_data} rows show what the call's data holds, which a remote agent
+    /// sends raw, so their text is sanitized here, where it is laid out.
     fn build_tool_segment_lines(
         msg: &DisplayMessage,
         status: ToolStatus,
         rctx: &RenderCtx,
         exp: SectionFlags,
+        from_data: bool,
     ) -> ToolLines {
         let mut tl = build_tool_lines(msg, status, rctx, exp);
+        if from_data {
+            sanitize_lines(&mut tl.lines);
+        }
         if let Some(header) = tl.lines.first_mut() {
-            let running = status == ToolStatus::InProgress;
-            let hint = (msg.movable && running).then_some(MOVABLE_HINT);
+            let hint = (msg.movable && status == ToolStatus::InProgress).then_some(MOVABLE_HINT);
             let usage = msg
                 .turn_usage
                 .as_deref()
@@ -1518,13 +1304,20 @@ impl MessagesPanel {
 
     fn drain_highlights(&mut self) -> Dirty {
         let mut dirty = Dirty::NO;
-        while let Some(result) = self.hl_worker.try_recv() {
+        while let Some(mut result) = self.hl_worker.try_recv() {
             if let Some(seg) = self
                 .cache
                 .segments_mut()
                 .iter_mut()
                 .find(|s| s.matches_pending_highlight(result.id))
             {
+                if seg
+                    .tool_id
+                    .as_deref()
+                    .is_some_and(|id| draws_from_data(&self.routes, id))
+                {
+                    sanitize_lines(&mut result.lines);
+                }
                 seg.apply_highlight_result(result.lines);
                 dirty = Dirty::YES;
             }
@@ -1554,7 +1347,8 @@ impl MessagesPanel {
             .copied()
             .unwrap_or_default();
         let rctx = self.rctx();
-        let tl = Self::build_tool_segment_lines(msg, status, &rctx, exp);
+        let from_data = self.routed_away(tool_id);
+        let tl = Self::build_tool_segment_lines(msg, status, &rctx, exp, from_data);
 
         let instructions = msg
             .tool_output
@@ -1580,7 +1374,8 @@ impl MessagesPanel {
             if let DisplayRole::Tool(t) = &msg.role {
                 let exp = self.expanded_tools.get(&t.id).copied().unwrap_or_default();
                 let status = t.status;
-                let tl = Self::build_tool_segment_lines(msg, status, &self.rctx(), exp);
+                let from_data = self.routed_away(&t.id);
+                let tl = Self::build_tool_segment_lines(msg, status, &self.rctx(), exp, from_data);
                 let id = t.id.clone();
                 self.cache.push_spacer_if_needed();
                 let mut seg = Segment::with_tool(id.clone());

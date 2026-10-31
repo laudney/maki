@@ -50,6 +50,39 @@ function M.project_id(path)
   return base .. "-" .. M.fnv1a_64(path)
 end
 
+function M.memories_path_suffix()
+  local cwd = maki.uv.cwd()
+  local root = maki.fs.root(cwd, ".git") or cwd
+  return "projects/" .. M.project_id(root) .. "/memories"
+end
+
+function M.legacy_dir_if_exists(suffix): string?
+  local legacy = maki.env.legacy_dir()
+  if not legacy then
+    return nil
+  end
+  local dir = maki.fs.joinpath(legacy, suffix)
+  local meta = maki.fs.metadata(dir)
+  if meta and meta.is_dir then
+    return dir
+  end
+end
+
+function M.resolve_dir(check_legacy)
+  local suffix = M.memories_path_suffix()
+  if check_legacy then
+    local dir = M.legacy_dir_if_exists(suffix)
+    if dir then
+      return dir
+    end
+  end
+  local state = maki.env.state_dir()
+  if not state then
+    return nil, "cannot resolve state dir"
+  end
+  return maki.fs.joinpath(state, suffix)
+end
+
 function M.safe_resolve(memories_dir, relative: string?)
   if not relative or relative == "" then
     return nil, "path is required"

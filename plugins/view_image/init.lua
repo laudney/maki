@@ -133,10 +133,8 @@ maki.api.register_tool({
     },
   },
 
-  header = function(input)
-    local buf = maki.ui.buf()
-    buf:line({ { shorten_path(input.path or ""), "path" } })
-    return buf
+  summary = function(input)
+    return shorten_path(input.path or "")
   end,
 
   handler = function(input, _ctx)

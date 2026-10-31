@@ -1,4 +1,6 @@
-use maki_lua::docs_render;
+use maki_lua::{bundled, docs_render};
+
+use crate::lua_util::api_docs;
 
 const FRONTMATTER: &str = r#"+++
 title = "Lua API"
@@ -10,5 +12,8 @@ group = "Reference"
 "#;
 
 pub fn generate() -> String {
-    format!("{FRONTMATTER}{}", docs_render::site_page())
+    format!(
+        "{FRONTMATTER}{}",
+        docs_render::site_page(bundled(), &api_docs())
+    )
 }

@@ -162,7 +162,7 @@ mod tests {
     use base64::{Engine, engine::general_purpose::STANDARD};
     use color_eyre::eyre::Result;
     use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
-    use maki_providers::{ImageMediaType, ImageSource};
+    use maki_types::message::{ImageMediaType, ImageSource};
     use ratatui::{Terminal, backend::TestBackend, layout::Rect};
     use ratatui_image::{
         FontSize,

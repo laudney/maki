@@ -7,14 +7,14 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
 use common::{
-    Chat, WAIT, call_ctx, done_text, exec, next_task_done, request_move, wait_live_buf,
-    wait_movable,
+    Chat, WAIT, call_ctx, done_text, exec, next_task_done, request_move, wait_movable,
+    wait_progress,
 };
 use maki_agent::cancel::{CancelToken, CancelTrigger};
 use maki_agent::tools::test_support::stub_ctx;
 use maki_agent::tools::{ToolContext, ToolRegistry};
 use maki_agent::{AgentMode, Envelope, SessionMailbox, ToolDoneEvent};
-use maki_lua::{MoveOutcome, PluginHost, UiAction};
+use maki_lua::{MoveOutcome, PluginHost};
 use maki_storage::id::MakiId;
 use serde_json::{Value, json};
 use test_case::test_case;
@@ -105,12 +105,10 @@ tool("release", function(input)
 end)
 
 tool("movable", function(input, ctx)
-  local buf = maki.ui.buf()
-  buf:on("click", function() release("movable") end)
-  ctx:live_buf(buf)
+  ctx:set_state({running=true})
   ctx:on_background(function()
     if input.park_hook then
-      ctx:live_buf(maki.ui.buf())
+      ctx:set_state({running=true})
       park("hook")
     end
     if input.decline then
@@ -121,12 +119,13 @@ tool("movable", function(input, ctx)
   if input.deadline then
     ctx:set_deadline(input.deadline, { expire = "background" })
   end
-  park("movable")
+  park(input.name or "movable")
+  ctx:set_parts({ { id = "1", name = "completed piece", tool = "movable", status = "done" } })
   return input.final .. ":" .. tostring(ctx:cancelled())
 end)
 
 tool("plain", function(_, ctx)
-  ctx:live_buf(maki.ui.buf())
+  ctx:set_state({running=true})
   park("plain")
   return "plain done"
 end)
@@ -152,16 +151,20 @@ tool("inner", function(input, ctx)
 end)
 
 tool("child", function(_, ctx)
-  ctx:live_buf(maki.ui.buf())
+  ctx:set_state({running=true})
   park("child")
   return "child done"
 end)
 
 -- Movable only once its child runs, so a move finds the child in flight.
 tool("nesting", function(_, ctx)
+  local hooked = false
   local out, err = maki.agent.call_tool(ctx, "child", { name = "child" }, {
-    on_live_buf = function()
-      ctx:on_background(function() return "nesting moved" end)
+    on_progress = function()
+      if not hooked then
+        hooked = true
+        ctx:on_background(function() return "nesting moved" end)
+      end
     end,
   })
   return out or ("child failed: " .. tostring(err))
@@ -199,7 +202,6 @@ end)
 struct Host {
     reg: Arc<ToolRegistry>,
     host: PluginHost,
-    ui: flume::Receiver<UiAction>,
 }
 
 impl Host {
@@ -207,13 +209,11 @@ impl Host {
         let reg = Arc::new(ToolRegistry::new());
         let host = PluginHost::new(Arc::clone(&reg)).unwrap();
         host.load_source(PLUGIN, SRC).unwrap();
-        host.ui_attachment().attach();
-        let ui = host.ui_action_rx();
-        Self { reg, host, ui }
+        Self { reg, host }
     }
 
     fn request(&self) -> MoveOutcome {
-        request_move(&self.host.event_handle(), CALL_ID)
+        request_move(&self.host.agent_handle(), CALL_ID)
     }
 
     fn release(&self, name: &str) {
@@ -227,8 +227,8 @@ impl Host {
     }
 
     /// The final reply of a moved call, as its task tab gets it.
-    fn task_done(&self) -> ToolDoneEvent {
-        next_task_done(&self.ui)
+    fn task_done(&self, chat: &Chat) -> ToolDoneEvent {
+        next_task_done(&chat.events)
     }
 }
 
@@ -279,8 +279,8 @@ impl Running {
         wait_movable(&self.events, &self.id);
     }
 
-    fn wait_live_buf(&self) {
-        wait_live_buf(&self.events, &self.id);
+    fn wait_progress(&self) {
+        wait_progress(&self.events, &self.id);
     }
 
     /// Ends the run once the call answered, the way a turn ends on its last
@@ -318,8 +318,19 @@ fn a_receipt_answers_the_dispatcher_and_the_final_reply_reaches_the_chat_once() 
     assert!(receipt.contains(CALL_ID), "{receipt}");
 
     host.release(MOVABLE);
+    let (id, parts) = loop {
+        match common::next_task_event(&chat.events).event {
+            maki_agent::AgentEvent::ToolParts { id, parts } => break (id, parts),
+            maki_agent::AgentEvent::ToolDone(_) => {
+                panic!("the moved call must report its parts before finishing")
+            }
+            _ => {}
+        }
+    };
+    assert_eq!(id, CALL_ID);
+    assert_eq!(parts[0].name, "completed piece");
     assert_eq!(
-        done_text(&host.task_done()),
+        done_text(&host.task_done(&chat)),
         (FINAL_REPLY.to_owned(), false)
     );
     assert_eq!(chat.mailbox.drain().len(), 1);
@@ -338,23 +349,7 @@ fn a_second_request_finds_the_call_already_moved() {
 
     assert!(running.result().backgrounded);
     host.release(MOVABLE);
-    host.task_done();
-}
-
-#[test]
-fn clicks_still_reach_a_moved_call() {
-    let host = Host::new();
-    let chat = Chat::live();
-    assert!(moved(&host, &chat).result().backgrounded);
-
-    host.host
-        .event_handle()
-        .request_click(CALL_ID.to_owned(), 0);
-
-    assert_eq!(
-        done_text(&host.task_done()),
-        (FINAL_REPLY.to_owned(), false)
-    );
+    host.task_done(&chat);
 }
 
 #[test_case(Some(DECLINE_REASON), DECLINE_REASON ; "with_a_reason")]
@@ -384,7 +379,7 @@ fn a_call_without_a_hook_has_nothing_to_move() {
     let host = Host::new();
     let chat = Chat::live();
     let running = Running::start(&host, chat.id, PLAIN, json!({}));
-    running.wait_live_buf();
+    running.wait_progress();
 
     assert_eq!(host.request(), MoveOutcome::NoHook);
 
@@ -430,7 +425,7 @@ fn a_nested_call_outlives_its_deadlines_once_the_scope_moved() {
     host.release(OUTER);
 
     assert_eq!(
-        done_text(&host.task_done()),
+        done_text(&host.task_done(&chat)),
         (INNER_REPLY.to_owned(), false)
     );
 }
@@ -460,7 +455,7 @@ fn a_reload_passes_a_moved_call_with_a_parked_nested_child() {
 
     host.release(CHILD);
     assert_eq!(
-        done_text(&host.task_done()),
+        done_text(&host.task_done(&chat)),
         (CHILD_REPLY.to_owned(), false)
     );
 }
@@ -481,7 +476,7 @@ fn a_background_deadline_moves_the_call_with_a_live_chat() {
 
     host.release(MOVABLE);
     assert_eq!(
-        done_text(&host.task_done()),
+        done_text(&host.task_done(&chat)),
         (FINAL_REPLY.to_owned(), false)
     );
 }
@@ -511,7 +506,7 @@ fn a_moved_calls_receipt_is_unsettled_until_its_notice_is_drained() {
     assert_eq!(chat.mailbox.unsettled(), [CALL_ID]);
 
     host.release(MOVABLE);
-    host.task_done();
+    host.task_done(&chat);
 
     assert_eq!(chat.mailbox.unsettled(), [CALL_ID]);
     assert_eq!(chat.mailbox.claim_wake().len(), 1);
@@ -534,7 +529,7 @@ fn the_user_moves_a_subagents_call_and_it_reports_to_the_subagent() {
 
     host.release(MOVABLE);
     assert_eq!(
-        done_text(&host.task_done()),
+        done_text(&host.task_done(&chat)),
         (FINAL_REPLY.to_owned(), false)
     );
     assert_eq!(subagent.claim_wake().len(), 1);
@@ -578,7 +573,10 @@ fn a_moved_calls_receipt_and_final_reply_pass_the_output_layers() {
 
     host.release(MOVABLE);
 
-    assert_eq!(done_text(&host.task_done()), (REDACTED.to_owned(), false));
+    assert_eq!(
+        done_text(&host.task_done(&chat)),
+        (REDACTED.to_owned(), false)
+    );
     let notices = chat.mailbox.drain();
     let notice = notices
         .first()
@@ -642,9 +640,9 @@ fn an_esc_while_the_hook_is_parked_ends_the_call_quietly() {
     running.wait_movable();
     let outcome = host
         .host
-        .event_handle()
+        .agent_handle()
         .request_background(CALL_ID.to_owned());
-    running.wait_live_buf();
+    running.wait_progress();
 
     running.run.cancel();
     host.release(HOOK);
@@ -666,10 +664,12 @@ fn a_call_over_the_task_cap_stays_in_the_foreground() {
     let chat = Chat::live();
     for n in 0..TASK_CAP {
         let id = format!("{CALL_ID}_{n}");
-        let running = Running::start_as(&host, chat.id, &id, MOVABLE, movable_input(), |_| {});
+        let mut input = movable_input();
+        input["name"] = json!(id);
+        let running = Running::start_as(&host, chat.id, &id, MOVABLE, input, |_| {});
         running.wait_movable();
         assert_eq!(
-            request_move(&host.host.event_handle(), &id),
+            request_move(&host.host.agent_handle(), &id),
             MoveOutcome::Moved
         );
         assert!(running.result().backgrounded);

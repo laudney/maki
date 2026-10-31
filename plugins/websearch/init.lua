@@ -8,7 +8,6 @@ local providers = require("providers")
 local searxng = require("searxng")
 local NOT_AN_OBJECT_MSG = require("constants").NOT_AN_OBJECT_MSG
 local truncate = require("maki.truncate")
-local ToolView = require("maki.tool_view")
 local output_limits = require("maki.output_limits")
 
 local opts = maki.api.register_options(output_limits.extend({
@@ -54,11 +53,6 @@ end
 local function api_key()
   local key = trim(maki.uv.os_getenv(provider.env))
   return key ~= "" and key or nil
-end
-
-local function web_view_opts(ctx)
-  local tol = ctx:tool_output_lines()
-  return { max_lines = (tol and tol.web) or 3, keep = "head" }
 end
 
 -- Request gate: a failed request or a non-2xx answer becomes an error
@@ -182,13 +176,10 @@ maki.api.register_tool({
   -- research/general included so subagents keep web search now that the
   -- interpreter only exposes tools the host audience could see itself.
   audiences = { "main", "research_sub", "general_sub", "interpreter" },
+  -- The state keeps the whole result text when the model gets it cut.
 
-  header = function(input)
+  summary = function(input)
     return input.query
-  end,
-
-  restore = function(_input, output, _is_error, ctx)
-    return ToolView.restore(output, web_view_opts(ctx))
   end,
 
   handler = function(input, ctx)
@@ -210,9 +201,11 @@ maki.api.register_tool({
     end
 
     local max_lines, max_bytes = output_limits.resolve(opts, ctx)
+    local model_text = truncate(text, max_lines, max_bytes)
+    local kept = model_text ~= text and #text <= output_limits.STATE_TEXT_MAX_BYTES
     return {
-      llm_output = truncate(text, max_lines, max_bytes),
-      body = ToolView.restore(text, web_view_opts(ctx)),
+      llm_output = model_text,
+      state = kept and { text = text } or nil,
     }
   end,
 })

@@ -1,0 +1,35 @@
+[package]
+name = "maki-host"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde_json = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+libc = { workspace = true }
+clap = { workspace = true }
+color-eyre = { workspace = true }
+maki-acp = { workspace = true }
+maki-agent = { workspace = true }
+maki-types = { workspace = true }
+maki-config = { workspace = true }
+maki-lua = { workspace = true }
+maki-otel = { workspace = true }
+maki-providers = { workspace = true }
+maki-storage = { workspace = true }
+maki-wire = { workspace = true }
+open = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+maki-providers = { workspace = true, features = ["test-support"] }
+tempfile = { workspace = true }
+test-case = { workspace = true }
+
+[lints]
+workspace = true

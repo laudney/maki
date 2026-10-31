@@ -4,16 +4,14 @@ use crate::chat::{DONE_TEXT, ERROR_TEXT};
 use crate::components::scrollbar::SCROLLBAR_THUMB;
 use crate::components::tool_display::{BACKGROUND_INDICATOR, TOOL_INDICATOR};
 use crate::markdown::{EXPAND_HINT, TRUNCATION_PREFIX};
-use crate::repaint::expect::{OWED, QUIET};
 use crate::selection::{DocPos, Selection, SelectionZone};
 use crate::theme::Theme;
 use crate::wrap;
-use maki_agent::tools::{BASH_TOOL_NAME, GREP_TOOL_NAME, WRITE_TOOL_NAME};
-use maki_agent::{
-    GrepFileEntry, GrepMatchGroup, SnapshotLine, SnapshotSpan, SpanStyle, ToolInput, ToolOutput,
-};
 use maki_config::DEFAULT_THINKING_LINES;
-use maki_providers::ImageMediaType;
+use maki_types::message::ImageMediaType;
+use maki_types::tool::{BASH_TOOL_NAME, GREP_TOOL_NAME, WRITE_TOOL_NAME};
+use maki_types::tool::{DEFAULT_DATA_VERSION, ToolInput, ToolOutput};
+use maki_types::tool::{GrepFileEntry, GrepMatchGroup};
 use ratatui::backend::TestBackend;
 use ratatui::style::Modifier;
 use std::collections::HashSet;
@@ -52,7 +50,10 @@ fn tool_images_survive_snapshot_rebuilds(loaded: bool) {
         panel.load_messages(panel.messages.clone());
         rebuild(&mut panel);
     }
-    panel.tool_snapshot(TOOL_ID, BufferSnapshot::plain_text(CAPTION.into()), None);
+    panel.find_tool_msg_mut(TOOL_ID).unwrap().render_snapshot = Some(
+        maki_types::snapshot::BufferSnapshot::plain_text(CAPTION.into()),
+    );
+    panel.rebuild_tool_segment(TOOL_ID);
     let terminal = render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
     let index = panel.cache.find_by_tool_id(TOOL_ID).unwrap();
     let segment = panel.cache.get(index).unwrap();
@@ -103,15 +104,6 @@ fn image_fallback(segment: &Segment, terminal: &ratatui::Terminal<TestBackend>) 
     )
 }
 
-fn snap_line(text: &str) -> SnapshotLine {
-    SnapshotLine {
-        spans: vec![SnapshotSpan {
-            text: text.into(),
-            style: SpanStyle::Default,
-        }],
-    }
-}
-
 fn start(id: &str, tool: &str) -> ToolStartEvent {
     ToolStartEvent {
         id: id.into(),
@@ -121,7 +113,7 @@ fn start(id: &str, tool: &str) -> ToolStartEvent {
         input: None,
         raw_input: None,
         output: None,
-        render_header: None,
+        data_version: DEFAULT_DATA_VERSION,
     }
 }
 
@@ -142,28 +134,10 @@ fn done(id: &str) -> ToolDoneEvent {
         is_error: false,
         annotation: None,
         written_path: None,
+        data: None,
+
         backgrounded: false,
     }
-}
-
-fn finish_with_live_buf(
-    panel: &mut MessagesPanel,
-    id: &str,
-    text: &str,
-    is_error: bool,
-) -> Arc<maki_agent::SharedBuf> {
-    let buf = Arc::new(maki_agent::SharedBuf::new());
-    buf.set_lines(vec![snap_line(text)]);
-    panel.register_live_buf(id.into(), Arc::clone(&buf));
-    let mut ev = start(id, BASH_TOOL_NAME);
-    ev.raw_input = Some(serde_json::json!({ "command": "true" }));
-    panel.tool_start(ev);
-    panel.tool_done(ToolDoneEvent {
-        call: None,
-        is_error,
-        ..done(id)
-    });
-    buf
 }
 
 #[test_case(false, ToolStatus::Success ; "success_updates_start_to_success")]
@@ -179,6 +153,8 @@ fn tool_done_updates_start_status(is_error: bool, expected: ToolStatus) {
         is_error,
         annotation: None,
         written_path: None,
+        data: None,
+
         backgrounded: false,
     });
 
@@ -210,6 +186,8 @@ fn tool_done_sets_annotation(tool: &'static str, output: ToolOutput, expected: O
         is_error: false,
         annotation: None,
         written_path: None,
+        data: None,
+
         backgrounded: false,
     });
     assert_eq!(panel.messages[0].annotation.as_deref(), expected);
@@ -230,6 +208,8 @@ fn tool_done_annotation_merge(output: &str, expected: Option<&str>) {
         is_error: false,
         annotation: None,
         written_path: None,
+        data: None,
+
         backgrounded: false,
     });
     assert_eq!(panel.messages[0].annotation.as_deref(), expected);
@@ -258,6 +238,8 @@ fn tool_done_grep_shows_matches() {
         is_error: false,
         annotation: None,
         written_path: None,
+        data: None,
+
         backgrounded: false,
     });
     let text = &panel.messages[0].text;
@@ -377,6 +359,8 @@ fn unknown_tool_id_is_noop() {
         is_error: false,
         annotation: None,
         written_path: None,
+        data: None,
+
         backgrounded: false,
     });
     assert!(panel.messages.is_empty());
@@ -408,6 +392,8 @@ fn in_progress_tracking() {
         is_error: false,
         annotation: None,
         written_path: None,
+        data: None,
+
         backgrounded: false,
     });
     assert_eq!(panel.in_progress_count(), 1);
@@ -420,6 +406,8 @@ fn in_progress_tracking() {
         is_error: false,
         annotation: None,
         written_path: None,
+        data: None,
+
         backgrounded: false,
     });
     assert_eq!(panel.in_progress_count(), 0);
@@ -489,6 +477,8 @@ fn events_before_cache_built_render_correctly() {
         is_error: false,
         annotation: None,
         written_path: None,
+        data: None,
+
         backgrounded: false,
     });
     rebuild(&mut panel);
@@ -509,7 +499,7 @@ fn bash_code_start(panel: &mut MessagesPanel, id: &str, code: &str) {
         }),
         raw_input: None,
         output: None,
-        render_header: None,
+        data_version: DEFAULT_DATA_VERSION,
     });
 }
 
@@ -530,6 +520,8 @@ fn bash_live_output_with_code_input() {
         is_error: false,
         annotation: None,
         written_path: None,
+        data: None,
+
         backgrounded: false,
     });
     let text = seg_text(&panel, "t1");
@@ -549,6 +541,8 @@ fn cancel_in_progress_marks_pending_as_error(cache_built: bool) {
         is_error: false,
         annotation: None,
         written_path: None,
+        data: None,
+
         backgrounded: false,
     });
     if cache_built {
@@ -646,6 +640,8 @@ fn tick_drains_the_highlight_worker() {
         is_error: false,
         annotation: None,
         written_path: None,
+        data: None,
+
         backgrounded: false,
     });
     rebuild(&mut panel);
@@ -692,6 +688,8 @@ fn tool_done_after_cancel_in_progress_does_not_underflow() {
         is_error: false,
         annotation: None,
         written_path: None,
+        data: None,
+
         backgrounded: false,
     });
     assert_eq!(panel.in_progress_count(), 0);
@@ -739,6 +737,8 @@ fn search_text_grep_result_includes_structured_output() {
         is_error: false,
         annotation: None,
         written_path: None,
+        data: None,
+
         backgrounded: false,
     });
     rebuild(&mut panel);
@@ -763,6 +763,8 @@ fn search_text_diff_output_includes_hunks() {
         is_error: false,
         annotation: None,
         written_path: None,
+        data: None,
+
         backgrounded: false,
     });
     rebuild(&mut panel);
@@ -782,6 +784,8 @@ fn search_text_bash_with_code_input() {
         is_error: false,
         annotation: None,
         written_path: None,
+        data: None,
+
         backgrounded: false,
     });
     rebuild(&mut panel);
@@ -811,6 +815,8 @@ fn search_text_instruction_segment_indexes_its_own_blocks() {
         is_error: false,
         annotation: None,
         written_path: None,
+        data: None,
+
         backgrounded: false,
     });
     rebuild(&mut panel);
@@ -1209,7 +1215,7 @@ fn panel_with_long_tool(line_count: usize) -> MessagesPanel {
         input: None,
         raw_input: None,
         output: None,
-        render_header: None,
+        data_version: DEFAULT_DATA_VERSION,
     });
     panel.tool_done(ToolDoneEvent {
         call: None,
@@ -1219,6 +1225,8 @@ fn panel_with_long_tool(line_count: usize) -> MessagesPanel {
         is_error: false,
         annotation: None,
         written_path: None,
+        data: None,
+
         backgrounded: false,
     });
     render(&mut panel, 80, 24);
@@ -1305,7 +1313,7 @@ fn panel_with_grep_tool(match_count: usize) -> MessagesPanel {
         input: None,
         raw_input: None,
         output: None,
-        render_header: None,
+        data_version: DEFAULT_DATA_VERSION,
     });
     panel.tool_done(ToolDoneEvent {
         call: None,
@@ -1315,6 +1323,8 @@ fn panel_with_grep_tool(match_count: usize) -> MessagesPanel {
         is_error: false,
         annotation: None,
         written_path: None,
+        data: None,
+
         backgrounded: false,
     });
     render(&mut panel, 80, 24);
@@ -1388,6 +1398,8 @@ fn search_text_includes_truncated_bash_output() {
         is_error: false,
         annotation: None,
         written_path: None,
+        data: None,
+
         backgrounded: false,
     });
     rebuild(&mut panel);
@@ -1425,6 +1437,8 @@ fn done_with_instructions(id: &str) -> ToolDoneEvent {
         is_error: false,
         annotation: None,
         written_path: None,
+        data: None,
+
         backgrounded: false,
     }
 }
@@ -1504,6 +1518,8 @@ fn instruction_segment_has_spacer_before_it() {
         is_error: false,
         annotation: None,
         written_path: None,
+        data: None,
+
         backgrounded: false,
     });
     rebuild(&mut panel);
@@ -1539,6 +1555,8 @@ fn toggle_instruction_segment_expands_and_collapses() {
         is_error: false,
         annotation: None,
         written_path: None,
+        data: None,
+
         backgrounded: false,
     });
     rebuild(&mut panel);
@@ -1587,46 +1605,6 @@ fn only_the_collapsed_view_expands_streaming_thinking(click_row: fn(u32, u32) ->
 }
 
 #[test]
-fn handle_click_on_done_tool_records_click_row() {
-    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
-    panel.tool_start(start("t1", BASH_TOOL_NAME));
-    panel.tool_done(ToolDoneEvent {
-        call: None,
-        id: "t1".into(),
-        tool: BASH_TOOL_NAME.into(),
-        output: Arc::new(ToolOutput::Plain("output".into())),
-        is_error: false,
-        annotation: None,
-        written_path: None,
-        backgrounded: false,
-    });
-    panel.tool_snapshot(
-        "t1",
-        BufferSnapshot::from_arc(Arc::new(vec![snap_line("rendered")])),
-        None,
-    );
-    render(&mut panel, 80, 24);
-    let area = Rect::new(0, 0, 80, 24);
-    assert_eq!(panel.handle_click(area.y, 0, area), ClickOutcome::Handled);
-    assert_eq!(panel.lua_clicks.get("t1").map(Vec::len), Some(1));
-}
-
-#[test]
-fn handle_click_on_running_tool_forwards_live_without_recording() {
-    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
-    panel.tool_start(start("t1", BASH_TOOL_NAME));
-    panel.tool_snapshot(
-        "t1",
-        BufferSnapshot::from_arc(Arc::new(vec![snap_line("streaming")])),
-        None,
-    );
-    render(&mut panel, 80, 24);
-    let area = Rect::new(0, 0, 80, 24);
-    assert_eq!(panel.handle_click(area.y, 0, area), ClickOutcome::Handled);
-    assert!(panel.lua_clicks.is_empty());
-}
-
-#[test]
 fn handle_click_returns_toggled_for_truncated_tool_without_snapshot() {
     let mut panel = panel_with_long_tool(200);
     let area = Rect::new(0, 0, 80, 24);
@@ -1645,449 +1623,7 @@ fn handle_click_non_tool_segment_returns_nothing() {
     assert_eq!(panel.handle_click(area.y, 0, area), ClickOutcome::None);
 }
 
-#[test]
-fn tool_done_removes_live_buf_and_snapshots_dirty() {
-    let buf = Arc::new(maki_agent::SharedBuf::new());
-    buf.set_lines(vec![snap_line("dirty content")]);
-
-    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
-    panel.register_live_buf("t1".into(), Arc::clone(&buf));
-    panel.tool_start(start("t1", BASH_TOOL_NAME));
-    panel.tool_done(ToolDoneEvent {
-        call: None,
-        id: "t1".into(),
-        tool: BASH_TOOL_NAME.into(),
-        output: Arc::new(ToolOutput::Plain("output".into())),
-        is_error: false,
-        annotation: None,
-        written_path: None,
-        backgrounded: false,
-    });
-
-    let msg = panel.find_tool_msg_mut("t1").unwrap();
-    assert_eq!(
-        msg.render_snapshot.as_ref().unwrap().first_line_text(),
-        "dirty content"
-    );
-}
-
-/// The handler's buf must supersede the `start` preview: the UI keeps only
-/// the last registered buf per tool_use_id.
-#[test]
-fn second_register_live_buf_replaces_first() {
-    let preview = Arc::new(maki_agent::SharedBuf::new());
-    preview.set_lines(vec![snap_line("preview")]);
-    let handler = Arc::new(maki_agent::SharedBuf::new());
-    handler.set_lines(vec![snap_line("handler")]);
-
-    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
-    panel.tool_start(start("t1", BASH_TOOL_NAME));
-    panel.register_live_buf("t1".into(), Arc::clone(&preview));
-    panel.register_live_buf("t1".into(), Arc::clone(&handler));
-    let _ = panel.poll_live_bufs();
-
-    let msg = panel.find_tool_msg_mut("t1").unwrap();
-    assert_eq!(
-        msg.render_snapshot.as_ref().unwrap().first_line_text(),
-        "handler"
-    );
-}
-
-/// Every finished-tool click on a watched buf carries the full recorded
-/// click list as a restore fallback: the runtime serves it warm when it
-/// can and restores otherwise, so the UI never guesses runtime state.
-#[test_case(false ; "success")]
-#[test_case(true ; "error_finish")]
-fn handle_click_on_watched_tool_sends_click_with_fallback(is_error: bool) {
-    let (eh, probe) = maki_lua::test_support::probed_event_handle();
-    let (tx, _rx) = flume::unbounded();
-    let mut panel = MessagesPanel::new(UiConfig::default(), eh);
-    panel.set_restore_channel(Some(EventSender::new(tx, 0)));
-    finish_with_live_buf(&mut panel, "t1", "body", is_error);
-    assert!(panel.watching("t1"));
-
-    render(&mut panel, 80, 24);
-    let area = Rect::new(0, 0, 80, 24);
-    assert_eq!(panel.handle_click(area.y, 0, area), ClickOutcome::Handled);
-    let recorded = panel.lua_clicks["t1"].clone();
-    assert_eq!(recorded.len(), 1);
-    assert_eq!(probe.try_recv(), Some(("click_fallback", recorded)));
-    assert_eq!(probe.try_recv(), None);
-}
-
-#[test]
-fn tool_done_moves_live_buf_to_watched_polled_but_not_animating() {
-    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
-    let buf = finish_with_live_buf(&mut panel, "t1", "before", false);
-    assert!(panel.watching("t1"));
-    assert_eq!(
-        panel.cadence(),
-        Cadence::IDLE,
-        "a finished tool must not leave a spinner running"
-    );
-
-    buf.set_lines(vec![snap_line("after")]);
-    assert_eq!(panel.poll_live_bufs(), Dirty::YES, "{OWED}");
-    let msg = panel.find_tool_msg_mut("t1").unwrap();
-    assert_eq!(
-        msg.render_snapshot.as_ref().unwrap().first_line_text(),
-        "after"
-    );
-}
-
-#[test]
-fn watched_fifo_evicts_oldest_which_stops_polling_and_restores_with_recorded_clicks() {
-    let (eh, probe) = maki_lua::test_support::probed_event_handle();
-    let (tx, _rx) = flume::unbounded();
-    let mut panel = MessagesPanel::new(UiConfig::default(), eh);
-    panel.set_restore_channel(Some(EventSender::new(tx, 0)));
-    let buf = finish_with_live_buf(&mut panel, "t0", "before", false);
-
-    render(&mut panel, 80, 24);
-    let area = Rect::new(0, 0, 80, 24);
-    assert_eq!(panel.handle_click(area.y, 0, area), ClickOutcome::Handled);
-    assert_eq!(panel.lua_clicks.get("t0").map(Vec::len), Some(1));
-    assert_eq!(
-        probe.try_recv(),
-        Some(("click_fallback", panel.lua_clicks["t0"].clone()))
-    );
-
-    for i in 1..=WARM_TOOL_CAP {
-        finish_with_live_buf(&mut panel, &format!("t{i}"), "body", false);
-    }
-    assert_eq!(panel.watched_bufs.len(), WARM_TOOL_CAP);
-    assert!(!panel.watching("t0"));
-
-    buf.set_lines(vec![snap_line("after-eviction")]);
-    assert_eq!(
-        panel.poll_live_bufs(),
-        Dirty::NO,
-        "evicted buf must no longer be polled"
-    );
-    let msg = panel.find_tool_msg_mut("t0").unwrap();
-    assert_eq!(
-        msg.render_snapshot.as_ref().unwrap().first_line_text(),
-        "before",
-        "evicted buf must no longer be polled"
-    );
-
-    render(&mut panel, 80, 24);
-    panel.scroll_to_top();
-    assert_eq!(panel.handle_click(area.y, 0, area), ClickOutcome::Handled);
-    let recorded = panel.lua_clicks["t0"].clone();
-    assert_eq!(recorded.len(), 2);
-    assert_eq!(probe.try_recv(), Some(("restore", recorded)));
-    assert_eq!(probe.try_recv(), None);
-}
-
-#[test]
-fn tool_done_without_live_buf_is_not_watched_and_click_restores() {
-    let (eh, probe) = maki_lua::test_support::probed_event_handle();
-    let (tx, _rx) = flume::unbounded();
-    let mut panel = MessagesPanel::new(UiConfig::default(), eh);
-    panel.set_restore_channel(Some(EventSender::new(tx, 0)));
-    let mut ev = start("t1", BASH_TOOL_NAME);
-    ev.raw_input = Some(serde_json::json!({ "command": "true" }));
-    panel.tool_start(ev);
-    panel.tool_snapshot(
-        "t1",
-        BufferSnapshot::from_arc(Arc::new(vec![snap_line("body")])),
-        None,
-    );
-    panel.tool_done(done("t1"));
-    assert!(!panel.watching("t1"));
-
-    render(&mut panel, 80, 24);
-    let area = Rect::new(0, 0, 80, 24);
-    assert_eq!(panel.handle_click(area.y, 0, area), ClickOutcome::Handled);
-    assert_eq!(
-        probe.try_recv(),
-        Some(("restore", panel.lua_clicks["t1"].clone()))
-    );
-    assert_eq!(probe.try_recv(), None);
-}
-
-/// The stale-run_id filter drops ToolDone events after a cancel, so the
-/// cancel path itself must retire live bufs: no spinner left running, and
-/// the tool stays clickable through the warm path.
-#[test]
-fn cancel_in_progress_retires_live_buf_to_watched() {
-    let (eh, probe) = maki_lua::test_support::probed_event_handle();
-    let (tx, _rx) = flume::unbounded();
-    let mut panel = MessagesPanel::new(UiConfig::default(), eh);
-    panel.set_restore_channel(Some(EventSender::new(tx, 0)));
-    let buf = Arc::new(maki_agent::SharedBuf::new());
-    buf.set_lines(vec![snap_line("body")]);
-    let mut ev = start("t1", BASH_TOOL_NAME);
-    ev.raw_input = Some(serde_json::json!({ "command": "true" }));
-    panel.tool_start(ev);
-    panel.register_live_buf("t1".into(), Arc::clone(&buf));
-
-    panel.cancel_in_progress();
-    assert_eq!(
-        panel.cadence(),
-        Cadence::IDLE,
-        "cancel must not leave a tool marked in progress"
-    );
-    assert!(panel.watching("t1"));
-
-    buf.set_lines(vec![snap_line("after-cancel")]);
-    // The tool hands that same repaint to the host as its reply body, and the
-    // stale-run_id filter drops it. Taking a body must not cost the screen the
-    // last thing a cancelled tool painted.
-    let _dropped_reply = buf.take();
-    assert_eq!(panel.poll_live_bufs(), Dirty::YES, "{OWED}");
-    let msg = panel.find_tool_msg_mut("t1").unwrap();
-    assert_eq!(
-        msg.render_snapshot.as_ref().unwrap().first_line_text(),
-        "after-cancel"
-    );
-
-    render(&mut panel, 80, 24);
-    let area = Rect::new(0, 0, 80, 24);
-    assert_eq!(panel.handle_click(area.y, 0, area), ClickOutcome::Handled);
-    assert_eq!(probe.try_recv(), Some(("click", vec![])));
-    assert_eq!(probe.try_recv(), None);
-}
-
-/// A restore reply supersedes the old live view: the buf must stop
-/// being watched so its stale content can't overwrite the fresh
-/// snapshot, and later clicks must go through restore.
-#[test]
-fn restore_reply_stops_watching_buf() {
-    let (eh, probe) = maki_lua::test_support::probed_event_handle();
-    let (tx, _rx) = flume::unbounded();
-    let mut panel = MessagesPanel::new(UiConfig::default(), eh);
-    panel.set_restore_channel(Some(EventSender::new(tx, 0)));
-    let buf = finish_with_live_buf(&mut panel, "t1", "old-theme", false);
-    assert!(panel.watching("t1"));
-
-    let baked_gen = panel.snapshot_gen_of("t1").unwrap();
-    panel.tool_snapshot(
-        "t1",
-        BufferSnapshot::from_arc(Arc::new(vec![snap_line("rebaked")])),
-        Some(baked_gen),
-    );
-    assert!(!panel.watching("t1"));
-
-    buf.set_lines(vec![snap_line("stale-mutation")]);
-    assert_eq!(
-        panel.poll_live_bufs(),
-        Dirty::NO,
-        "unwatched buf must no longer be polled"
-    );
-    let msg = panel.find_tool_msg_mut("t1").unwrap();
-    assert_eq!(
-        msg.render_snapshot.as_ref().unwrap().first_line_text(),
-        "rebaked",
-        "unwatched buf must not overwrite the restored snapshot"
-    );
-
-    render(&mut panel, 80, 24);
-    let area = Rect::new(0, 0, 80, 24);
-    assert_eq!(panel.handle_click(area.y, 0, area), ClickOutcome::Handled);
-    assert_eq!(
-        probe.try_recv(),
-        Some(("restore", panel.lua_clicks["t1"].clone()))
-    );
-    assert_eq!(probe.try_recv(), None);
-}
-
-/// Requesting a rebake already stops watching: clicks inside the
-/// request/reply window must restore (with the new theme) instead of
-/// mutating the old-theme buf.
-#[test]
-fn rebake_request_stops_watching_buf() {
-    let (eh, probe) = maki_lua::test_support::probed_event_handle();
-    let (tx, _rx) = flume::unbounded();
-    let mut panel = MessagesPanel::new(UiConfig::default(), eh);
-    panel.set_restore_channel(Some(EventSender::new(tx, 0)));
-    finish_with_live_buf(&mut panel, "t1", "old-theme", false);
-    assert!(panel.watching("t1"));
-
-    let next_gen = panel.snapshot_gen_of("t1").unwrap() + 1;
-    panel.rebake_stale_snapshots(next_gen);
-    assert!(!panel.watching("t1"));
-    assert_eq!(probe.try_recv(), Some(("restore", vec![])));
-    assert_eq!(probe.try_recv(), None);
-}
-
-const REBAKE_TASK_ID: &str = "toolu_sub";
-
-/// A rebake replays one call for its colors. The plugin behind it only sees
-/// the item, so the item has to say which chat it is and that nothing but
-/// the buf is wanted, or a stateful tool (the todo panel) would treat a
-/// years-old call as news from the main chat.
-#[test]
-fn rebake_stamps_the_chat_and_asks_for_a_rerender() {
-    let (eh, probe) = maki_lua::test_support::probed_event_handle();
-    let session_id = MakiId::generate();
-    let mut panel = MessagesPanel::new(UiConfig::default(), eh);
-    panel.set_chat(session_id, Some(Arc::from(REBAKE_TASK_ID)));
-    panel.set_restore_channel(Some(test_event_sender()));
-    finish_with_live_buf(&mut panel, "t1", "old-theme", false);
-
-    panel.rebake_stale_snapshots(panel.snapshot_gen_of("t1").unwrap() + 1);
-
-    let item = probe
-        .try_recv_restore_item()
-        .expect("rebake requests a restore");
-    assert_eq!(item.session_id.map(|s| s.id()), Some(session_id));
-    assert_eq!(item.task_id.as_deref(), Some(REBAKE_TASK_ID));
-    assert_eq!(item.reason, maki_lua::RestoreReason::Rerender);
-}
-
-#[test]
-fn live_buf_streams_across_clean_polls() {
-    let buf = Arc::new(maki_agent::SharedBuf::new());
-    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
-    panel.tool_start(start("t1", BASH_TOOL_NAME));
-    panel.register_live_buf("t1".into(), Arc::clone(&buf));
-
-    buf.append(snap_line("first"));
-    assert_eq!(panel.poll_live_bufs(), Dirty::YES);
-    assert_eq!(panel.poll_live_bufs(), Dirty::NO, "{QUIET}");
-
-    buf.append(snap_line("second"));
-    assert_eq!(panel.poll_live_bufs(), Dirty::YES);
-
-    let msg = panel.find_tool_msg_mut("t1").unwrap();
-    let snapshot = msg.render_snapshot.as_ref().unwrap();
-    assert_eq!(snapshot.lines.len(), 2);
-}
-
-#[test]
-fn tool_done_without_live_buf_preserves_existing_snapshot() {
-    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
-    panel.tool_start(start("t1", BASH_TOOL_NAME));
-    panel.tool_snapshot(
-        "t1",
-        BufferSnapshot::from_arc(Arc::new(vec![snap_line("pre-existing")])),
-        None,
-    );
-    panel.tool_done(ToolDoneEvent {
-        call: None,
-        id: "t1".into(),
-        tool: BASH_TOOL_NAME.into(),
-        output: Arc::new(ToolOutput::Plain("output".into())),
-        is_error: false,
-        annotation: None,
-        written_path: None,
-        backgrounded: false,
-    });
-
-    let msg = panel.find_tool_msg_mut("t1").unwrap();
-    assert_eq!(
-        msg.render_snapshot.as_ref().unwrap().first_line_text(),
-        "pre-existing"
-    );
-}
-
-#[test]
-fn tool_done_clean_live_buf_does_not_snapshot() {
-    let buf = Arc::new(maki_agent::SharedBuf::new());
-
-    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
-    panel.register_live_buf("t1".into(), Arc::clone(&buf));
-    panel.tool_start(start("t1", BASH_TOOL_NAME));
-    panel.tool_done(ToolDoneEvent {
-        call: None,
-        id: "t1".into(),
-        tool: BASH_TOOL_NAME.into(),
-        output: Arc::new(ToolOutput::Plain("output".into())),
-        is_error: false,
-        annotation: None,
-        written_path: None,
-        backgrounded: false,
-    });
-
-    let msg = panel.find_tool_msg_mut("t1").unwrap();
-    assert!(
-        msg.render_snapshot.is_none(),
-        "clean (never-written) live buf should not produce a snapshot"
-    );
-}
-
-const REQUEST_RECORDED_MSG: &str = "a fired re-bake records the requested generation";
-const NOT_RESTAMPED_MSG: &str =
-    "the re-bake walk must not optimistically stamp the displayed generation";
-const NO_REQUEST_MSG: &str = "snapshot-free message must not trigger a re-bake request";
-const SUPERSEDED_DROP_MSG: &str =
-    "a re-bake reply older than the applied generation must be dropped (monotonic)";
-
-fn bash_tool_with_snapshot(id: &str) -> MessagesPanel {
-    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
-    panel.tool_start(start(id, BASH_TOOL_NAME));
-    panel.tool_done(ToolDoneEvent {
-        call: None,
-        id: id.into(),
-        tool: BASH_TOOL_NAME.into(),
-        output: Arc::new(ToolOutput::Plain("output".into())),
-        is_error: false,
-        annotation: None,
-        written_path: None,
-        backgrounded: false,
-    });
-    panel.tool_snapshot(
-        id,
-        BufferSnapshot::from_arc(Arc::new(vec![snap_line("rendered")])),
-        None,
-    );
-    panel
-}
-
-fn rendered_snapshot() -> BufferSnapshot {
-    BufferSnapshot::from_arc(Arc::new(vec![snap_line("rendered")]))
-}
-
-#[test]
-fn rebake_walk_requests_without_stamping_displayed_generation() {
-    let mut panel = bash_tool_with_snapshot("t1");
-    panel.find_tool_msg_mut("t1").unwrap().tool_raw_input =
-        Some(Arc::new(serde_json::json!({ "command": "echo" })));
-    panel.push(DisplayMessage::new(DisplayRole::Assistant, "plain".into()));
-    panel.set_restore_channel(Some(test_event_sender()));
-
-    let baked_gen = panel.snapshot_gen_of("t1").unwrap();
-    let next_gen = baked_gen + 1;
-    panel.rebake_stale_snapshots(next_gen);
-
-    assert_eq!(
-        panel.snapshot_gen_of("t1"),
-        Some(baked_gen),
-        "{NOT_RESTAMPED_MSG}"
-    );
-    assert_eq!(
-        panel.rebake_requested_gen("t1"),
-        Some(next_gen),
-        "{REQUEST_RECORDED_MSG}"
-    );
-    assert_eq!(panel.messages[1].snapshot_theme_gen, 0, "{NO_REQUEST_MSG}");
-}
-
-#[test]
-fn superseded_rebake_reply_is_dropped() {
-    let mut panel = bash_tool_with_snapshot("t1");
-    let baked = panel.snapshot_gen_of("t1").unwrap();
-    let newer = baked + 3;
-    panel.tool_snapshot("t1", rendered_snapshot(), Some(newer));
-    panel.tool_snapshot("t1", rendered_snapshot(), Some(baked + 1));
-    assert_eq!(
-        panel.snapshot_gen_of("t1"),
-        Some(newer),
-        "{SUPERSEDED_DROP_MSG}"
-    );
-}
-
-fn test_event_sender() -> maki_agent::EventSender {
-    let (tx, _rx) = flume::unbounded();
-    maki_agent::EventSender::new(tx, 0)
-}
-
 const RAW_INPUT_SET_MSG: &str = "tool_raw_input must be set from event payload";
-const HEADER_GEN_MSG: &str = "header snapshot must stamp the provided generation";
-const LIVE_PANEL_GEN_MSG: &str = "live snapshot (None gen) must stamp with panel theme_generation";
-const REBAKE_NOOP_MSG: &str = "rebake without channel must be a no-op (no requested gen)";
 
 #[test_case(false ; "fresh_start")]
 #[test_case(true  ; "upgrade_from_pending")]
@@ -2110,41 +1646,6 @@ fn tool_start_propagates_raw_input(pre_pending: bool) {
         raw.unwrap().as_ref(),
         &serde_json::json!({"command": "echo"}),
         "{RAW_INPUT_SET_MSG}"
-    );
-}
-
-#[test]
-fn header_snapshot_stamps_gen_on_top_level() {
-    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
-    panel.tool_start(start("t1", BASH_TOOL_NAME));
-    panel.tool_header_snapshot("t1", rendered_snapshot(), Some(5));
-
-    assert_eq!(panel.snapshot_gen_of("t1"), Some(5), "{HEADER_GEN_MSG}");
-    let msg = panel.find_tool_msg_mut("t1").unwrap();
-    assert!(msg.render_header.is_some(), "render_header must be set");
-}
-
-#[test]
-fn live_snapshot_uses_panel_generation() {
-    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
-    panel.tool_start(start("t1", BASH_TOOL_NAME));
-    panel.tool_snapshot("t1", rendered_snapshot(), None);
-
-    assert_eq!(panel.snapshot_gen_of("t1"), Some(0), "{LIVE_PANEL_GEN_MSG}");
-}
-
-#[test]
-fn rebake_without_channel_is_noop() {
-    let mut panel = bash_tool_with_snapshot("t1");
-    panel.find_tool_msg_mut("t1").unwrap().tool_raw_input =
-        Some(Arc::new(serde_json::json!({"command": "echo"})));
-    let baked_gen = panel.snapshot_gen_of("t1").unwrap();
-
-    panel.rebake_stale_snapshots(baked_gen + 1);
-
-    assert!(
-        panel.rebake_requested_gen("t1").is_none(),
-        "{REBAKE_NOOP_MSG}"
     );
 }
 
@@ -2598,6 +2099,8 @@ fn resize_reflows_tool_segment_and_keeps_instruction_segment() {
         is_error: false,
         annotation: None,
         written_path: None,
+        data: None,
+
         backgrounded: false,
     });
     render(&mut panel, 80, 10);
@@ -2787,6 +2290,8 @@ fn theme_switch_repaints_highlighted_code() {
         is_error: false,
         annotation: None,
         written_path: None,
+        data: None,
+
         backgrounded: false,
     });
     render(&mut panel, 80, 20);
@@ -2921,45 +2426,6 @@ fn scroll_position_survives_a_flush() {
         before,
         "the flush moved the content under the viewport"
     );
-}
-
-fn panel_with_snapshot_tools(count: usize) -> MessagesPanel {
-    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
-    for i in 0..count {
-        let id = format!("t{i}");
-        panel.tool_start(start(&id, BASH_TOOL_NAME));
-        panel.tool_done(done(&id));
-        panel.tool_snapshot(
-            &id,
-            BufferSnapshot::from_arc(Arc::new(vec![snap_line(&format!("out {i}"))])),
-            None,
-        );
-    }
-    panel
-}
-
-/// A click arrives as a screen row, so it only means something relative to
-/// the scroll position. Counted from the top of the document it would land on
-/// the first segment, and on yet another one after a resize.
-#[test]
-fn a_click_on_the_top_row_reaches_the_scrolled_segment() {
-    const TARGET: &str = "t2";
-
-    let mut panel = panel_with_snapshot_tools(10);
-    render(&mut panel, 80, 10);
-    panel.scroll_to_segment(panel.cache.find_by_tool_id(TARGET).unwrap());
-
-    for width in [80, 40] {
-        render(&mut panel, width, 10);
-        let area = Rect::new(0, 0, width, 10);
-        assert!(
-            panel.handle_click(area.y, 0, area) == ClickOutcome::Handled,
-            "no click at width {width}"
-        );
-    }
-
-    assert_eq!(panel.lua_clicks.get(TARGET).map(Vec::len), Some(2));
-    assert_eq!(panel.lua_clicks.len(), 1, "no other tool was clicked");
 }
 
 /// A document row used to be a `u16`, so a long session silently clamped: the
@@ -3162,11 +2628,17 @@ fn a_moved_row_takes_no_toggle() {
 /// command can land after the move, so the row keeps following the buf.
 #[test]
 fn a_moved_row_keeps_its_head_and_follows_it() {
-    let buf = Arc::new(maki_agent::SharedBuf::new());
-    buf.set_lines_with_head(vec![snap_line(COMMAND), snap_line(STREAMED)], 1);
+    let buf = Arc::new(maki_types::snapshot::SharedBuf::new());
+    buf.set_lines_with_head(
+        vec![
+            maki_types::snapshot::SnapshotLine::plain(COMMAND.into()),
+            maki_types::snapshot::SnapshotLine::plain(STREAMED.into()),
+        ],
+        1,
+    );
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     panel.tool_start(start(MOVABLE_ID, BASH_TOOL_NAME));
-    panel.register_live_buf(MOVABLE_ID.into(), Arc::clone(&buf));
+    panel.set_snapshot(MOVABLE_ID, buf.take());
     panel.tool_done(backgrounded_done(RECEIPT));
 
     let text = view_text(&mut panel);
@@ -3177,8 +2649,14 @@ fn a_moved_row_keeps_its_head_and_follows_it() {
     assert!(!text.contains(TOOL_INDICATOR.trim()), "{text}");
     assert!(text.contains(CLICK_HINT), "{text}");
 
-    buf.set_lines_with_head(vec![snap_line(NEW_COMMAND), snap_line(STREAMED)], 1);
-    assert_eq!(panel.tick(), Dirty::YES);
+    buf.set_lines_with_head(
+        vec![
+            maki_types::snapshot::SnapshotLine::plain(NEW_COMMAND.into()),
+            maki_types::snapshot::SnapshotLine::plain(STREAMED.into()),
+        ],
+        1,
+    );
+    panel.set_snapshot(MOVABLE_ID, buf.take());
     assert!(view_text(&mut panel).contains(NEW_COMMAND));
 }
 

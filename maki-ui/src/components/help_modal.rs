@@ -1,14 +1,13 @@
-use crate::components::ModalScroll;
-use crate::components::Overlay;
 use crate::components::keybindings::{
     ALT_SEP, KEYBINDS, KeybindContext, ResolvedLabel, all_contexts, key,
 };
 use crate::components::modal::{BORDER, Modal};
 use crate::components::scrollbar::render_vertical_scrollbar;
+use crate::components::{ModalScroll, Overlay};
 use crate::theme;
 
 use crossterm::event::{KeyCode, KeyEvent};
-use maki_lua::{BuiltinAction, InputMode, KeymapEntry, KeymapReader};
+use maki_lua_ui::{BuiltinAction, InputMode, KeymapEntry, KeymapReader};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
@@ -356,9 +355,7 @@ mod tests {
     use super::*;
     use crate::components::key as key_ev;
     use crossterm::event::KeyCode;
-    use maki_agent::tools::ToolRegistry;
-    use maki_lua::PluginHost;
-    use std::sync::Arc;
+
     use test_case::test_case;
 
     #[test_case(key_ev(KeyCode::Esc)       ; "esc_closes")]
@@ -391,7 +388,7 @@ maki.keymap.set("i", "<C-t>", function() end, { desc = "Pong" })
     /// answers it in `"n"`.
     #[test]
     fn plugin_lines_name_who_answers_each_key_and_every_action() {
-        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let host = maki_lua_ui::UiHost::bare();
         host.load_source("helper", HELPER_PLUGIN).unwrap();
         host.load_source("later", LATER_PLUGIN).unwrap();
 

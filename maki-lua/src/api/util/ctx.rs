@@ -6,27 +6,27 @@ use std::time::{Duration, Instant};
 use maki_agent::agent::tool_dispatch::silent_mutation_check;
 use maki_agent::cancel::CancelToken;
 use maki_agent::tools::{
-    Deadline, FileKey, MAIN_TASK_ID, ToolAudience, ToolContext, ToolLive, ToolOutputMode,
+    Deadline, FileKey, MAIN_TASK_ID, ProgressScope, ToolAudience, ToolContext, ToolLive,
+    ToolOutputMode,
 };
-use maki_agent::{AgentEvent, AgentSeed, ToolPart};
+use maki_agent::{AgentEvent, AgentSeed, Envelope, SessionMailbox, ToolPart};
 use maki_config::{AgentConfig, ToolOutputLines};
 use maki_storage::id::{MakiId, SessionRef};
+use maki_types::paths::HOME;
 use mlua::{
-    AnyUserData, Function, LuaSerdeExt, MultiValue, Table, UserData, UserDataMethods,
+    Function, Lua, LuaSerdeExt, MultiValue, Result as LuaResult, Table, UserData, UserDataMethods,
     Value as LuaValue,
 };
-use tokio::task::spawn_blocking;
 
 use crate::api::tool::ToolCallReply;
-use crate::api::ui::buf::BufHandle;
-use crate::api::util::convert::{TableExt, json_to_lua};
+use crate::api::util::convert::{TableExt, json_to_lua, lua_to_json};
 use crate::api::util::pair::{Pair, err_pair, pair};
-use crate::runtime::{
-    MoveOutcome, RestoreReason, SUBAGENT_SELF_MOVE_MSG, TaskHandle, active_task, lock_cell,
-    move_self,
-};
+use crate::domains::agent::moves::{AgentTask, MoveOutcome, SUBAGENT_SELF_MOVE_MSG, move_self};
+use crate::runtime::{active_task, lock_cell};
 
 const DEADLINE_ALREADY_SET_MSG: &str = "ctx:set_deadline() already called";
+const STREAM_NOT_STRING_MSG: &str = "ctx:stream(text) expects a string";
+const SET_STATE_CONTEXT: &str = "ctx:set_state(value)";
 const WRITE_TOOL: &str = "write";
 const BACKGROUND_HOOK_ALREADY_SET_MSG: &str = "ctx:on_background() already called";
 const NOT_A_MODEL_CALL_MSG: &str =
@@ -45,8 +45,9 @@ const EXPIRE_BACKGROUND: &str = "background";
 const EXPIRE_TIMEOUT: &str = "timeout";
 
 /// What `ctx:set_deadline` does when the deadline passes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum DeadlineExpire {
+    #[default]
     Timeout,
     /// Move the call to the background instead, falling back to a timeout
     /// when it cannot move.
@@ -68,28 +69,9 @@ impl DeadlineExpire {
     }
 }
 
-/// Tells whoever draws the call whether a Ctrl+B press would move it now: the
-/// row's hint for a top-level call, the calling tool for a nested one. A row
-/// the press cannot move gets no hint at all.
-fn announce_movable(handle: &TaskHandle, agent: &AgentContext, movable: bool) {
-    let (live, sink) = {
-        let cell = lock_cell(handle);
-        (cell.live.clone(), cell.live_sink.clone())
-    };
-    if let Some(live) = live {
-        if could_move(agent) {
-            let _ = live.event_tx.send(AgentEvent::ToolMovable {
-                id: live.tool_use_id,
-                movable,
-            });
-        }
-    } else if let Some(sink) = sink {
-        let _ = sink.send(ToolLive::Movable(movable));
-    }
-}
+const CWD_KEY: &str = "cwd";
+const HOME_KEY: &str = "home";
 
-/// What the runtime asks before a move: a run to report to, and a live chat
-/// whose task tabs show the work.
 fn could_move(agent: &AgentContext) -> bool {
     agent.mailbox.is_some()
         && agent
@@ -98,24 +80,17 @@ fn could_move(agent: &AgentContext) -> bool {
             .is_some_and(|session| AgentSeed::live(session.id()).is_some())
 }
 
-fn send_live_buf(lua: &mlua::Lua, buf: &mlua::AnyUserData) -> mlua::Result<()> {
-    let shared = buf.borrow::<BufHandle>().map(|h| Arc::clone(&h.buf))?;
-    let task = active_task(lua);
-    let (live, sink) = {
-        let mut cell = lock_cell(&task);
-        cell.root_buf = Some(Arc::clone(&shared));
-        (cell.live.clone(), cell.live_sink.clone())
-    };
-    if let Some(live) = live {
-        let _ = live.event_tx.send(maki_agent::AgentEvent::LiveToolBuf {
-            id: live.tool_use_id.clone(),
-            body: Arc::clone(&shared),
-        });
+fn announce_movable(agent: &AgentContext, movable: bool) {
+    if let Some(id) = &agent.tool_use_id {
+        if could_move(agent) {
+            agent.send_event(AgentEvent::ToolMovable {
+                id: id.clone(),
+                movable,
+            });
+        }
+    } else if let Some(sink) = &agent.live_sink {
+        let _ = sink.send(ToolLive::Movable(movable));
     }
-    if let Some(sink) = sink {
-        let _ = sink.send(ToolLive::Buf(shared));
-    }
-    Ok(())
 }
 
 /// Captured snapshot of the parent `ToolContext`. Per-call state (deadline,
@@ -146,66 +121,61 @@ impl Deref for AgentContext {
 }
 
 impl AgentContext {
+    fn send_event(&self, event: AgentEvent) {
+        if let Some(home) = self.call.as_ref().and_then(|call| call.home()) {
+            SessionMailbox::task_event(
+                home.chat,
+                Arc::clone(&home.plugin),
+                Envelope {
+                    event,
+                    subagent: None,
+                    run_id: 0,
+                },
+            );
+        } else {
+            let _ = self.event_tx.send(event);
+        }
+    }
+
     /// Drops `tool_use_id` so an inner tool never emits UI events under the
-    /// outer call's id, and `live_sink` so a grandchild never streams into
-    /// a sink meant for its parent.
+    /// outer call's id, `live_sink` so a grandchild never streams into a sink
+    /// meant for its parent, and `progress`, which only a dispatched child
+    /// gets, as its own scope: see [`Self::child_progress`].
     pub(crate) fn to_tool_context(&self) -> ToolContext {
         let mut c = self.0.clone();
         c.tool_use_id = None;
         c.live_sink = None;
+        c.progress = None;
         c
+    }
+
+    /// The scope of the next call this handler dispatches, recorded under
+    /// it with the next invocation index.
+    pub(crate) fn child_progress(&self) -> Option<ProgressScope> {
+        self.0.progress.as_ref().map(ProgressScope::child)
     }
 }
 
-/// One ctx type for handler, `start`, and restore invocations. Each kind's
-/// capabilities live in its `Caps` variant, so a capability exists exactly
-/// when its data does. Methods a kind lacks return `(nil, err)` instead of
-/// not existing, so callers can probe without pcall.
 pub(crate) struct LuaCtx {
-    caps: Caps,
+    agent: Box<AgentContext>,
     pub(crate) cancel: CancelToken,
     tool_output_lines: ToolOutputLines,
     /// Which chat the run serves, see [`ToolContext::session_id`] and
-    /// [`ToolContext::task_id`]. Restore takes both from the chat being
-    /// re-rendered.
+    /// [`ToolContext::task_id`].
     session_id: Option<SessionRef>,
     task_id: Option<Arc<str>>,
     pub(crate) finish_tx: Option<flume::Sender<ToolCallReply>>,
 }
 
-enum Caps {
-    Handler {
-        agent: Box<AgentContext>,
-    },
-    /// `start` runs before permission checks: it reads config and publishes
-    /// previews, but dispatching tools is structurally impossible.
-    Start {
-        config: AgentConfig,
-        workflow: bool,
-        audience: ToolAudience,
-        output_mode: ToolOutputMode,
-    },
-    Restore {
-        state: Option<serde_json::Value>,
-        reason: RestoreReason,
-    },
-}
-
-/// What a restore run knows about the call it re-renders: the host fills it
-/// from a `RestoreItem`, batch from the plain table it hands its children.
-#[derive(Default)]
-pub(crate) struct RestoreCtx {
-    pub(crate) tool_output_lines: ToolOutputLines,
-    pub(crate) state: Option<serde_json::Value>,
-    pub(crate) session_id: Option<SessionRef>,
-    pub(crate) task_id: Option<Arc<str>>,
-    pub(crate) reason: RestoreReason,
+struct SessionPlace {
+    cwd: PathBuf,
+    home: Option<PathBuf>,
 }
 
 impl LuaCtx {
-    fn new(ctx: &ToolContext, caps: Caps) -> Self {
+    fn new(ctx: &ToolContext, agent: AgentContext) -> Self {
         Self {
-            caps,
+            agent: Box::new(agent),
             cancel: ctx.cancel.clone(),
             tool_output_lines: ctx.tool_output_lines,
             session_id: ctx.session_id.clone(),
@@ -215,38 +185,16 @@ impl LuaCtx {
     }
 
     pub(crate) fn handler(ctx: &ToolContext) -> Self {
-        Self::new(
-            ctx,
-            Caps::Handler {
-                agent: Box::new(AgentContext::from(ctx)),
-            },
-        )
+        Self::new(ctx, AgentContext::from(ctx))
     }
 
-    pub(crate) fn start(ctx: &ToolContext) -> Self {
-        Self::new(
-            ctx,
-            Caps::Start {
-                config: ctx.config.clone(),
-                workflow: ctx.workflow,
-                audience: ctx.audience,
-                output_mode: ctx.output_mode,
-            },
-        )
-    }
-
-    pub(crate) fn restore(ctx: RestoreCtx) -> Self {
-        Self {
-            caps: Caps::Restore {
-                state: ctx.state,
-                reason: ctx.reason,
-            },
-            cancel: CancelToken::none(),
-            tool_output_lines: ctx.tool_output_lines,
-            session_id: ctx.session_id,
-            task_id: ctx.task_id,
-            finish_tx: None,
-        }
+    /// A handler ctx for code that runs beside a call rather than as it, such
+    /// as a permission layer: what it streams or dispatches is no part of the
+    /// call, so it gets no progress scope.
+    pub(crate) fn detached_handler(ctx: &ToolContext) -> Self {
+        let mut agent = AgentContext::from(ctx);
+        agent.0.progress = None;
+        Self::new(ctx, agent)
     }
 
     pub(crate) fn session(&self) -> Option<MakiId> {
@@ -255,68 +203,52 @@ impl LuaCtx {
 
     /// Dispatch capability: only handler ctxs can call `maki.agent.*`.
     pub(crate) fn agent(&self) -> Option<&AgentContext> {
-        match &self.caps {
-            Caps::Handler { agent } => Some(agent),
-            _ => None,
-        }
+        Some(&self.agent)
     }
 
     fn config(&self) -> Option<&AgentConfig> {
-        match &self.caps {
-            Caps::Handler { agent } => Some(&agent.config),
-            Caps::Start { config, .. } => Some(config),
-            Caps::Restore { .. } => None,
-        }
+        Some(&self.agent.config)
     }
 
     fn workflow(&self) -> Option<bool> {
-        match &self.caps {
-            Caps::Handler { agent } => Some(agent.workflow),
-            Caps::Start { workflow, .. } => Some(*workflow),
-            Caps::Restore { .. } => None,
-        }
+        Some(self.agent.workflow)
     }
 
     fn audience(&self) -> Option<ToolAudience> {
-        match &self.caps {
-            Caps::Handler { agent } => Some(agent.audience),
-            Caps::Start { audience, .. } => Some(*audience),
-            Caps::Restore { .. } => None,
-        }
-    }
-
-    fn restore_reason(&self) -> Option<RestoreReason> {
-        match &self.caps {
-            Caps::Restore { reason, .. } => Some(*reason),
-            _ => None,
-        }
+        Some(self.agent.audience)
     }
 
     fn output_mode(&self) -> ToolOutputMode {
-        match &self.caps {
-            Caps::Handler { agent } => agent.output_mode,
-            Caps::Start { output_mode, .. } => *output_mode,
-            Caps::Restore { .. } => ToolOutputMode::Compact,
-        }
+        self.agent.output_mode
     }
 
     fn task_id(&self) -> &str {
         self.task_id.as_deref().unwrap_or(MAIN_TASK_ID)
     }
 
+    /// `None` outside a model call and its nested calls, where nothing
+    /// streams.
+    fn progress(&self) -> Option<&ProgressScope> {
+        self.agent()?.progress.as_ref()
+    }
+
+    /// A call runs in its session's working directory, with the agent's
+    /// home. A restore draws a call for the UI, which knows the session it
+    /// belongs to.
+    fn place(&self) -> Option<SessionPlace> {
+        let cwd = &*self.agent.working_dir;
+        Some(SessionPlace {
+            cwd: cwd.to_path_buf(),
+            home: HOME.clone(),
+        })
+    }
+
     fn state(&self) -> Option<&serde_json::Value> {
-        match &self.caps {
-            Caps::Restore { state, .. } => state.as_ref(),
-            _ => None,
-        }
+        None
     }
 
     fn kind(&self) -> &'static str {
-        match self.caps {
-            Caps::Handler { .. } => "handler",
-            Caps::Start { .. } => "start",
-            Caps::Restore { .. } => "restore",
-        }
+        "handler"
     }
 
     pub(crate) fn cap_err(&self, method: &str) -> String {
@@ -358,25 +290,6 @@ impl UserData for LuaCtx {
 
         methods.add_method("task_id", |_, this, ()| Ok(this.task_id().to_owned()));
 
-        methods.add_method("tool_use_id", |_, this, ()| {
-            Ok(this.agent().and_then(|agent| agent.tool_use_id.clone()))
-        });
-
-        methods.add_method("restore_reason", |_, this, ()| {
-            let Some(reason) = this.restore_reason() else {
-                return Ok(this.cap_err_pair("restore_reason"));
-            };
-            Ok((Some(<&str>::from(reason)), None))
-        });
-
-        methods.add_method("live_buf", |lua, this, buf: mlua::AnyUserData| {
-            if matches!(this.caps, Caps::Restore { .. }) {
-                return Ok(this.cap_err_pair("live_buf"));
-            }
-            send_live_buf(lua, &buf)?;
-            Ok((Some(true), None))
-        });
-
         methods.add_method("config", |lua, this, args: MultiValue| {
             let Some(config) = this.config() else {
                 return Ok(this.cap_err_pair("config"));
@@ -405,9 +318,22 @@ impl UserData for LuaCtx {
             lua.to_value(&this.tool_output_lines)
         });
 
+        // The session's directories, for shortening paths as the session
+        // sees them: `{ cwd, home }`, `home` nil when unknown, or nil for a
+        // restore the UI gave no place.
+        methods.add_method("place", |lua, this, ()| {
+            this.place()
+                .map(|place| place_to_lua(lua, &place))
+                .transpose()
+        });
+
         methods.add_method("state", |lua, this, ()| match this.state() {
             Some(v) => json_to_lua(lua, v),
             None => Ok(LuaValue::Nil),
+        });
+
+        methods.add_method("tool_use_id", |_, this, ()| {
+            Ok(this.agent.tool_use_id.clone())
         });
 
         methods.add_method(
@@ -422,18 +348,30 @@ impl UserData for LuaCtx {
                 let handle = active_task(lua);
                 {
                     let cell = lock_cell(&handle);
-                    if !cell.call.as_ref().is_some_and(|own| Arc::ptr_eq(own, call)) {
+                    if !cell
+                        .exts
+                        .get::<AgentTask>()
+                        .and_then(|task| task.call.as_ref())
+                        .is_some_and(|own| Arc::ptr_eq(own, call))
+                    {
                         return Ok(err_pair(NOT_A_MODEL_CALL_MSG));
                     }
-                    if cell.background_hook.is_some() {
+                    if cell
+                        .exts
+                        .get::<AgentTask>()
+                        .is_some_and(|task| task.background_hook.is_some())
+                    {
                         return Err(mlua::Error::runtime(BACKGROUND_HOOK_ALREADY_SET_MSG));
                     }
                 }
                 // Made outside the lock: allocating can run the GC, and a
                 // finalizer may want the same cell.
                 let key = lua.create_registry_value(hook)?;
-                lock_cell(&handle).background_hook = Some(key);
-                announce_movable(&handle, agent, true);
+                lock_cell(&handle)
+                    .exts
+                    .get_or_insert_with(AgentTask::default)
+                    .background_hook = Some(key);
+                announce_movable(agent, true);
                 Ok((Some(true), None))
             },
         );
@@ -445,10 +383,14 @@ impl UserData for LuaCtx {
                 return Ok(this.cap_err_pair("set_movable"));
             };
             let handle = active_task(lua);
-            if lock_cell(&handle).background_hook.is_none() {
+            if lock_cell(&handle)
+                .exts
+                .get::<AgentTask>()
+                .is_none_or(|task| task.background_hook.is_none())
+            {
                 return Ok(err_pair(NO_BACKGROUND_HOOK_MSG));
             }
-            announce_movable(&handle, agent, movable);
+            announce_movable(agent, movable);
             Ok((Some(true), None))
         });
 
@@ -471,14 +413,11 @@ impl UserData for LuaCtx {
                         status: lua
                             .from_value(part.get::<LuaValue>("status")?)
                             .map_err(|_| mlua::Error::runtime(PART_STATUS_ERR))?,
-                        body: part
-                            .opt::<AnyUserData>("body")?
-                            .map(|body| body.borrow::<BufHandle>().map(|h| Arc::clone(&h.buf)))
-                            .transpose()?,
+                        body: None,
                     })
                 })
                 .collect::<mlua::Result<Vec<_>>>()?;
-            let _ = agent.event_tx.send(AgentEvent::ToolParts { id, parts });
+            agent.send_event(AgentEvent::ToolParts { id, parts });
             Ok((Some(true), None))
         });
 
@@ -524,10 +463,7 @@ impl UserData for LuaCtx {
 
         methods.add_method(
             "set_deadline",
-            |lua, this, (secs, opts): (u64, Option<Table>)| {
-                if !matches!(this.caps, Caps::Handler { .. }) {
-                    return Ok(this.cap_err_pair("set_deadline"));
-                }
+            |lua, _this, (secs, opts): (u64, Option<Table>)| {
                 let expire = DeadlineExpire::parse(opts.as_ref())?;
                 let handle = active_task(lua);
                 let cell = lock_cell(&handle);
@@ -535,16 +471,40 @@ impl UserData for LuaCtx {
                     return Err(mlua::Error::runtime(DEADLINE_ALREADY_SET_MSG));
                 }
                 // Only a model call can move, anything else just times out.
-                if cell.call.is_some() {
-                    cell.deadline_expire.set(expire);
+                if let Some(task) = cell.exts.get::<AgentTask>()
+                    && task.call.is_some()
+                {
+                    task.deadline_expire.set(expire);
                 }
                 cell.deadline_secs.set(Some(secs));
                 cell.deadline
                     .set(Some(Instant::now() + Duration::from_secs(secs)));
                 cell.deadline_changed.notify(usize::MAX);
-                Ok((Some(true), None))
+                Ok((Some(true), None::<String>))
             },
         );
+
+        methods.add_method("stream", |_, this, text: LuaValue| {
+            let LuaValue::String(text) = text else {
+                return Err(mlua::Error::runtime(format!(
+                    "{STREAM_NOT_STRING_MSG}, got {}",
+                    text.type_name()
+                )));
+            };
+            if let Some(scope) = this.progress() {
+                scope.stream(&text.to_str()?);
+            }
+            Ok(())
+        });
+
+        methods.add_method("set_state", |lua, this, value: LuaValue| {
+            let state = lua_to_json(lua, &value)
+                .map_err(|e| mlua::Error::runtime(format!("{SET_STATE_CONTEXT}: {e}")))?;
+            if let Some(scope) = this.progress() {
+                scope.set_state(state);
+            }
+            Ok(())
+        });
 
         // The matching check before a write is not exposed: the dispatcher
         // runs it under the file lock for every tool declaring `mutable_path`,
@@ -555,8 +515,8 @@ impl UserData for LuaCtx {
             };
             agent
                 .file_access
-                .record_read(&FileKey::new(Path::new(&path)));
-            Ok((Some(true), None))
+                .record_read(&FileKey::new(&agent.resolve_path(Path::new(&path))));
+            Ok((Some(true), None::<String>))
         });
 
         // A plugin that changes the disk itself has no tool call to hang a
@@ -577,6 +537,7 @@ impl UserData for LuaCtx {
                 let Some(agent) = this.agent() else {
                     return Ok(this.cap_err_pair("load_instructions"));
                 };
+                let cwd = Arc::clone(&agent.working_dir);
                 let loaded = agent.loaded_instructions.clone();
                 let call = agent.call_instructions.clone();
                 let files = Arc::clone(&agent.instruction_files);
@@ -584,15 +545,14 @@ impl UserData for LuaCtx {
                 // hook firing meanwhile needs `ctx:finish`, which takes it
                 // mutably.
                 drop(this);
-                let blocks = spawn_blocking(move || {
-                    let cwd = std::env::current_dir().unwrap_or_default();
+                let blocks = tokio::task::spawn_blocking(move || {
                     let abs = resolve_abs_with_cwd(dir_path, &cwd);
                     maki_agent::find_subdirectory_instructions(&abs, &cwd, &loaded, &files)
                 })
                 .await
                 .map_err(mlua::Error::external)?;
                 call.record(blocks);
-                Ok((Some(true), None))
+                Ok((Some(true), None::<String>))
             },
         );
 
@@ -603,21 +563,25 @@ impl UserData for LuaCtx {
         });
 
         methods.add_method_mut("finish", |lua, this, val: LuaValue| {
-            if !matches!(this.caps, Caps::Handler { .. }) {
-                return Ok(this.cap_err_pair("finish"));
-            }
             let tx = this
                 .finish_tx
                 .take()
                 .ok_or_else(|| mlua::Error::runtime("ctx:finish() already called"))?;
 
-            if let Some(buf) = crate::api::ui::buf::buf_from_reply(&val) {
-                lock_cell(&active_task(lua)).root_buf = Some(buf);
-            }
             let _ = tx.send(ToolCallReply::from_lua_value(lua, &val));
-            Ok((Some(true), None))
+            Ok((Some(true), None::<String>))
         });
     }
+}
+
+fn place_to_lua(lua: &Lua, place: &SessionPlace) -> LuaResult<mlua::Table> {
+    let table = lua.create_table()?;
+    table.set(CWD_KEY, place.cwd.display().to_string())?;
+    table.set(
+        HOME_KEY,
+        place.home.as_ref().map(|home| home.display().to_string()),
+    )?;
+    Ok(table)
 }
 
 fn resolve_abs_with_cwd(path: String, cwd: &Path) -> PathBuf {
@@ -635,19 +599,15 @@ mod tests {
     use maki_agent::tools::test_support::stub_ctx_with;
     use maki_agent::tools::{LocalTool, ToolAudience};
     use maki_agent::{AgentMode, InstructionBlock};
-    use mlua::Lua;
     use test_case::test_case;
 
     use super::*;
-    use crate::runtime::test_support::call_scope;
-    use crate::runtime::{TaskCell, TaskScope};
 
     const TOOL_USE_ID: &str = "tu-1";
     const INSTRUCTION_PATH: &str = "/tmp/nested/AGENTS.md";
     const LOCAL_TOOL_NAME: &str = "sess_tool";
     /// Arbitrary ids are rejected: `SessionRef` parses base58 or a uuid.
     const SESSION_ID: &str = "01965087-4c71-7f00-8000-000000000000";
-    const SUBAGENT_TASK_ID: &str = "toolu_task";
 
     fn session_ref() -> SessionRef {
         SESSION_ID.parse().expect("valid session id")
@@ -727,81 +687,76 @@ mod tests {
         );
     }
 
-    fn restore_ctx(ctx: &ToolContext) -> RestoreCtx {
-        RestoreCtx {
-            session_id: ctx.session_id.clone(),
-            task_id: ctx.task_id.clone(),
-            ..RestoreCtx::default()
-        }
+    const CTX_GLOBAL: &str = "ctx";
+    const STREAM_TEXT: &str = "chunk";
+    const BAD_STREAM_ARGS: &str = "ctx:stream(42)";
+    const MISSING_STREAM_ARG: &str = "ctx:stream()";
+    const UNCONVERTIBLE_STATE: &str = "ctx:set_state({ f = print })";
+    const STATE_FIELD: &str = "n";
+    const STATE_VALUE: u64 = 1;
+
+    fn valid_calls() -> String {
+        format!(r#"ctx:stream("{STREAM_TEXT}") ctx:set_state({{ {STATE_FIELD} = {STATE_VALUE} }})"#)
     }
 
-    /// Restore has no `ToolContext`, so its session comes stamped on the item.
-    #[test]
-    fn session_id_reaches_every_ctx_kind() {
-        let ctx = populated_ctx();
-        for lua_ctx in [
-            LuaCtx::handler(&ctx),
-            LuaCtx::start(&ctx),
-            LuaCtx::restore(restore_ctx(&ctx)),
-        ] {
-            assert_eq!(
-                lua_ctx.session_id,
-                Some(session_ref()),
-                "{}",
-                lua_ctx.kind()
-            );
-        }
+    fn run_on(lua_ctx: LuaCtx, chunk: &str) -> mlua::Result<()> {
+        let lua = mlua::Lua::new();
+        lua.globals().set(CTX_GLOBAL, lua_ctx)?;
+        lua.load(chunk).exec()
     }
 
-    #[test_case(None, MAIN_TASK_ID ; "session_owner")]
-    #[test_case(Some(SUBAGENT_TASK_ID), SUBAGENT_TASK_ID ; "subagent")]
-    fn task_id_reaches_every_ctx_kind(task_id: Option<&str>, expected: &str) {
+    #[test_case(BAD_STREAM_ARGS,     STREAM_NOT_STRING_MSG ; "stream_number")]
+    #[test_case(MISSING_STREAM_ARG,  STREAM_NOT_STRING_MSG ; "stream_nil")]
+    #[test_case(UNCONVERTIBLE_STATE, SET_STATE_CONTEXT     ; "state_with_a_function")]
+    fn stream_api_raises_on_bad_args(chunk: &str, expected: &str) {
         let mut ctx = populated_ctx();
-        ctx.task_id = task_id.map(Arc::from);
-        assert_eq!(LuaCtx::handler(&ctx).task_id(), expected);
-        assert_eq!(LuaCtx::start(&ctx).task_id(), expected);
-        assert_eq!(LuaCtx::restore(restore_ctx(&ctx)).task_id(), expected);
+        ctx.progress = Some(ProgressScope::default());
+        let err = run_on(LuaCtx::handler(&ctx), chunk).unwrap_err();
+        assert!(err.to_string().contains(expected), "{err}");
     }
 
-    #[test]
-    fn a_second_on_background_raises() {
-        let lua = Lua::new();
-        let (call, _run, _) = call_scope(false);
+    /// A nested call streams under its own path, numbered in the order its
+    /// parent dispatched it.
+    #[test_case(0, &[]     ; "model_call")]
+    #[test_case(1, &[0]    ; "first_child")]
+    #[test_case(2, &[0, 0] ; "grandchild")]
+    fn stream_api_fills_the_scope_of_the_call(depth: usize, path: &[u32]) {
         let mut ctx = populated_ctx();
-        ctx.call = Some(Arc::clone(&call));
-        let mut cell = TaskCell::new(call.cancel().clone(), None, None);
-        cell.call = Some(call);
-        let scope = TaskScope::new(&lua, cell);
-        let _active = scope.enter();
-        let handler = lua.create_userdata(LuaCtx::handler(&ctx)).unwrap();
-
-        let (ok, err): (bool, String) = lua
-            .load(
-                r#"
-                local ctx = ...
-                local hook = function() end
-                ctx:on_background(hook)
-                local ok, err = pcall(ctx.on_background, ctx, hook)
-                return ok, tostring(err)
-                "#,
-            )
-            .call(handler)
-            .unwrap();
-
-        assert!(!ok);
-        assert!(err.contains(BACKGROUND_HOOK_ALREADY_SET_MSG), "{err}");
-    }
-
-    /// A plain-table ctx that names no reason must read as a rerender: side
-    /// effects on load are opt-in, never the fallback.
-    #[test]
-    fn restore_reason_defaults_to_rerender_and_is_restore_only() {
-        let ctx = populated_ctx();
+        let root = ProgressScope::default();
+        ctx.progress = Some(root.clone());
+        for _ in 0..depth {
+            let agent = AgentContext::from(&ctx);
+            ctx = ToolContext {
+                progress: agent.child_progress(),
+                ..agent.to_tool_context()
+            };
+        }
+        run_on(LuaCtx::handler(&ctx), &valid_calls()).unwrap();
+        let taken = root.take();
+        assert_eq!(taken.len(), 1, "{taken:?}");
+        assert_eq!(taken[0].path, path);
+        assert_eq!(taken[0].append, STREAM_TEXT);
         assert_eq!(
-            LuaCtx::restore(RestoreCtx::default()).restore_reason(),
-            Some(RestoreReason::Rerender)
+            taken[0].state,
+            Some(serde_json::json!({ STATE_FIELD: STATE_VALUE }))
         );
-        assert_eq!(LuaCtx::handler(&ctx).restore_reason(), None);
-        assert_eq!(LuaCtx::start(&ctx).restore_reason(), None);
+    }
+
+    #[test]
+    fn sibling_children_take_the_next_index() {
+        let mut ctx = populated_ctx();
+        let root = ProgressScope::default();
+        ctx.progress = Some(root.clone());
+        let agent = AgentContext::from(&ctx);
+        for _ in 0..2 {
+            let child = agent.child_progress().expect("a child scope");
+            child.stream(STREAM_TEXT);
+        }
+        let paths: Vec<_> = root.take().into_iter().map(|p| p.path).collect();
+        assert_eq!(paths, [vec![0], vec![1]]);
+        assert!(
+            agent.to_tool_context().progress.is_none(),
+            "only a dispatched child gets a scope"
+        );
     }
 }

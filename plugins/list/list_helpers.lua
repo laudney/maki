@@ -2,8 +2,6 @@ local dir_listing = require("maki.dir_listing")
 
 local M = {}
 
--- Pure result building; init.lua attaches the body view, which needs a task scope.
-
 function M.handler(input, ctx)
   local raw = input.path
   if not raw then

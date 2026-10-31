@@ -1,5 +1,5 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use maki_lua::PackPlan;
+use maki_lua_core::pack::PackPlan;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::Line;
@@ -7,8 +7,7 @@ use ratatui::widgets::{Paragraph, Wrap};
 
 use crate::components::Overlay;
 use crate::components::form::render_form;
-use crate::components::hint_line;
-use crate::components::is_ctrl;
+use crate::components::{hint_line, is_ctrl};
 use crate::theme;
 
 const REVIEW_HINTS: &[(&str, &str)] = &[("Enter / y", "Apply"), ("Esc / n", "Decline")];

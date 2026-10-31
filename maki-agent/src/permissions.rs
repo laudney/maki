@@ -8,6 +8,7 @@ use maki_config::{
     ProjectConfig, ToolKey, append_permission_rule,
 };
 use maki_storage::id::SessionRef;
+use maki_storage::sessions::{StoredEffect, StoredRule};
 use thiserror::Error;
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::{info, warn};
@@ -654,6 +655,12 @@ impl PermissionManager {
             .store(stored.is_some(), Ordering::Relaxed);
     }
 
+    /// The session's working directory, which the builtin rules are rooted
+    /// at: the `cwd` of an ACP `session/new`, the TUI's session directory.
+    pub fn working_dir(&self) -> &Path {
+        &self.cwd
+    }
+
     pub fn is_yolo(&self) -> bool {
         self.yolo.load(Ordering::Relaxed)
     }
@@ -686,10 +693,6 @@ impl PermissionManager {
 
     pub fn load_session_rules(&self, rules: Vec<PermissionRule>) {
         *self.session_rules() = rules;
-    }
-
-    pub fn project_is_trusted(&self) -> bool {
-        self.project_config.is_trusted()
     }
 
     /// Where an always-answer gets written, or `None` when it only holds for
@@ -911,6 +914,7 @@ impl PermissionManager {
             tool: t2.clone(),
             scopes: s2.clone(),
             reason: ask.map(str::to_owned),
+            choices: Vec::new(),
         });
         // Only the answer naming this ask may be applied. Anything else is a
         // leftover from a cancelled or reassigned ask, so it is dropped and the
@@ -1161,6 +1165,55 @@ fn write_rule_dir(scope: &str) -> PathBuf {
         }
         _ => landing_dir.to_path_buf(),
     }
+}
+
+fn migrate_stored_tool_key(s: &str) -> Option<maki_config::ToolKey> {
+    // Pre-PR1 format: "mcp:server__tool" — rewrite to new format and parse.
+    if let Some(rest) = s.strip_prefix("mcp:")
+        && let Some((server, tool)) = rest.split_once("__")
+    {
+        let new_form = format!("{server}.{tool}");
+        return maki_config::ToolKey::parse(&new_form)
+            .map_err(|e| tracing::warn!(key = s, error = %e, "malformed stored tool key: skipping"))
+            .ok();
+    }
+    match maki_config::ToolKey::parse(s) {
+        Ok(key) => Some(key),
+        Err(e) => {
+            tracing::error!(key = s, error = %e, "malformed stored tool key: rule DROPPED; a deny rule may have been lost");
+            None
+        }
+    }
+}
+
+pub(crate) fn stored_to_rules(stored: &[StoredRule]) -> Vec<maki_config::PermissionRule> {
+    stored
+        .iter()
+        .filter_map(|r| {
+            let tool = match migrate_stored_tool_key(&r.tool) {
+                Some(t) => t,
+                None => {
+                    if matches!(r.effect, StoredEffect::Deny) {
+                        tracing::error!(
+                            key = %r.tool,
+                            "SECURITY: stored DENY rule dropped: tool may now be accessible. \
+                             Re-add this rule manually in permissions.toml"
+                        );
+                    }
+                    return None;
+                }
+            };
+            let effect = match r.effect {
+                StoredEffect::Allow => Effect::Allow,
+                StoredEffect::Deny => Effect::Deny,
+            };
+            Some(maki_config::PermissionRule {
+                tool,
+                scope: r.scope.clone(),
+                effect,
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]

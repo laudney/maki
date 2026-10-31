@@ -24,6 +24,7 @@ use maki_config::{
 };
 use maki_lua::test_support::runtime;
 use maki_lua::{PluginHost, set_allowed_private_hosts};
+
 use serde_json::{Value, json};
 
 const TOOLS: &[&str] = &[

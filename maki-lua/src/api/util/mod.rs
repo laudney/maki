@@ -1,6 +1,3 @@
-pub(crate) mod command;
-pub(crate) mod convert;
 pub(crate) mod ctx;
-pub(crate) mod dispatch;
-pub(crate) mod pair;
-pub(crate) mod setup;
+
+pub(crate) use maki_lua_core::api::util::{call, convert, dispatch, pair};

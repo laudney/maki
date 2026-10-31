@@ -16,32 +16,33 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
+crossterm = { workspace = true }
+maki-acp = { workspace = true }
+maki-wire = { workspace = true }
+agent-client-protocol-schema = { workspace = true }
 maki-ui = { workspace = true }
 maki-agent = { workspace = true }
-maki-acp = { workspace = true }
+maki-host = { workspace = true }
 maki-config = { workspace = true }
 maki-providers = { workspace = true }
 maki-storage = { workspace = true }
 maki-lua = { workspace = true }
+maki-lua-ui = { workspace = true }
 maki-otel = { workspace = true }
 clap = { workspace = true }
 color-eyre = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
 tokio = { workspace = true }
-futures = { workspace = true }
 tempfile = { workspace = true }
 reqwest = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
 flume = { workspace = true }
-open = { workspace = true }
 unicode-width = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
-libc = { workspace = true }
 rustix = { workspace = true }
 
 [dev-dependencies]
@@ -56,8 +57,11 @@ members = [
   "maki-config-macro",
   "maki-docgen",
   "maki-highlight",
+  "maki-host",
   "maki-interpreter",
   "maki-lua",
+  "maki-lua-core",
+  "maki-lua-ui",
   "maki-lua-macro",
   "maki-markdown",
   "maki-otel",
@@ -81,6 +85,7 @@ rust-version = "1.99"
 [workspace.lints.clippy]
 
 [workspace.dependencies]
+maki = { path = "." }
 maki-agent = { path = "maki-agent" }
 maki-acp = { path = "maki-acp" }
 maki-config = { path = "maki-config" }
@@ -91,9 +96,12 @@ maki-types = { path = "maki-types" }
 maki-ui = { path = "maki-ui" }
 maki-wire = { path = "maki-wire" }
 maki-lua = { path = "maki-lua" }
+maki-lua-core = { path = "maki-lua-core" }
+maki-lua-ui = { path = "maki-lua-ui" }
 maki-config-macro = { path = "maki-config-macro" }
 maki-lua-macro = { path = "maki-lua-macro" }
 maki-highlight = { path = "maki-highlight" }
+maki-host = { path = "maki-host" }
 maki-markdown = { path = "maki-markdown" }
 maki-otel = { path = "maki-otel" }
 maki-pack = { path = "maki-pack" }
@@ -146,8 +154,8 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"
 arc-swap = "1"
 bitflags = "2"
 event-listener = "5"
-tokio-tungstenite = { version = "0.29", features = ["rustls-tls-native-roots"] }
 futures-lite = "2"
+tokio-tungstenite = { version = "0.29", features = ["rustls-tls-native-roots"] }
 futures = "0.3"
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 rmcp = { version = "3", default-features = false, features = ["client", "auth", "reqwest", "transport-async-rw", "transport-streamable-http-client-reqwest"] }

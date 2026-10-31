@@ -1,85 +1,32 @@
-//! Messages queued for a subagent while it runs, typed in its tab or sent by
-//! a plugin. The host pushes, the subagent's loop drains them between turns,
-//! each as its own message in one burst.
+//! The subagent's loop drains its inbox between turns as one
+//! `<user-interrupt>`.
 
-use std::collections::VecDeque;
-use std::fmt;
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::future;
 
-use event_listener::Event;
+use maki_providers::provider::BoxFuture;
+pub use maki_types::inbox::SubagentInbox;
 
-use crate::{AgentInput, ExtractedCommand, InterruptSource};
-
-#[derive(Default)]
-pub struct SubagentInbox {
-    items: Mutex<VecDeque<AgentInput>>,
-    pushed: Event,
-}
-
-impl SubagentInbox {
-    pub fn push(&self, input: AgentInput) {
-        self.lock().push_back(input);
-        self.pushed.notify(usize::MAX);
-    }
-
-    /// Resolves once something is queued, for a session idle between runs.
-    pub async fn wait_nonempty(&self) {
-        loop {
-            let listener = self.pushed.listen();
-            if !self.is_empty() {
-                return;
-            }
-            listener.await;
-        }
-    }
-
-    pub fn remove(&self, index: usize) -> Option<AgentInput> {
-        self.lock().remove(index)
-    }
-
-    pub fn len(&self) -> usize {
-        self.lock().len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.lock().is_empty()
-    }
-
-    pub fn drain(&self) -> Vec<AgentInput> {
-        self.lock().drain(..).collect()
-    }
-
-    pub fn texts(&self) -> Vec<String> {
-        self.lock()
-            .iter()
-            .map(|input| input.message.clone())
-            .collect()
-    }
-
-    fn lock(&self) -> MutexGuard<'_, VecDeque<AgentInput>> {
-        self.items.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-}
+use crate::{AgentMode, CancelToken, ExtractedCommand, InterruptSource};
 
 impl InterruptSource for SubagentInbox {
-    fn poll(&self) -> Option<ExtractedCommand> {
-        let inputs = self.drain();
-        (!inputs.is_empty()).then_some(ExtractedCommand::Interrupt(inputs))
-    }
-}
-
-impl fmt::Debug for SubagentInbox {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("SubagentInbox")
-            .field("len", &self.len())
-            .finish()
+    /// The cancel is checked under the lock, so a cancelled run leaves what
+    /// came after it for the next one.
+    fn poll<'a>(
+        &'a self,
+        cancel: &'a CancelToken,
+        _: &'a AgentMode,
+    ) -> BoxFuture<'a, Option<ExtractedCommand>> {
+        let drained = self
+            .drain_unless_cancelled(cancel)
+            .map(ExtractedCommand::Interrupt);
+        Box::pin(future::ready(drained))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{AgentMode, InputSource};
+    use crate::{AgentInput, AgentMode, InputSource};
     use maki_providers::ThinkingConfig;
 
     fn input(message: &str) -> AgentInput {
@@ -97,30 +44,35 @@ mod tests {
         }
     }
 
+    fn poll_now(queue: &SubagentInbox) -> Option<ExtractedCommand> {
+        crate::test_block_on(queue.poll(&CancelToken::none(), &AgentMode::Build))
+    }
+
+    #[test]
+    fn a_cancelled_poll_leaves_the_burst() {
+        let queue = SubagentInbox::default();
+        queue.push(input("a"));
+        let (trigger, cancel) = CancelToken::new();
+        trigger.cancel();
+
+        assert!(crate::test_block_on(queue.poll(&cancel, &AgentMode::Build)).is_none());
+        assert_eq!(queue.texts(), ["a"]);
+    }
+
     #[test]
     fn poll_drains_the_burst_in_order_and_empties_the_queue() {
         let queue = SubagentInbox::default();
-        assert!(queue.poll().is_none());
+        assert!(poll_now(&queue).is_none());
         queue.push(input("a"));
         queue.push(input("b"));
         assert_eq!(queue.texts(), ["a", "b"]);
 
-        let Some(ExtractedCommand::Interrupt(inputs)) = queue.poll() else {
+        let Some(ExtractedCommand::Interrupt(inputs)) = poll_now(&queue) else {
             panic!("a non-empty queue polls as one interrupt");
         };
         let texts: Vec<_> = inputs.into_iter().map(|i| i.message).collect();
         assert_eq!(texts, ["a", "b"]);
         assert!(queue.is_empty());
-        assert!(queue.poll().is_none());
-    }
-
-    #[test]
-    fn remove_takes_one_entry_by_position() {
-        let queue = SubagentInbox::default();
-        queue.push(input("a"));
-        queue.push(input("b"));
-        assert_eq!(queue.remove(0).map(|i| i.message).as_deref(), Some("a"));
-        assert_eq!(queue.texts(), ["b"]);
-        assert!(queue.remove(5).is_none());
+        assert!(poll_now(&queue).is_none());
     }
 }

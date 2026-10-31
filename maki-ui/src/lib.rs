@@ -25,7 +25,6 @@ mod render_worker;
 pub mod repaint;
 mod selection;
 pub mod splash;
-mod storage_writer;
 mod text_buffer;
 mod theme;
 mod trust_card;
@@ -35,24 +34,28 @@ pub mod update;
 pub mod wrap;
 
 mod agent;
+pub use agent::{BUILD_MODE, LoginInvocation, PLAN_MODE, RemoteAgent, RemoteInput, RemoteSettings};
 mod event_loop;
 mod input;
+mod lua_handle;
+pub use lua_handle::EventHandle;
+mod remote_start;
+pub use remote_start::ClientProject;
 mod terminal;
 mod terminal_image;
 
 use std::time::Instant;
 
 use color_eyre::Result;
-use maki_agent::SessionMailbox;
-use maki_agent::session::{StoreError, save_new};
-use maki_lua::PackPlan;
+use maki_lua_core::pack::PackPlan;
 use maki_storage::StateDir;
 use maki_storage::id::MakiId;
 use maki_storage::sessions::{SAVE_FAILED, SessionClaim, SessionError};
+use maki_wire::plugins::PluginOperation;
 
 /// The tabs keep their own name, but the type is the same one the drivers
 /// persist, by construction rather than by coincidence.
-pub use maki_agent::session::StoredSession as AppSession;
+pub use maki_types::session::StoredSession as AppSession;
 
 /// A session a tab has open, with the right to write it. Kept as one value so a
 /// tab never gets a session without its claim, and the claim follows the
@@ -74,12 +77,6 @@ impl OpenSession {
         let (session, claim) = AppSession::claim_and_load(id, storage)?;
         Ok(Self { session, claim })
     }
-
-    /// For a session no tab opens. The write lands before this returns, so a
-    /// caller told the id already finds it in a listing.
-    pub(crate) fn store(self, storage: &StateDir) -> Result<MakiId, StoreError> {
-        save_new(self.session, &self.claim, storage)
-    }
 }
 
 #[cfg(test)]
@@ -98,12 +95,11 @@ pub fn terminal_width() -> Option<u16> {
     crossterm::terminal::size().ok().map(|(w, _)| w)
 }
 
-pub use event_loop::EventLoopParams;
+pub use event_loop::{AgentFactory, EventLoopParams};
 
 /// How a UI generation ended. On `Reload`, each tab carries its in-memory
 /// session so the caller reopens everything without re-reading from disk, and
-/// its claim, so no other process can take the session while the UI rebuilds,
-/// and their mailboxes, which go back in as `EventLoopParams::handed_over`.
+/// its claim, so no other process can take the session while the UI rebuilds.
 pub enum RunOutcome {
     Exit {
         session_id: Option<MakiId>,
@@ -112,8 +108,8 @@ pub enum RunOutcome {
     Reload {
         tabs: Vec<OpenSession>,
         focused: usize,
-        pack: Option<PackPlan>,
-        mailboxes: Vec<SessionMailbox>,
+        pack: Option<Box<PackPlan>>,
+        plugins: PluginOperation,
     },
 }
 
@@ -126,29 +122,35 @@ pub fn run(params: EventLoopParams, initial_prompt: Option<String>) -> Result<Ru
     };
     // Nothing is going to ask for a file list after the last frame, and a walk
     // of a large tree has no business burning cores through teardown.
-    maki_agent::cancel_walks();
+    maki_storage::file_index::cancel_walks();
     let event_loop::ShutdownReport {
         exit,
         tabs,
         focused,
         unsaved,
-        mailboxes,
     } = report;
     for id in unsaved {
         eprintln!("{SAVE_FAILED}{id}");
     }
     Ok(match exit {
-        components::ExitRequest::Reload => RunOutcome::Reload {
+        components::ExitRequest::Reload
+        | components::ExitRequest::Plugins(PluginOperation::Reload) => RunOutcome::Reload {
             tabs,
             focused,
             pack: None,
-            mailboxes,
+            plugins: PluginOperation::Reload,
+        },
+        components::ExitRequest::Plugins(plugins) => RunOutcome::Reload {
+            tabs,
+            focused,
+            pack: None,
+            plugins,
         },
         components::ExitRequest::Pack(request) => RunOutcome::Reload {
             tabs,
             focused,
-            pack: Some(request),
-            mailboxes,
+            pack: Some(Box::new(request)),
+            plugins: PluginOperation::Reload,
         },
         exit => {
             let session_id = tabs
@@ -167,4 +169,23 @@ pub fn run(params: EventLoopParams, initial_prompt: Option<String>) -> Result<Ru
             }
         }
     })
+}
+
+pub use components::login_picker::{LoginCatalog, LoginProvider};
+
+#[cfg(test)]
+fn test_runtime() -> &'static tokio::runtime::Runtime {
+    static RUNTIME: std::sync::LazyLock<tokio::runtime::Runtime> = std::sync::LazyLock::new(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("test runtime")
+    });
+    &RUNTIME
+}
+
+#[cfg(test)]
+fn test_block_on<F: std::future::Future>(future: F) -> F::Output {
+    test_runtime().block_on(future)
 }

@@ -9,6 +9,8 @@ use maki_agent::tools::{all_builtin_tool_names, is_builtin_tool};
 
 use crate::print::OutputFormat;
 
+pub use maki_host::{AcpArgs, HostFlags};
+
 const DEFAULT_BACKGROUND_TIMEOUT_SECS: u64 = 600;
 /// A week. The deadline is an `Instant`, which panics on overflow.
 const MAX_BACKGROUND_TIMEOUT_SECS: u64 = 7 * 24 * 60 * 60;
@@ -79,27 +81,12 @@ pub struct Cli {
     #[arg(long)]
     pub no_commands: bool,
 
-    /// Skip user `init.lua` files (global and project) but keep the Lua
-    /// host and every builtin plugin running, so tools and the default
-    /// keymap still load. Use this to recover from a broken `init.lua`
-    /// or keymap override. Only Lua `init.lua` files are affected;
-    /// `permissions.toml`, custom commands, and env files load as usual.
-    #[arg(long)]
-    pub no_plugins: bool,
-
-    /// Run plugin Lua on the interpreter with full debug info (no native codegen)
-    #[arg(long)]
-    pub no_jit: bool,
-
     /// Skip all permission prompts (allow everything)
     #[arg(long, alias = "dangerously-skip-permissions")]
     pub yolo: bool,
 
-    /// Load shared project `.maki` config for this run without asking and
-    /// without recording an answer. For containers and CI, where the state
-    /// directory is thrown away anyway. Only use it on a project you trust.
-    #[arg(long)]
-    pub trust: bool,
+    #[command(flatten)]
+    pub host: HostFlags,
 
     /// Exit after the agent completes (for automation workflows)
     #[arg(long)]
@@ -277,14 +264,7 @@ pub enum Command {
     /// Rollback to the previous version
     Rollback,
     /// Run as an ACP (Agent Client Protocol) server over stdio
-    Acp {
-        /// Model spec (provider/model-id)
-        #[arg(short, long)]
-        model: Option<String>,
-        /// Skip all permission prompts
-        #[arg(long)]
-        yolo: bool,
-    },
+    Acp(AcpArgs),
     /// Show the rendered system prompt or tool definitions
     Prompt {
         /// Prompt variant: system (default), research, general
@@ -461,6 +441,7 @@ mod tests {
     #[test_case(&["--fork-session", "-c"], true ; "a fork of the latest")]
     #[test_case(&["--fork-session", "-r", SESSION_ID], true ; "a fork of a named session")]
     #[test_case(&["-c", "--session-id", SESSION_ID], true ; "a redirected continue")]
+    #[test_case(&["acp", "--login"], true ; "the terminal login of an acp agent")]
     fn session_flag_combinations(args: &[&str], accepted: bool) {
         let argv = std::iter::once("maki").chain(args.iter().copied());
 
@@ -489,5 +470,20 @@ mod tests {
         let too_long = (MAX_BACKGROUND_TIMEOUT_SECS + 1).to_string();
 
         assert!(Cli::try_parse_from(["maki", "-p", "--background-timeout", &too_long]).is_err());
+    }
+
+    /// `--yes` is a flag next to a positional path, so both orders have to land
+    /// in the same place.
+    #[test_case(&["trust", "add", "--yes", "/tmp"] ; "yes_before_path")]
+    #[test_case(&["trust", "add", "/tmp", "--yes"] ; "yes_after_path")]
+    fn trust_add_accepts_the_flag_on_either_side_of_the_path(args: &[&str]) {
+        let cli = Cli::try_parse_from(std::iter::once("maki").chain(args.iter().copied())).unwrap();
+
+        assert!(matches!(
+            cli.command,
+            Some(Command::Trust {
+                action: TrustAction::Add { yes: true, .. }
+            })
+        ));
     }
 }

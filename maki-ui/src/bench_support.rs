@@ -1,31 +1,30 @@
 //! A bench links this crate from outside, so the few private items it needs
 //! to build an `App` and drive its input get a public door here.
 
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use maki_agent::permissions::PermissionManager;
-use maki_agent::{McpConfigErrors, McpSnapshotReader, SnapshotSpan, SpanStyle};
-use maki_config::{ModelPolicy, PermissionsConfig, ProjectConfig, UiConfig};
-use maki_lua::{
-    EventHandle, HintReader, InputEdit, InputRule, InputRulesReader, KeymapReader,
-    LuaCommandReader, PatternRule, PluginPermissions, PluginReach, Reveal, SyntaxRule, TextEdit,
+use crate::EventHandle;
+use maki_config::UiConfig;
+use maki_lua_core::plugin_permissions::{PluginPermissions, PluginReach};
+use maki_lua_ui::{
+    HintReader, InputEdit, InputRule, InputRulesReader, KeymapReader, LuaCommandReader,
+    PatternRule, Reveal, SyntaxRule, TextEdit,
 };
-use maki_providers::{Model, ModelTier};
 use maki_storage::StateDir;
+use maki_types::mcp::McpSnapshotReader;
+use maki_types::snapshot::{SnapshotSpan, SpanStyle};
 use ratatui::layout::Rect;
 
 use crate::OpenSession;
 use crate::app::App;
 use crate::decor_worker;
-use crate::storage_writer::StorageWriter;
 use crate::text_buffer::{Decoration, Mark, RuleSet, VirtTextPos};
 
 const CWD: &str = "/tmp";
 const INPUT_HISTORY_SIZE: usize = 100;
 const PLUGIN: &str = "bench";
-const PROVIDER: &str = "anthropic";
+const MODEL: &str = "agent/model";
 const MARK_LEN: usize = 6;
 const KIND_EVERY: usize = 10;
 const GHOST: &str = "ghost";
@@ -53,33 +52,21 @@ const STRONG_CAPTURE: &str = "strong";
 /// building after the catalogue drops a model. {storage} should be a scratch
 /// dir, because the fresh session takes a claim in it.
 pub fn app(storage: StateDir) -> App {
-    let model = Model::from_tier(PROVIDER, ModelTier::Medium).expect("provider has a default");
-    let tab = OpenSession::fresh(&model.spec(), CWD, &storage);
-    let writer = Arc::new(StorageWriter::new(storage.clone(), flume::unbounded().0));
-    let permissions = Arc::new(PermissionManager::new(
-        PermissionsConfig::default(),
-        PathBuf::from(CWD),
-        ProjectConfig::discover(Path::new(CWD)),
-        Arc::default(),
-    ));
+    let tab = OpenSession::fresh(MODEL, CWD, &storage);
     App::new(
-        &model,
         tab,
         storage,
-        Arc::default(),
         McpSnapshotReader::empty(),
-        McpConfigErrors::new(PathBuf::new()),
         LuaCommandReader::empty(),
         KeymapReader::empty(),
         HintReader::empty(),
         InputRulesReader::empty(),
-        writer,
         UiConfig::default(),
         INPUT_HISTORY_SIZE,
-        permissions,
+        false,
         Arc::from([]),
         EventHandle::disconnected_for_test(),
-        Arc::new(ModelPolicy::default()),
+        None,
     )
 }
 

@@ -1,14 +1,20 @@
+use arc_swap::ArcSwap;
 use crossterm::event::KeyEvent;
+use maki_wire::session::SessionOperation;
 use ratatui::Frame;
 use ratatui::layout::Rect;
+use std::sync::Arc;
+use std::time::Duration;
 
-use maki_agent::{McpConfigErrors, McpServerInfo, McpServerStatus, McpSnapshot, McpSnapshotReader};
+use maki_types::mcp::{McpServerInfo, McpServerStatus, McpSnapshot, McpSnapshotReader};
 
+use crate::agent::RemoteSession;
 use crate::components::Overlay;
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
 use crate::repaint::{Cadence, Dirty, Watch};
 
 const TITLE: &str = " MCP Servers ";
+const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 fn build_entries(infos: &[McpServerInfo]) -> (Vec<McpEntry>, Vec<bool>) {
     let entries = infos
@@ -76,23 +82,57 @@ pub struct McpPicker {
     picker: ListPicker<McpEntry>,
     reader: McpSnapshotReader,
     servers: Watch<McpSnapshot>,
-    config_errors: McpConfigErrors,
+    poll: Option<tokio_util::task::AbortOnDropHandle<()>>,
 }
 
 impl McpPicker {
-    pub fn new(reader: McpSnapshotReader, config_errors: McpConfigErrors) -> Self {
+    pub fn new(reader: McpSnapshotReader) -> Self {
         Self {
             picker: ListPicker::new(),
             reader,
             servers: Watch::default(),
-            config_errors,
+            poll: None,
         }
+    }
+
+    pub(crate) fn set_remote(&mut self, remote: RemoteSession) -> McpSnapshotReader {
+        let snapshot = Arc::new(ArcSwap::from_pointee(McpSnapshot::default()));
+        self.reader = McpSnapshotReader::over(Arc::clone(&snapshot));
+        self.poll = Some(tokio_util::task::AbortOnDropHandle::new(tokio::spawn(
+            async move {
+                while let Some(session_id) = remote.session() {
+                    let Ok(value) = remote
+                        .client
+                        .session_operation(SessionOperation::Mcp {
+                            session_id: session_id.clone(),
+                            toggle: None,
+                        })
+                        .await
+                    else {
+                        break;
+                    };
+                    if remote.session().as_ref() != Some(&session_id) {
+                        break;
+                    }
+                    let Ok(next) = serde_json::from_value::<McpSnapshot>(value) else {
+                        break;
+                    };
+                    if snapshot.load().generation != next.generation
+                        || snapshot.load().infos.is_empty()
+                    {
+                        snapshot.store(Arc::new(next));
+                    }
+                    tokio::time::sleep(POLL_INTERVAL).await;
+                }
+            },
+        )));
+        self.reader.clone()
     }
 
     pub fn open(&mut self) {
         let _ = self.servers.poll(self.reader.load_full());
         let (entries, enabled) = self.entries();
-        let errors = (!self.config_errors.is_empty()).then(|| self.config_errors.to_string());
+        let errors = self.reader.load().config_error.clone();
         self.picker.set_error_text(errors);
         self.picker.open_toggleable(entries, enabled, TITLE);
     }
@@ -104,6 +144,8 @@ impl McpPicker {
         if self.servers.poll(self.reader.load_full()) == Dirty::NO {
             return Dirty::NO;
         }
+        self.picker
+            .set_error_text(self.reader.load().config_error.clone());
         let (entries, enabled) = self.entries();
         self.picker.replace_toggleable(entries, enabled);
         Dirty::YES
@@ -172,16 +214,17 @@ mod tests {
     use crate::components::key;
     use crate::components::keybindings::key as kb;
     use crossterm::event::{KeyCode, KeyEvent};
-    use maki_agent::{McpServerInfo, McpSnapshot};
+    use maki_types::mcp::{McpServerInfo, McpSnapshot};
     use std::path::PathBuf;
     use test_case::test_case;
 
     fn test_snapshot() -> McpSnapshotReader {
         McpSnapshotReader::from_snapshot(McpSnapshot {
+            config_error: None,
             infos: vec![
                 McpServerInfo {
                     name: "fs".into(),
-                    transport_kind: "stdio",
+                    transport_kind: "stdio".into(),
                     tool_count: 5,
                     prompt_count: 0,
                     status: McpServerStatus::Running,
@@ -192,7 +235,7 @@ mod tests {
                 },
                 McpServerInfo {
                     name: "github".into(),
-                    transport_kind: "stdio",
+                    transport_kind: "stdio".into(),
                     tool_count: 3,
                     prompt_count: 0,
                     status: McpServerStatus::Disabled,
@@ -210,7 +253,7 @@ mod tests {
 
     #[test]
     fn toggle_returns_server_name_and_new_state() {
-        let mut p = McpPicker::new(test_snapshot(), McpConfigErrors::new(PathBuf::new()));
+        let mut p = McpPicker::new(test_snapshot());
         p.open();
         let action = p.handle_key(key(KeyCode::Enter));
         assert!(matches!(
@@ -222,7 +265,7 @@ mod tests {
     #[test_case(key(KeyCode::Esc)       ; "esc_closes")]
     #[test_case(kb::QUIT.to_key_event() ; "ctrl_c_closes")]
     fn close_keys(cancel_key: KeyEvent) {
-        let mut p = McpPicker::new(test_snapshot(), McpConfigErrors::new(PathBuf::new()));
+        let mut p = McpPicker::new(test_snapshot());
         p.open();
         let action = p.handle_key(cancel_key);
         assert!(matches!(action, McpPickerAction::Close));
@@ -231,10 +274,7 @@ mod tests {
 
     #[test]
     fn open_with_empty_infos() {
-        let mut p = McpPicker::new(
-            McpSnapshotReader::empty(),
-            McpConfigErrors::new(PathBuf::new()),
-        );
+        let mut p = McpPicker::new(McpSnapshotReader::empty());
         p.open();
         assert!(p.is_open());
     }

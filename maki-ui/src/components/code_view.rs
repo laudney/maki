@@ -2,8 +2,8 @@ use crate::highlight::{fallback_span, highlight_line};
 use crate::markdown::{should_truncate, truncation_notice};
 use crate::theme;
 
-use maki_agent::diff::{DiffLine, DiffSpan, compute_hunks};
-use maki_agent::{GrepFileEntry, InstructionBlock, ToolInput, ToolOutput};
+use maki_types::diff::{DiffLine, DiffSpan, compute_hunks};
+use maki_types::tool::{GrepFileEntry, InstructionBlock, ToolInput, ToolOutput};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use syntect::parsing::SyntaxReference;
@@ -583,7 +583,7 @@ fn merge_syntax_with_diff(
 mod tests {
     use super::*;
     use crate::markdown::TRUNCATION_PREFIX;
-    use maki_agent::GrepMatchGroup;
+    use maki_types::tool::GrepMatchGroup;
     use test_case::test_case;
 
     fn plain(text: &str) -> DiffSpan {

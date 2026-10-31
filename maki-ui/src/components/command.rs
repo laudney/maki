@@ -2,9 +2,10 @@ use std::mem;
 use std::sync::Arc;
 
 use crossterm::event::{KeyCode, KeyEvent};
-use maki_agent::command::CustomCommand;
-use maki_agent::{McpPromptInfo, McpSnapshotReader};
-use maki_lua::{LuaCommandInfo, LuaCommandReader, Missing, Permission, PluginReach, SENDS_PROMPT};
+use maki_lua_core::plugin_permissions::{Missing, Permission, PluginReach, SENDS_PROMPT};
+use maki_lua_ui::{LuaCommandInfo, LuaCommandReader};
+use maki_types::command::CustomCommand;
+use maki_types::mcp::{McpPromptInfo, McpSnapshotReader};
 use nucleo::pattern::{CaseMatching, Normalization};
 use nucleo::{Config, Matcher, Nucleo, Utf32String};
 use ratatui::Frame;
@@ -272,6 +273,12 @@ pub struct CommandPalette {
 }
 
 impl CommandPalette {
+    pub(crate) fn set_mcp_reader(&mut self, reader: McpSnapshotReader) {
+        self.mcp_reader = reader;
+        self.mcp_generation = u64::MAX;
+        self.synced_version = None;
+    }
+
     pub fn new(
         custom_commands: Arc<[CustomCommand]>,
         mcp_reader: McpSnapshotReader,
@@ -809,8 +816,8 @@ impl CommandPalette {
 mod tests {
     use super::*;
     use crate::components::key;
-    use maki_agent::{McpPromptArg, McpSnapshot};
-    use maki_lua::PluginPermissions;
+    use maki_lua_core::plugin_permissions::PluginPermissions;
+    use maki_types::mcp::{McpPromptArg, McpSnapshot};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use test_case::test_case;
@@ -837,14 +844,14 @@ mod tests {
                 name: "review".into(),
                 description: "Code review".into(),
                 content: "Review $ARGUMENTS".into(),
-                scope: maki_agent::command::CommandScope::Project,
+                scope: maki_types::command::CommandScope::Project,
                 accepts_args: true,
             },
             CustomCommand {
                 name: "fix".into(),
                 description: "Quick fix".into(),
                 content: "Fix the code".into(),
-                scope: maki_agent::command::CommandScope::User,
+                scope: maki_types::command::CommandScope::User,
                 accepts_args: false,
             },
         ])
@@ -1000,6 +1007,7 @@ mod tests {
 
     fn sample_prompts() -> McpSnapshotReader {
         McpSnapshotReader::from_snapshot(McpSnapshot {
+            config_error: None,
             infos: vec![],
             prompts: vec![
                 McpPromptInfo {
@@ -1094,6 +1102,7 @@ mod tests {
         assert_eq!(initial_count, 2, "Should have 2 MCP prompts initially");
 
         let updated_reader = McpSnapshotReader::from_snapshot(McpSnapshot {
+            config_error: None,
             infos: vec![],
             prompts: vec![McpPromptInfo {
                 display_name: "myserver:new-prompt".into(),
@@ -1293,7 +1302,7 @@ mod tests {
 
     #[test]
     fn lua_commands_update_on_generation_change() {
-        let (writer, reader) = maki_lua::test_support::lua_command_writer_pair();
+        let (writer, reader) = maki_lua_ui::test_support::lua_command_writer_pair();
         writer.publish(vec![LuaCommandInfo {
             name: Arc::from("/old"),
             description: Arc::from("old command"),
@@ -1360,7 +1369,7 @@ mod tests {
                     name: format!("cmd{i:02}"),
                     description: "d".into(),
                     content: String::new(),
-                    scope: maki_agent::command::CommandScope::User,
+                    scope: maki_types::command::CommandScope::User,
                     accepts_args: false,
                 })
                 .collect::<Vec<_>>(),

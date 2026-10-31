@@ -3,3 +3,5 @@ fs_read = true
 fs_write = true
 run = true
 agent = true
+
+[ui.permissions]

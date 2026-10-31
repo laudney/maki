@@ -1,4 +1,4 @@
-use maki_lua::{Axis, Split};
+use maki_lua_ui::{Axis, Split};
 use ratatui::layout::Rect;
 
 /// Minimum interior columns the chat keeps after every column split is carved.

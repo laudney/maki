@@ -1,4 +1,3 @@
-local ToolView = require("maki.tool_view")
 local output_limits = require("maki.output_limits")
 local partial = require("maki.partial")
 local bash_log = require("bash_log")
@@ -36,7 +35,6 @@ local FOREGROUND_NOTE = "Could not start in the background (%s). Ran in the fore
 local EARLIER_IN_LOG = "[%d earlier lines are in the full output log]"
 local EARLIER_ROTATED = "[%d earlier lines are in the full output log or %s; the oldest may be gone]"
 local EARLIER_DROPPED = "[%d earlier lines dropped]"
-local FULL_OUTPUT_PATTERN = "^(.*)\nFull output: ([^\n]+)$"
 local FULL_OUTPUT_LINE = "Full output: %s"
 local EXPIRE_BACKGROUND = { expire = "background" }
 
@@ -210,27 +208,6 @@ local function description_of(input)
   return description
 end
 
-local function create_bash_view(command, ctx)
-  local tol = ctx:tool_output_lines()
-  local buf = maki.ui.buf()
-  local view = ToolView.new(buf, {
-    max_lines = (tol and tol.bash) or 5,
-    keep = "tail",
-    max_line_bytes = output_limits.DEFAULT_MAX_LINE_BYTES,
-  })
-  view:set_header(maki.split(command, "\n"))
-  maki.async.run(function()
-    local highlighted = maki.ui.highlight(command, "bash")
-    if highlighted then
-      view:set_header(highlighted)
-    end
-  end)
-  buf:on("click", function()
-    view:toggle()
-  end)
-  return buf, view
-end
-
 local COMPLEX_TYPES = {
   command_substitution = true,
   process_substitution = true,
@@ -386,8 +363,7 @@ maki.api.register_tool({
     return { scopes = segments, force_prompt = false }
   end,
 
-  header = function(input)
-    -- The body leaves out a leading `cd`, so the title keeps the directory.
+  summary = function(input)
     local _, workdir = parse_cd_hint(input)
     local dir = workdir and relative_path(workdir)
     local title = description_of(input) or ""
@@ -395,37 +371,6 @@ maki.api.register_tool({
       title = title == "" and "in " .. dir or title .. " in " .. dir
     end
     return title
-  end,
-
-  restore = function(input, output, is_error, ctx)
-    local command = parse_cd_hint(input)
-    local buf, view = create_bash_view(command, ctx)
-    local timeout_secs = output:match("^tool bash timed out after (%d+)s$")
-    local text, log_file = output:match(FULL_OUTPUT_PATTERN)
-    text = text or output
-    if timeout_secs then
-      view:append({ { "Timed out after " .. timeout_secs .. "s", "dim" } })
-    elseif is_error then
-      local body, code = text:match("^(.-)\nExit code: (%d+)$")
-      if body then
-        view:append_text(body)
-        view:append({ { "Exit code: " .. code, "dim" } })
-      else
-        view:append_text(text)
-      end
-    else
-      if text == "Exit code: 0" or text == "" then
-        view:clear()
-        view:append({ { "No output", "dim" } })
-      else
-        view:append_text(text)
-      end
-    end
-    if log_file then
-      view:append({ { FULL_OUTPUT_LINE:format(tostring(log_file)), "dim" } })
-    end
-    view:finish()
-    return buf
   end,
 
   handler = function(input, ctx)
@@ -445,7 +390,9 @@ maki.api.register_tool({
       command = rewritten
     end
 
-    local buf, view = create_bash_view(command, ctx)
+    local state = { command = command, text = "" }
+    local show = output_limits.live_collector(ctx, state)
+    ctx:set_state(state)
 
     -- The reply comes from `collected` until the call moves to the
     -- background, and from the bounded `tail` after. The log opens once the
@@ -453,7 +400,6 @@ maki.api.register_tool({
     local collected = output_limits.collector(max_lines, max_bytes)
     local tail, log, log_err
     local log_gate = maki.async.semaphore(1)
-    local has_output = false
     local finishing, finished = false, false
     local foreground_note
 
@@ -527,10 +473,6 @@ maki.api.register_tool({
     end
 
     local function capture(line, bytes)
-      if not has_output then
-        has_output = true
-        view:clear()
-      end
       -- A bash inside a moved batch never runs its own hook, so its first
       -- output after the move does the same switch.
       if collected and ctx:backgrounded() then
@@ -551,7 +493,7 @@ maki.api.register_tool({
       if log then
         log:push(line .. "\n")
       end
-      view:append(line)
+      show(line)
     end
 
     local function final_output()
@@ -571,7 +513,6 @@ maki.api.register_tool({
     local function reply_text(llm_output)
       if log then
         local log_line = FULL_OUTPUT_LINE:format(log.path)
-        view:append({ { log_line, "dim" } })
         llm_output = llm_output .. "\n" .. log_line
       end
       return foreground_note and (foreground_note .. "\n" .. llm_output) or llm_output
@@ -611,24 +552,8 @@ maki.api.register_tool({
         llm_output = llm_output .. "\n" .. output_limits.FULL_LIMIT_NOTE
       end
 
-      if output == "" then
-        view:clear()
-        view:append({ { "No output", "dim" } })
-      end
-
-      if exit_code ~= 0 then
-        view:append({ { "Exit code: " .. exit_code, "dim" } })
-      end
-      if over_full_limit then
-        view:append({ { output_limits.FULL_LIMIT_NOTE, "dim" } })
-      end
-      local reply = reply_text(llm_output)
-      view:finish()
-
-      ctx:finish({ llm_output = reply, is_error = is_error, body = buf })
+      ctx:finish({ llm_output = reply_text(llm_output), is_error = is_error, state = state })
     end
-
-    view:append({ { "Waiting for output...", "dim" } })
 
     local job, err = maki.fn.jobstart(command, {
       cwd = workdir,
@@ -663,7 +588,9 @@ maki.api.register_tool({
         return
       end
       finished = true
-      local cut = partial.cut(view, final_output(), reason, timeout_secs, started_at)
+      local output = final_output()
+      local cut = partial.reply(output, partial.marker(output, reason, timeout_secs, started_at))
+      cut.state = state
       cut.llm_output = reply_text(cut.llm_output)
       ctx:finish(cut)
     end)

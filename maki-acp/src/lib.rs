@@ -1,5 +1,4 @@
-pub mod elicitation;
-pub mod methods;
+pub mod config_options;
 pub mod permissions;
 pub mod server;
 pub mod translate;
@@ -8,8 +7,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use futures::future::BoxFuture;
+use maki_agent::headless::SessionPlugins;
 use maki_agent::permissions::PluginRuleStore;
 use maki_agent::prompt::ResolvedPrompts;
+use maki_agent::session::StoredSession;
 use maki_agent::{AgentConfig, CancelToken, SessionEndReason};
 use maki_config::project::TrustMode;
 use maki_config::{ModelPolicy, SessionDefaults, TrustConfig};
@@ -17,12 +18,21 @@ use maki_providers::Timeouts;
 use maki_providers::model::Model;
 use maki_storage::StateDir;
 use maki_storage::id::MakiId;
+use maki_storage::sessions::SessionClaim;
+use maki_wire::plugins::{PluginReply, PluginRequest};
 use tokio::runtime::Handle;
 
 pub type SessionEndHook =
     Arc<dyn Fn(MakiId, SessionEndReason) -> BoxFuture<'static, ()> + Send + Sync>;
 
+pub type PluginAdmin =
+    Arc<dyn Fn(PluginRequest, AcpParams) -> Result<(AcpParams, PluginReply), String> + Send + Sync>;
+
+#[derive(Clone)]
 pub struct AcpParams {
+    pub initial: Option<(StoredSession, SessionClaim)>,
+    pub administration: Option<PluginAdmin>,
+    pub plugins: Option<Arc<dyn SessionPlugins>>,
     pub model: Model,
     pub config: AgentConfig,
     pub timeouts: Timeouts,

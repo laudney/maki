@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use maki_agent::tools::ToolRegistry;
 use maki_lua::PluginHost;
+
 use test_case::test_case;
 
 #[test_case("completion", include_str!("../../plugins/completion/tests/spec.lua") ; "completion_plugin_spec")]
@@ -19,8 +20,14 @@ use test_case::test_case;
 #[test_case("websearch", include_str!("../../plugins/websearch/tests/spec.lua") ; "websearch_plugin_spec")]
 #[test_case("write", include_str!("../../plugins/write/tests/spec.lua") ; "write_plugin_spec")]
 fn plugin_spec(name: &str, spec: &str) {
-    let reg = Arc::new(ToolRegistry::new());
-    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
-    host.load_source(&format!("{name}_spec"), spec)
-        .unwrap_or_else(|e| panic!("{name} spec failed:\n{e}"));
+    if matches!(name, "completion" | "lib" | "question") {
+        maki_lua_ui::UiHost::bare()
+            .load_source(&format!("{name}_spec"), spec)
+            .unwrap_or_else(|error| panic!("{name} spec failed:\n{error}"));
+    } else {
+        let reg = Arc::new(ToolRegistry::new());
+        let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+        host.load_source(&format!("{name}_spec"), spec)
+            .unwrap_or_else(|e| panic!("{name} spec failed:\n{e}"));
+    }
 }

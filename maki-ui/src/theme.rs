@@ -4,9 +4,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use arc_swap::{ArcSwap, Guard};
-use maki_agent::SpanColor;
 use maki_highlight::SegmentColor;
 use maki_storage::StateDir;
+use maki_types::snapshot::SpanColor;
 use ratatui::style::{Color, Modifier, Style};
 use serde::Deserialize;
 use syntect::highlighting::{

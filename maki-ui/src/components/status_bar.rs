@@ -10,7 +10,7 @@ use super::{RetryInfo, Status};
 use crate::animation::spinner_frame;
 use crate::theme;
 
-use maki_providers::format_tokens;
+use maki_types::usage::format_tokens;
 use notify::{Config, Error, Event, EventKindMask, RecommendedWatcher, RecursiveMode, Watcher};
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};

@@ -1,9 +1,8 @@
 use crate::render_worker::RenderWorker;
 use crate::repaint::Dirty;
 use crate::terminal_image::InlineImage;
-use crate::theme;
-use crate::wrap;
-use maki_providers::ImageSource;
+use crate::{theme, wrap};
+use maki_types::message::ImageSource;
 use std::sync::Arc;
 
 use super::super::code_view::SectionFlags;
@@ -523,7 +522,7 @@ mod tests {
     #[test]
     fn reuse_highlight_keys_on_theme_not_width() {
         use crate::components::code_view::RenderLimits;
-        use maki_agent::ToolOutput;
+        use maki_types::tool::ToolOutput;
         use std::sync::Arc;
 
         let output = Arc::new(ToolOutput::ReadCode {

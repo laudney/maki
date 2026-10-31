@@ -3,13 +3,11 @@ use std::collections::HashSet;
 use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher};
 
-use crate::animation::{animation_elapsed_ms, spinner_str};
 use crate::components::Overlay;
 use crate::components::keybindings::key;
 use crate::components::modal::{BORDER, Modal};
 use crate::components::scrollbar::render_vertical_scrollbar;
 use crate::components::{hint_footer, is_ctrl};
-use crate::repaint::Cadence;
 use crate::text_buffer::TextBuffer;
 use crate::theme;
 
@@ -35,25 +33,12 @@ type Hints = &'static [(&'static str, &'static str)];
 
 pub trait PickerItem {
     fn label(&self) -> &str;
-    fn suffix(&self) -> Option<&str> {
-        None
-    }
+
     fn detail(&self) -> Option<&str> {
         None
     }
     fn section(&self) -> Option<&str> {
         None
-    }
-    fn is_spinning(&self) -> bool {
-        false
-    }
-    fn is_highlighted(&self) -> bool {
-        false
-    }
-    /// Drawn in place of its section header, so the cursor can land on the
-    /// section itself.
-    fn is_section_row(&self) -> bool {
-        false
     }
 }
 
@@ -88,7 +73,6 @@ struct State<T> {
     inner_area: Rect,
     enabled: Option<Vec<bool>>,
     matcher: Matcher,
-    notice: Option<&'static str>,
 }
 
 impl<T: PickerItem> State<T> {
@@ -104,7 +88,6 @@ impl<T: PickerItem> State<T> {
             inner_area: Rect::default(),
             enabled: None,
             matcher: Matcher::new(Config::DEFAULT),
-            notice: None,
         }
     }
 
@@ -314,19 +297,6 @@ impl<T: PickerItem> ListPicker<T> {
         self.error_text.as_deref()
     }
 
-    /// A dim line under the list, for state that is not an item.
-    pub fn set_notice(&mut self, notice: Option<&'static str>) {
-        if let Some(s) = self.state.as_mut() {
-            s.notice = notice;
-        }
-    }
-
-    pub fn replace_items(&mut self, items: Vec<T>) {
-        if let Some(s) = self.state.as_mut() {
-            s.replace_items(items);
-        }
-    }
-
     pub fn replace_toggleable(&mut self, items: Vec<T>, enabled: Vec<bool>) {
         if let Some(s) = self.state.as_mut() {
             s.enabled = Some(enabled);
@@ -336,15 +306,6 @@ impl<T: PickerItem> ListPicker<T> {
 
     pub fn is_open(&self) -> bool {
         self.state.is_some()
-    }
-
-    pub fn cadence(&self) -> Cadence {
-        Cadence::when(
-            self.state
-                .as_ref()
-                .is_some_and(|s| s.items.iter().any(PickerItem::is_spinning)),
-            Cadence::SPINNER,
-        )
     }
 
     pub fn close(&mut self) {
@@ -534,10 +495,6 @@ impl<T: PickerItem> Overlay for ListPicker<T> {
     fn close(&mut self) {
         self.close()
     }
-
-    fn cadence(&self) -> Cadence {
-        self.cadence()
-    }
 }
 
 fn render_ready<T: PickerItem>(
@@ -549,7 +506,6 @@ fn render_ready<T: PickerItem>(
     footer: Hints,
     error_text: Option<&str>,
 ) -> Rect {
-    let notice = s.notice;
     let content_rows = if s.filtered.is_empty() {
         1
     } else {
@@ -560,7 +516,6 @@ fn render_ready<T: PickerItem>(
         }
     };
     let error_rows = error_text.is_some() as u16;
-    let notice_rows = notice.is_some() as u16;
     let modal = Modal {
         title,
         width_percent: MIN_WIDTH_PERCENT,
@@ -570,24 +525,19 @@ fn render_ready<T: PickerItem>(
     let (popup, inner) = modal.render_with_footer(
         frame,
         area,
-        content_rows + SEARCH_ROW + error_rows + notice_rows,
+        content_rows + SEARCH_ROW + error_rows,
         (!footer.is_empty()).then(|| hint_footer(footer)),
     );
-    let viewport_h = inner
-        .height
-        .saturating_sub(error_rows + notice_rows + SEARCH_ROW);
+    let viewport_h = inner.height.saturating_sub(error_rows + SEARCH_ROW);
     s.viewport_height = viewport_h as usize;
     s.ensure_visible();
 
-    let mut constraints: Vec<Constraint> =
-        Vec::with_capacity(3 + error_text.is_some() as usize + notice.is_some() as usize);
+    let mut constraints: Vec<Constraint> = Vec::with_capacity(3 + error_text.is_some() as usize);
     if error_text.is_some() {
         constraints.push(Constraint::Length(1)); // error line
     }
     constraints.push(Constraint::Min(1)); // list
-    if notice.is_some() {
-        constraints.push(Constraint::Length(1));
-    }
+
     constraints.push(Constraint::Length(1)); // search
 
     let areas = Layout::vertical(constraints).split(inner);
@@ -601,15 +551,6 @@ fn render_ready<T: PickerItem>(
 
     let list_area = areas[area_idx];
     area_idx += 1;
-
-    if let Some(notice) = notice {
-        let line = Line::from(Span::styled(
-            format!("  {notice}"),
-            theme::current().tool_dim,
-        ));
-        frame.render_widget(Paragraph::new(vec![line]), areas[area_idx]);
-        area_idx += 1;
-    }
 
     let search_area = areas[area_idx];
 
@@ -640,16 +581,13 @@ fn section_gap<T: PickerItem>(filtered: &[usize], items: &[T], idx: usize, start
     let Some(sec) = item.section() else {
         return 0;
     };
-    // A section row draws itself where the header would have gone, so it costs
-    // the blank spacer above it and nothing more.
-    let header = usize::from(!item.is_section_row());
     if idx == start {
-        return header;
+        return 1;
     }
     let is_break = items[filtered[idx - 1]]
         .section()
         .is_none_or(|prev| prev != sec);
-    if is_break { 1 + header } else { 0 }
+    if is_break { 2 } else { 0 }
 }
 
 fn visual_rows_in_range<T: PickerItem>(
@@ -745,7 +683,7 @@ fn render_list<T: PickerItem>(
             if !lines.is_empty() && lines.len() < viewport_height {
                 lines.push(Line::raw(""));
             }
-            if !item.is_section_row() && lines.len() < viewport_height {
+            if lines.len() < viewport_height {
                 lines.push(Line::from(Span::styled(
                     format!("  {sec}"),
                     theme::current().keybind_section,
@@ -758,19 +696,11 @@ fn render_list<T: PickerItem>(
             break;
         }
 
-        let highlighted = item.is_highlighted();
         let t = theme::current();
-        let (style, detail_style) = match (i == selected, highlighted) {
-            (true, true) => {
-                let s = t.item_selected.fg(t.accent.fg.unwrap_or_default());
-                (s, theme::dim_style(s, 0.4))
-            }
-            (true, false) => (t.item_selected, t.item_selected),
-            (false, true) => (t.accent, theme::dim_style(t.accent, 0.4)),
-            (false, false) if item.is_section_row() => {
-                (t.keybind_section, theme::dim_style(t.keybind_section, 0.4))
-            }
-            (false, false) => (t.item, t.item_desc),
+        let (style, detail_style) = if i == selected {
+            (t.item_selected, t.item_selected)
+        } else {
+            (t.item, t.item_desc)
         };
         let checkbox = enabled.map(|en| {
             let sym = if en[item_idx] { "✓ " } else { "✗ " };
@@ -784,33 +714,22 @@ fn render_list<T: PickerItem>(
             Span::styled(sym, sty)
         });
         let label = format!("  {}", item.label());
-        let suffix = item.suffix();
-        let detail: Option<&str> = if item.is_spinning() {
-            Some(spinner_str(animation_elapsed_ms()))
-        } else {
-            item.detail()
-        };
-        let suffix_gap = 2usize;
-        let suffix_w = suffix.map(|s| s.width()).unwrap_or(0);
-        let trailing_gap = suffix_w + if suffix_w > 0 { suffix_gap } else { 0 };
+        let detail = item.detail();
         let line = match detail {
             Some(detail) => {
-                let max_label = area.width.saturating_sub(
-                    detail.width() as u16 + trailing_gap as u16 + 1 + DETAIL_RIGHT_PAD,
-                ) as usize;
+                let max_label = area
+                    .width
+                    .saturating_sub(detail.width() as u16 + 1 + DETAIL_RIGHT_PAD)
+                    as usize;
                 let label = truncate_label(&label, max_label);
-                let pad = (area.width as usize).saturating_sub(
-                    label.width() + trailing_gap + detail.width() + DETAIL_RIGHT_PAD as usize + 1,
-                );
+                let pad = (area.width as usize)
+                    .saturating_sub(label.width() + detail.width() + DETAIL_RIGHT_PAD as usize + 1);
                 let mut spans = Vec::with_capacity(7);
                 if let Some(cb) = checkbox {
                     spans.push(cb);
                 }
                 spans.push(Span::styled(label, style));
-                if let Some(s) = suffix {
-                    spans.push(Span::styled(" ".repeat(suffix_gap), style));
-                    spans.push(Span::styled(s.to_string(), theme::dim_style(style, 0.4)));
-                }
+
                 spans.push(Span::styled(" ".repeat(pad), style));
                 spans.push(Span::styled(detail.to_string(), detail_style));
                 spans.push(Span::styled(" ".repeat(DETAIL_RIGHT_PAD as usize), style));
@@ -822,10 +741,7 @@ fn render_list<T: PickerItem>(
                     spans.push(cb);
                 }
                 spans.push(Span::styled(label, style));
-                if let Some(s) = suffix {
-                    spans.push(Span::styled(" ".repeat(suffix_gap), style));
-                    spans.push(Span::styled(s.to_string(), theme::dim_style(style, 0.4)));
-                }
+
                 Line::from(spans)
             }
         };
@@ -873,7 +789,6 @@ mod tests {
     struct Entry {
         label: String,
         detail: Option<String>,
-        spinning: bool,
     }
 
     impl Entry {
@@ -881,7 +796,6 @@ mod tests {
             Self {
                 label: label.into(),
                 detail: None,
-                spinning: false,
             }
         }
     }
@@ -893,26 +807,6 @@ mod tests {
         fn detail(&self) -> Option<&str> {
             self.detail.as_deref()
         }
-        fn is_spinning(&self) -> bool {
-            self.spinning
-        }
-    }
-
-    /// The running-task spinner is drawn here and nowhere else, so this is the
-    /// only place that can tell the loop to keep painting it.
-    #[test]
-    fn a_spinning_item_animates_the_picker() {
-        let mut p = ListPicker::new();
-        p.open(entries(&["idle task"]), " Test ");
-        assert_eq!(p.cadence(), Cadence::IDLE);
-
-        let mut running = Entry::new("running task");
-        running.spinning = true;
-        p.replace_items(vec![running]);
-        assert_eq!(p.cadence(), Cadence::SPINNER);
-
-        p.close();
-        assert_eq!(p.cadence(), Cadence::IDLE, "a closed picker draws nothing");
     }
 
     fn entries(names: &[&str]) -> Vec<Entry> {
@@ -1095,7 +989,6 @@ mod tests {
     struct SectionEntry {
         label: String,
         section: &'static str,
-        is_section_row: bool,
     }
 
     impl PickerItem for SectionEntry {
@@ -1105,24 +998,12 @@ mod tests {
         fn section(&self) -> Option<&str> {
             Some(self.section)
         }
-        fn is_section_row(&self) -> bool {
-            self.is_section_row
-        }
     }
 
     fn in_section(label: &str, section: &'static str) -> SectionEntry {
         SectionEntry {
             label: label.into(),
             section,
-            is_section_row: false,
-        }
-    }
-
-    fn heading(section: &'static str) -> SectionEntry {
-        SectionEntry {
-            label: section.into(),
-            section,
-            is_section_row: true,
         }
     }
 
@@ -1134,35 +1015,12 @@ mod tests {
         ]
     }
 
-    fn headed_entries() -> Vec<SectionEntry> {
-        vec![
-            heading("Anthropic"),
-            in_section("a1", "Anthropic"),
-            heading("Openrouter"),
-            in_section("b1", "Openrouter"),
-        ]
-    }
-
     #[test]
     fn section_headers_counted_in_visual_rows() {
         let items = section_entries();
         let filtered: Vec<usize> = (0..items.len()).collect();
         let rows = visual_rows_in_range(&filtered, &items, 0, items.len());
         assert_eq!(rows, 6);
-    }
-
-    #[test]
-    fn a_section_row_costs_its_spacer_and_not_a_second_header() {
-        let items = headed_entries();
-        let filtered: Vec<usize> = (0..items.len()).collect();
-
-        let rows = visual_rows_in_range(&filtered, &items, 0, items.len());
-        assert_eq!(rows, 5, "4 items and the one spacer between the sections");
-        assert_eq!(
-            find_scroll_offset_for(&filtered, &items, 3, 3),
-            2,
-            "scrolling has to count the spacer the second heading brings"
-        );
     }
 
     #[test]

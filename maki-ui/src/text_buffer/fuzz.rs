@@ -6,15 +6,14 @@
 //! `MAKI_FUZZ_SEEDS=N` runs the first N seeds instead of the default.
 
 use std::collections::VecDeque;
-use std::env;
-use std::mem;
 use std::ops::Range;
 use std::sync::Arc;
+use std::{env, mem};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use fastrand::Rng;
-use maki_agent::{SnapshotSpan, SpanStyle};
-use maki_lua::{InputMarks, TextEdit};
+use maki_lua_ui::{InputMarks, TextEdit};
+use maki_types::snapshot::{SnapshotSpan, SpanStyle};
 
 use super::syntax::edit_since;
 use super::test_support::text_edit;

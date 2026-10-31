@@ -1,99 +1,23 @@
-//! The one portable form of a session: what `maki session export` prints,
-//! `maki session import` reads, and `maki.session.export` / `new` hand to and
-//! take from plugins. Every one of them goes through here, so a plugin and a
-//! server can never disagree on what a session is.
-//!
-//! It carries conversation, never authority: no system prompt, no tools, no
-//! rules. A fresh frame is built on the first run, and whatever the origin's
-//! prompt stated that no longer holds (cwd, date) is told then.
+//! Opening a [`Transcript`] as a session: what a resume repairs is repaired,
+//! and the rest is refused.
 
 use std::collections::HashSet;
-use std::mem;
 use std::sync::Arc;
 
 use maki_providers::{ContentBlock, Message, Role, TokenUsage};
-use maki_storage::frame::{PromptFacts, StoredFrame};
-use maki_storage::sessions::{StoredMode, StoredThinking, ThinkingParseError, normalize_title};
-use serde::de;
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use serde_json::Value;
+use maki_storage::frame::StoredFrame;
+use maki_storage::sessions::{StoredThinking, ThinkingParseError, normalize_title};
+use maki_types::transcript::{Transcript, location};
 
-use super::history::{HistorySnapshot, facts_told, sanitize_restored, strip_thinking};
-use crate::session::{SessionHeader, StoredSession};
+use super::history::{sanitize_restored, strip_thinking};
+use crate::session::StoredSession;
 
-/// Versions the envelope only. Messages inside it grow additively forever,
-/// so nothing here moves with the session log format.
-const FORMAT: u32 = 1;
-const CONTENT_KEY: &str = "content";
-
-pub const NEWER_FORMAT: &str = "exported by a newer maki";
 const NO_TOOL_RESULT: &str = "has no tool_result in the next user message";
 const MISPLACED_BLOCK: &str = "block is not allowed in a message with role";
 const DUPLICATE_TOOL_ID: &str = "duplicate tool id";
 const MALFORMED_CONTEXT_UPDATE: &str =
     "a context_update must be a user message with one text block and no display_text";
 const INVALID_THINKING: &str = "invalid thinking setting";
-
-/// A session as a document. Unknown top-level fields are ignored, which
-/// means dropped: an importer keeps nothing it does not know. Everything but
-/// `messages` may be left out, so a converter can hand over just those.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct Transcript {
-    /// Reading a higher one fails, since a newer envelope field that must
-    /// not be ignored is exactly what bumps it.
-    #[serde(default = "current_format", deserialize_with = "known_format")]
-    pub format: u32,
-    /// Stored as given and resolved when the session opens, like any resume.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mode: Option<StoredMode>,
-    /// Spelled like the thinking setting everywhere else.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub thinking: Option<String>,
-    /// Always written on export. Left out on import, the host's default holds.
-    #[serde(default)]
-    pub fast: Option<bool>,
-    /// Left out, the title is generated from the history as usual.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub title: Option<String>,
-    /// The date, working directory, model, instructions and hints the model
-    /// was last told. Data, not authority: it only decides what the first run
-    /// tells the model has moved.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub facts: Option<PromptFacts>,
-    /// Skipped when empty only so [`SessionExport`] can write its shared
-    /// messages under the same key. An empty document still parses.
-    #[serde(
-        default,
-        deserialize_with = "located_messages",
-        skip_serializing_if = "Vec::is_empty"
-    )]
-    pub messages: Vec<Message>,
-}
-
-fn current_format() -> u32 {
-    FORMAT
-}
-
-fn known_format<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u32, D::Error> {
-    let found = u32::deserialize(deserializer)?;
-    if found > FORMAT {
-        return Err(de::Error::custom(format!(
-            "{NEWER_FORMAT} (format {found}, this build reads up to {FORMAT})"
-        )));
-    }
-    Ok(found)
-}
-
-/// Where in `messages` something is wrong, as the path a reader of the
-/// document would follow: `messages[12].content[2]`.
-fn location(message: usize, block: Option<usize>) -> String {
-    match block {
-        Some(block) => format!("messages[{message}].{CONTENT_KEY}[{block}]"),
-        None => format!("messages[{message}]"),
-    }
-}
 
 /// What resume cannot repair. Message shape errors (facts on the wrong
 /// message) are caught earlier, by deserializing, and are located the same
@@ -120,114 +44,54 @@ pub enum TranscriptError {
     Thinking(#[from] ThinkingParseError),
 }
 
-impl Transcript {
-    /// Lays the document over `base`, the blank session its host would open
-    /// (cwd, settings that outlive a turn), but does not store it. Whatever
-    /// the document leaves out keeps the base's value. Spend comes from
-    /// neither. A transcript carries no authority, and a host's standing
-    /// permissions belong to the sessions the user opened, so a document
-    /// with conversation drops the base's. One without is just a new
-    /// session, so it keeps them the way a new tab does.
-    ///
-    /// Repairs exactly what a resume repairs and refuses the rest, so a plugin
-    /// bug fails loudly instead of changing what the model saw. Thinking goes:
-    /// it is bound to the origin's prefix, which no fresh frame can match.
-    pub fn into_session(self, mut base: StoredSession) -> Result<StoredSession, TranscriptError> {
-        let thinking = self
-            .thinking
-            .as_deref()
-            .map(StoredThinking::parse_setting)
-            .transpose()?;
-        validate(&self.messages)?;
-        let mut messages = self.messages;
-        sanitize_restored(&mut messages);
-        strip_thinking(&mut messages);
+/// Lays the document over `base`, the blank session its host would open
+/// (cwd, settings that outlive a turn), but does not store it. Whatever
+/// the document leaves out keeps the base's value. Spend comes from
+/// neither. A transcript carries no authority, and a host's standing
+/// permissions belong to the sessions the user opened, so a document
+/// with conversation drops the base's. One without is just a new
+/// session, so it keeps them the way a new tab does.
+///
+/// Repairs exactly what a resume repairs and refuses the rest, so a plugin
+/// bug fails loudly instead of changing what the model saw. Thinking goes:
+/// it is bound to the origin's prefix, which no fresh frame can match.
+pub fn transcript_into_session(
+    transcript: Transcript,
+    mut base: StoredSession,
+) -> Result<StoredSession, TranscriptError> {
+    let thinking = transcript
+        .thinking
+        .as_deref()
+        .map(StoredThinking::parse_setting)
+        .transpose()?;
+    validate(&transcript.messages)?;
+    let mut messages = transcript.messages;
+    sanitize_restored(&mut messages);
+    strip_thinking(&mut messages);
 
-        if !messages.is_empty() {
-            base.meta.yolo = None;
-            base.meta.session_rules.clear();
-        }
-        base.replace_messages(messages);
-        base.set_frame(
-            self.facts
-                .map(|facts| Arc::new(StoredFrame::facts_only(facts))),
-        );
-        if let Some(model) = self.model.filter(|model| !model.trim().is_empty()) {
-            base.set_model(model);
-        }
-        let meta = &mut base.meta;
-        meta.mode = self.mode.or(meta.mode);
-        meta.thinking = thinking.or(meta.thinking);
-        meta.fast = self.fast.unwrap_or(meta.fast);
-        base.token_usage = TokenUsage::default();
-        match self.title.map(|title| normalize_title(&title)) {
-            Some(title) if !title.is_empty() => base.set_title(title),
-            _ => base.update_title_if_default(),
-        }
-        Ok(base)
+    if !messages.is_empty() {
+        base.meta.yolo = None;
+        base.meta.session_rules.clear();
     }
-}
-
-/// A session to export, its messages still shared with whoever holds them,
-/// so reading a long live one copies nothing. Serializes as the
-/// [`Transcript`] document.
-pub struct SessionExport {
-    pub header: SessionHeader,
-    pub messages: Arc<Vec<Message>>,
-    pub frame: Option<Arc<StoredFrame>>,
-}
-
-impl SessionExport {
-    pub fn stored(session: StoredSession) -> Self {
-        Self {
-            header: SessionHeader::of(&session),
-            frame: session.frame().cloned(),
-            messages: Arc::new(session.take_messages()),
-        }
+    base.replace_messages(messages);
+    base.set_frame(
+        transcript
+            .facts
+            .map(|facts| Arc::new(StoredFrame::facts_only(facts))),
+    );
+    if let Some(model) = transcript.model.filter(|model| !model.trim().is_empty()) {
+        base.set_model(model);
     }
-
-    /// A live session, whose transcript and frame run ahead of what its
-    /// stored copy holds.
-    pub fn live(header: SessionHeader, snapshot: &HistorySnapshot) -> Self {
-        Self {
-            header,
-            messages: Arc::clone(&snapshot.messages),
-            frame: snapshot.frame.clone(),
-        }
+    let meta = &mut base.meta;
+    meta.mode = transcript.mode.or(meta.mode);
+    meta.thinking = thinking.or(meta.thinking);
+    meta.fast = transcript.fast.unwrap_or(meta.fast);
+    base.token_usage = TokenUsage::default();
+    match transcript.title.map(|title| normalize_title(&title)) {
+        Some(title) if !title.is_empty() => base.set_title(title),
+        _ => base.update_title_if_default(),
     }
-
-    /// The document without `messages`, which stay in [`Self::messages`].
-    pub fn envelope(&self) -> Transcript {
-        let header = &self.header;
-        Transcript {
-            format: FORMAT,
-            model: (!header.model.is_empty()).then(|| header.model.clone()),
-            mode: header.mode,
-            thinking: header.thinking.map(|thinking| thinking.to_string()),
-            fast: Some(header.fast),
-            title: Some(header.title.clone()),
-            facts: (self.frame.as_deref())
-                .and_then(|frame| facts_told(frame, &self.messages).prompt),
-            messages: Vec::new(),
-        }
-    }
-}
-
-#[derive(Serialize)]
-struct ExportDocument<'a> {
-    #[serde(flatten)]
-    envelope: Transcript,
-    messages: &'a [Message],
-}
-
-impl Serialize for SessionExport {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        ExportDocument {
-            envelope: self.envelope(),
-            messages: &self.messages,
-        }
-        .serialize(serializer)
-    }
+    Ok(base)
 }
 
 fn validate(messages: &[Message]) -> Result<(), TranscriptError> {
@@ -289,50 +153,19 @@ fn required_role(block: &ContentBlock) -> Option<Role> {
     }
 }
 
-/// Parses each message, and each of its blocks, on its own, so a shape error
-/// names the message and block it is in. Going through `Value` copies each
-/// text string once more than a plain load does. Image data is not copied
-/// again.
-fn located_messages<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<Message>, D::Error> {
-    Vec::<Value>::deserialize(deserializer)?
-        .into_iter()
-        .enumerate()
-        .map(|(index, raw)| parse_message(index, raw))
-        .collect::<Result<_, _>>()
-        .map_err(de::Error::custom)
-}
-
-fn parse_message(index: usize, mut raw: Value) -> Result<Message, String> {
-    let blocks = match raw.get_mut(CONTENT_KEY) {
-        Some(Value::Array(blocks)) => mem::take(blocks),
-        _ => Vec::new(),
-    };
-    let mut message =
-        Message::deserialize(raw).map_err(|e| format!("{}: {e}", location(index, None)))?;
-    message.content = blocks
-        .into_iter()
-        .enumerate()
-        .map(|(block, raw)| {
-            <ContentBlock as Deserialize>::deserialize(raw)
-                .map_err(|e| format!("{}: {e}", location(index, Some(block))))
-        })
-        .collect::<Result<_, _>>()?;
-    Ok(message)
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
     use std::fmt::Display;
 
     use maki_providers::{ImageMediaType, ImageSource};
-    use maki_storage::frame::FactsUpdate;
-    use maki_storage::sessions::{StoredEffect, StoredRule};
-    use serde_json::json;
+    use maki_storage::frame::{FactsUpdate, PromptFacts};
+    use maki_storage::sessions::{StoredEffect, StoredMode, StoredRule};
+    use serde_json::{Value, json};
     use test_case::test_case;
 
     use super::*;
-    use crate::agent::History;
+    use crate::agent::{History, SessionExport};
 
     const CWD: &str = "/here";
     const ORIGIN_CWD: &str = "/origin";
@@ -357,7 +190,6 @@ mod tests {
     const MCP_TOOL: &str = "srv__tool";
     const PLAN_PATH: &str = "/plans/origin.md";
     const UNKNOWN_BLOCK_TYPE: &str = "server_tool_use";
-    const UNKNOWN_FIELD: &str = "origin_host";
     const UPDATE_TEXT: &str = "<context-update>Date is now 2026-10-02.</context-update>";
     const NOT_CARRIED: &str = "an import must not carry what belongs to the origin machine";
     const PERMISSIONS_MSG: &str =
@@ -502,7 +334,7 @@ mod tests {
     }
 
     fn import(transcript: Transcript) -> StoredSession {
-        transcript.into_session(blank()).unwrap()
+        transcript_into_session(transcript, blank()).unwrap()
     }
 
     /// A focused tab's blank session: its settings, and permissions a
@@ -610,9 +442,8 @@ mod tests {
 
     #[test]
     fn what_the_document_leaves_out_comes_from_the_base_but_permissions() {
-        let session = messages_only(vec![user(PROMPT)])
-            .into_session(host_base())
-            .unwrap();
+        let session =
+            transcript_into_session(messages_only(vec![user(PROMPT)]), host_base()).unwrap();
         assert_eq!(session.cwd, HOST_CWD);
         assert_eq!(session.model, MODEL);
         assert_eq!(session.meta.mode, Some(StoredMode::Plan));
@@ -629,7 +460,7 @@ mod tests {
     #[test_case(Vec::new(), true ; "blank_keeps_them")]
     #[test_case(vec![Message { content: Vec::new(), ..user(PROMPT) }], true ; "emptied_by_repair_keeps_them")]
     fn permissions_stay_only_with_a_blank_document(messages: Vec<Message>, kept: bool) {
-        let session = messages_only(messages).into_session(host_base()).unwrap();
+        let session = transcript_into_session(messages_only(messages), host_base()).unwrap();
         assert_eq!(session.meta.yolo.is_some(), kept, "{PERMISSIONS_MSG}");
         assert_eq!(
             !session.meta.session_rules.is_empty(),
@@ -642,15 +473,14 @@ mod tests {
     /// when the session opens like on any resume.
     #[test]
     fn document_settings_win_over_the_base() {
-        let session = Transcript {
+        let transcript = Transcript {
             model: Some(UNKNOWN_MODEL.into()),
             mode: Some(StoredMode::Build),
             thinking: Some(OTHER_THINKING.into()),
             fast: Some(false),
             ..messages_only(vec![user(PROMPT)])
-        }
-        .into_session(host_base())
-        .unwrap();
+        };
+        let session = transcript_into_session(transcript, host_base()).unwrap();
         assert_eq!(session.cwd, HOST_CWD);
         assert_eq!(session.model, UNKNOWN_MODEL);
         assert_eq!(session.meta.mode, Some(StoredMode::Build));
@@ -679,12 +509,11 @@ mod tests {
     #[test_case(Some("  "), MODEL ; "blank_inherits")]
     #[test_case(Some(UNKNOWN_MODEL), UNKNOWN_MODEL ; "given_is_kept")]
     fn import_model_falls_back_to_the_base_when_blank(model: Option<&str>, expected: &str) {
-        let session = Transcript {
+        let transcript = Transcript {
             model: model.map(String::from),
             ..messages_only(vec![user(PROMPT)])
-        }
-        .into_session(host_base())
-        .unwrap();
+        };
+        let session = transcript_into_session(transcript, host_base()).unwrap();
         assert_eq!(session.model, expected);
     }
 
@@ -705,7 +534,7 @@ mod tests {
     #[test_case(vec![user(PROMPT), call(TOOL_ID), result(TOOL_ID), call(TOOL_ID), result(TOOL_ID)], DUPLICATE_TOOL_ID, "messages[3].content[0]" ; "duplicate_tool_id")]
     #[test_case(vec![user(PROMPT), Message { role: Role::Assistant, ..date_update(DATE) }], MALFORMED_CONTEXT_UPDATE, "messages[1]" ; "context_update_from_assistant")]
     fn invalid_history_is_refused(messages: Vec<Message>, problem: &str, at: &str) {
-        let error = messages_only(messages).into_session(blank()).unwrap_err();
+        let error = transcript_into_session(messages_only(messages), blank()).unwrap_err();
         assert_refused_at(error, at, problem);
     }
 
@@ -726,12 +555,11 @@ mod tests {
 
     #[test]
     fn bad_thinking_setting_is_refused() {
-        let error = Transcript {
+        let transcript = Transcript {
             thinking: Some(PROMPT.into()),
             ..messages_only(vec![user(PROMPT)])
-        }
-        .into_session(blank())
-        .unwrap_err();
+        };
+        let error = transcript_into_session(transcript, blank()).unwrap_err();
         assert!(error.to_string().starts_with(INVALID_THINKING));
     }
 
@@ -744,32 +572,9 @@ mod tests {
         let error = serde_json::from_value::<Transcript>(document)
             .map_err(|e| e.to_string())
             .and_then(|transcript| {
-                (transcript.into_session(blank()).map(drop)).map_err(|e| e.to_string())
+                (transcript_into_session(transcript, blank()).map(drop)).map_err(|e| e.to_string())
             })
             .unwrap_err();
         assert!(error.starts_with(&format!("{at}: ")), "{error}");
-    }
-
-    #[test]
-    fn newer_format_is_refused() {
-        let document = json!({ "format": FORMAT + 1, "messages": [] });
-        let error = serde_json::from_value::<Transcript>(document).unwrap_err();
-        assert!(error.to_string().contains(NEWER_FORMAT), "{error}");
-    }
-
-    /// A converter may hand over just the messages, and an importer keeps
-    /// nothing it does not know.
-    #[test]
-    fn messages_alone_are_a_transcript_and_unknown_fields_are_dropped() {
-        let document = json!({
-            "messages": [{ "role": "user", "content": [{ "type": "text", "text": PROMPT }] }],
-            UNKNOWN_FIELD: { "host": CWD },
-        });
-        let read: Transcript = serde_json::from_value(document).unwrap();
-        let expected = Transcript {
-            format: FORMAT,
-            ..messages_only(vec![user(PROMPT)])
-        };
-        assert_eq!(read, expected);
     }
 }

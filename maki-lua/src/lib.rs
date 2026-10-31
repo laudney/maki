@@ -1,253 +1,83 @@
-pub mod agent_autocmd;
 mod api;
 mod background;
-pub mod chunks;
-pub mod docs;
-pub mod docs_render;
-mod error;
+mod domains;
 mod hook;
-pub mod key;
-mod key_lint;
-pub mod language;
 mod loader;
-mod pack;
-pub(crate) mod plugin_permissions;
-mod runtime;
+mod provider_adapter;
 pub mod session_snapshot;
 
-pub use api::action::ActionInfo;
+pub use maki_lua_core::handle::CoreHandle;
+pub use maki_lua_core::{agent_autocmd, chunks, docs, docs_render, language};
+use maki_lua_core::{bundled, domain, error, pack, plugin_permissions, provider_hooks, runtime};
+
 pub use api::r#fn::set_shell_preference;
-pub use api::keymap::{
-    InputMode, InputSnapshot, KeybindTicket, KeymapEntry, KeymapReader, KeymapSnapshot,
-};
 pub use api::net::set_allowed_private_hosts;
 pub use api::options::{OptionSpec, OptionType, PluginOptionSpecs};
-pub use api::pack::{Declared, PackOp};
-pub use api::session::SessionSnapshotFn;
-pub use api::ui::marks::{
-    Decoration, InputRule, InputRulesReader, Mark, PatternRule, Reveal, VirtTextPos,
-};
-pub use api::ui::syntax::{SyntaxDoc, SyntaxEdit, SyntaxIndex, SyntaxInput, SyntaxRule};
-pub use api::util::command::{
-    Anchor, Axis, Border, BuiltinAction, Dimension, Edge, FloatConfig, FloatConfigPatch, HintEntry,
-    HintReader, HintSnapshot, InputDecorate, InputEdit, InputMarks, InputRequest, InputSubmit,
-    LuaCommandInfo, LuaCommandReader, ModelRequest, NO_UI_ERR, PlanActionOutcome, PlanFormRow,
-    PlanMenu, PlanRequest, PlanRowAction, SessionRequest, Split, TaskRequest, TextEdit, TitlePos,
-    UiAction, UiAttachment, UiReply, WinCommand, WinEvent, WinView,
-};
-pub use docs::{DocKind, FnDoc, ModuleDoc, ParamDoc, api_docs};
+pub use api::pack::Declared;
+pub use api::provider::set_terminal_prompt;
+pub use bundled::Bundled;
+pub use docs::{DocKind, FnDoc, ModuleDoc, ParamDoc};
+pub use domains::agent::moves::MoveOutcome;
+pub use domains::api_docs;
+pub use domains::facade::SessionSnapshotFn;
 pub use error::PluginError;
-pub use key::{Key, PASTE, RESERVED_KEYS, is_reserved};
-pub use key_lint::KEY_WARNING;
 pub use loader::{
-    EventHandle, InitFiles, PERMISSION_NAME_WARNING, PluginHost, SKIPPED_PLUGIN_WARNING,
+    AgentHandle, InitFiles, PERMISSION_NAME_WARNING, PluginHost, SKIPPED_PLUGIN_WARNING, bundled,
+    bundled_grant, discover, discover_installed, install_declared,
 };
-pub use maki_agent::SessionEndReason;
+pub use maki_lua_core::api::fs::publish_walks;
+pub use maki_types::event::SessionEndReason;
 pub use pack::{
     DeleteTarget, DiscoveredPackage, Discovery, InstallReport, Interaction, MANAGED_GROUP, Origin,
     PackCommand, PackContext, PackPlan, PackPreparation, PackReport, PlannedOp, UpdateOptions,
-    UpdateTarget, apply_pack_plan, approvals_path, discover, discover_installed, install_declared,
-    installed_names, lockfile_path, prepare_pack_command, sanitize_message, site_dir,
+    UpdateTarget, apply_pack_plan, approvals_path, installed_names, lockfile_path,
+    prepare_pack_command, sanitize_message, site_dir,
 };
 pub use plugin_permissions::{
-    Missing, Permission, PluginPermissions, PluginReach, Requested, SENDS_PROMPT,
+    Component, Missing, PackageRequests, Permission, PluginPermissions, PluginReach, Requested,
+    SENDS_PROMPT,
 };
-pub use runtime::{
-    KILL_GRACE, MAX_INFLIGHT_TOOLS, MoveOutcome, PLAN_FORM_SLOT_DEADLINE,
-    PLAN_ROW_HANDLER_DEADLINE, RestoreItem, RestoreReason, SLICE_WARN, WARM_TOOL_CAP,
-};
+pub use runtime::{KILL_GRACE, MAX_INFLIGHT_TOOLS, SLICE_WARN};
 pub use session_snapshot::{SessionQueueSnapshot, SessionSnapshot};
 
 pub mod test_support {
+
+    use std::process::Command;
     use std::sync::Arc;
 
     pub use crate::api::autocmd::content_omitted_message;
-    use crate::api::keymap::{InputMode, KeymapStore, KeymapWriter, SetOpts};
-    use crate::api::util::command::{
-        HintEntries, HintReader, HintWriter, LuaCommandInfo, LuaCommandReader, LuaCommandWriter,
-    };
     pub use crate::api::util::dispatch::MAX_HOOK_DEPTH;
-    use crate::key::Key;
-    pub use crate::runtime::layer_skipped_message;
-    use crate::{KeybindTicket, KeymapReader, PluginPermissions, SessionEndReason};
-    use maki_agent::SharedBuf;
-    use maki_storage::id::MakiId;
-    #[cfg(any(test, feature = "test-support"))]
-    use tokio::runtime::Runtime;
+    use crate::plugin_permissions::NetEgress;
+    use crate::provider_hooks;
 
-    /// The runtime [`crate::PluginHost::start`] puts a host on, for the sync
-    /// side of a test to drive futures with.
+    pub use crate::runtime::layer_skipped_message;
+    use url::Url;
+
     #[cfg(any(test, feature = "test-support"))]
-    pub fn runtime() -> &'static Runtime {
+    pub fn runtime() -> &'static tokio::runtime::Runtime {
         &crate::loader::HOST_RUNTIME
     }
 
-    pub struct LuaCommandWriterHandle(LuaCommandWriter);
-
-    impl LuaCommandWriterHandle {
-        pub fn publish(&self, commands: Vec<LuaCommandInfo>) {
-            self.0.publish(commands);
-        }
+    /// An egress that declared no host of its own and owns provider {slug}.
+    fn provider_owner(slug: &str) -> NetEgress {
+        let egress = NetEgress::new(Some(Arc::from([])));
+        egress.owns(slug.to_owned());
+        egress
     }
 
-    pub fn lua_command_writer_pair() -> (LuaCommandWriterHandle, LuaCommandReader) {
-        let (writer, reader) = LuaCommandWriter::new();
-        (LuaCommandWriterHandle(writer), reader)
+    /// Whether a plugin owning provider {slug} reaches {url} as that
+    /// provider's origin, under the provider hooks this process installed.
+    pub fn owner_vouches(slug: &str, url: &Url) -> bool {
+        provider_owner(slug).vouches(url)
     }
 
-    /// Stands in for the Lua thread publishing a plugin's status hints.
-    pub struct HintWriterHandle(HintWriter);
-
-    impl HintWriterHandle {
-        pub fn publish(&self, entries: HintEntries) {
-            self.0.publish(entries);
-        }
+    /// Whether a plugin owning provider {slug}, and declaring no host, may
+    /// reach `host:port`, under the provider hooks this process installed.
+    pub fn owner_allows(slug: &str, host: &str, port: u16) -> bool {
+        provider_owner(slug).allows(host, port)
     }
 
-    pub fn hint_writer_pair() -> (HintWriterHandle, HintReader) {
-        let (writer, reader) = HintWriter::new();
-        (HintWriterHandle(writer), reader)
-    }
-
-    /// Observes which requests an [`crate::EventHandle`] sends, without a
-    /// running plugin host.
-    pub struct RequestProbe(flume::Receiver<crate::runtime::Request>);
-
-    impl RequestProbe {
-        /// Next request as `(kind, clicks)`: `"click"` carries no clicks,
-        /// `"click_fallback"` and `"restore"` carry their restore item's.
-        pub fn try_recv(&self) -> Option<(&'static str, Vec<usize>)> {
-            use crate::runtime::Request;
-            Some(match self.0.try_recv().ok()? {
-                Request::ClickTool { fallback: None, .. } => ("click", Vec::new()),
-                Request::ClickTool {
-                    fallback: Some(fb), ..
-                } => ("click_fallback", fb.item.clicks),
-                Request::RestoreToolAsync { item, .. } => ("restore", item.clicks),
-                _ => ("other", Vec::new()),
-            })
-        }
-
-        /// Next dispatched slash command as `(command, args, depth)`, skipping
-        /// other requests.
-        pub fn try_recv_command(&self) -> Option<(String, String, u8)> {
-            use crate::runtime::Request;
-            while let Ok(req) = self.0.try_recv() {
-                if let Request::RunCommand {
-                    command,
-                    args,
-                    depth,
-                    ..
-                } = req
-                {
-                    return Some((command.to_string(), args, depth));
-                }
-            }
-            None
-        }
-
-        /// Next key handed to a plugin binding, skipping other requests. The
-        /// chat input fires an autocmd of its own on every keystroke, so a
-        /// test that types cannot tell a dispatched binding from an announced
-        /// edit without this.
-        pub fn try_recv_keybind(&self) -> Option<Key> {
-            self.try_recv_ticket().map(|ticket| ticket.key())
-        }
-
-        /// [`Self::try_recv_keybind`] with the whole ticket, for a test that
-        /// plays the Lua thread and reports the handler done.
-        pub fn try_recv_ticket(&self) -> Option<KeybindTicket> {
-            use crate::runtime::Request;
-            while let Ok(req) = self.0.try_recv() {
-                if let Request::RunKeybindCallback { ticket } = req {
-                    return Some(ticket);
-                }
-            }
-            None
-        }
-
-        /// Next queued restore item, skipping other requests.
-        pub fn try_recv_restore_item(&self) -> Option<crate::RestoreItem> {
-            use crate::runtime::Request;
-            while let Ok(req) = self.0.try_recv() {
-                if let Request::RestoreToolAsync { item, .. } = req {
-                    return Some(item);
-                }
-            }
-            None
-        }
-
-        /// Next fired autocmd as `(event, data)`, skipping other requests.
-        pub fn try_recv_autocmd(&self) -> Option<(String, serde_json::Value)> {
-            use crate::runtime::Request;
-            while let Ok(req) = self.0.try_recv() {
-                if let Request::FireAutocmd { event, data } = req {
-                    return Some((event, data));
-                }
-            }
-            None
-        }
-
-        /// Next `SessionEnd` request as the session being left behind and why.
-        pub fn try_recv_end_session(&self) -> Option<(MakiId, SessionEndReason)> {
-            use crate::runtime::Request;
-            while let Ok(req) = self.0.try_recv() {
-                if let Request::EndSession(end) = req {
-                    return Some((end.session, end.reason));
-                }
-            }
-            None
-        }
-    }
-
-    pub fn probed_event_handle() -> (crate::EventHandle, RequestProbe) {
-        let (tx, rx) = flume::unbounded();
-        (crate::EventHandle::probed_for_test(tx), RequestProbe(rx))
-    }
-
-    /// [`probed_event_handle`] for a host with a plugin layering the plan
-    /// form, the one case the UI has to ask a chain before it draws.
-    pub fn probed_event_handle_layering_plan_form() -> (crate::EventHandle, RequestProbe) {
-        let (handle, probe) = probed_event_handle();
-        (handle.layering(&[crate::api::slot::PLAN_FORM_SLOT]), probe)
-    }
-
-    /// Switches {reader}'s mode the way `maki.ui.set_mode` would.
-    pub fn set_mode(reader: &KeymapReader, mode: InputMode) {
-        reader.mode.set(mode);
-    }
-
-    /// One binding for [`keymap_reader_from`], global when `buffer` is `None`.
-    pub struct TestBinding<'a> {
-        pub plugin: &'a str,
-        pub modes: &'a [InputMode],
-        pub key: Key,
-        pub buffer: Option<&'a Arc<SharedBuf>>,
-    }
-
-    /// Publishes {binds}, set in order, so a later one shadows an earlier one
-    /// in its scope the way a later `maki.keymap.set` would.
-    pub fn keymap_reader_from(binds: &[TestBinding]) -> KeymapReader {
-        let lua = mlua::Lua::new();
-        let mut store = KeymapStore::new();
-        for bind in binds {
-            let callback = lua
-                .create_registry_value(lua.create_function(|_, ()| Ok(())).unwrap())
-                .unwrap();
-            store.set(
-                bind.key,
-                bind.modes,
-                callback,
-                Arc::from(bind.plugin),
-                PluginPermissions::trusted(),
-                SetOpts {
-                    buffer: bind.buffer.map(Arc::downgrade),
-                    ..Default::default()
-                },
-            );
-        }
-        let (writer, reader) = KeymapWriter::new();
-        writer.publish(store.snapshot_entries());
-        reader
+    pub fn sanitize_child_env(command: &mut Command) {
+        provider_hooks::sanitize_child_env(command);
     }
 }

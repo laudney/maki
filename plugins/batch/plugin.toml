@@ -1,2 +1,4 @@
 [permissions]
 agent = true
+
+[ui.permissions]

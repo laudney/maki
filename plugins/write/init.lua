@@ -1,5 +1,4 @@
 local shorten_path = require("maki.shorten_path")
-local ToolView = require("maki.tool_view")
 
 local DESCRIPTION = [[Write content to a file, replacing existing content.
 
@@ -7,22 +6,6 @@ local DESCRIPTION = [[Write content to a file, replacing existing content.
 - Always read the file first before writing.
 - NEVER create files unless absolutely necessary - prefer editing existing files.
 - NEVER proactively create documentation files (*.md) or README files. Only create documentation files if explicitly requested by the User.]]
-
-local function write_view_opts(ctx)
-  local tol = ctx:tool_output_lines()
-  return { max_lines = (tol and tol.write) or 10, keep = "head" }
-end
-
-local function build_view(content, path, ctx)
-  local buf = maki.ui.buf()
-  local view = ToolView.new(buf, write_view_opts(ctx))
-  view:set_highlight(content, path:match("%.([^%.]+)$") or "")
-  view:finish()
-  buf:on("click", function()
-    view:toggle()
-  end)
-  return buf
-end
 
 maki.api.register_tool({
   name = "write",
@@ -54,21 +37,11 @@ maki.api.register_tool({
     },
   },
 
-  header = function(input)
-    local buf = maki.ui.buf()
-    buf:line({ { shorten_path(input.path or ""), "path" } })
-    return buf
+  summary = function(input)
+    return shorten_path(input.path or input.file_path or "")
   end,
 
-  restore = function(input, output, _is_error, ctx)
-    local content = input.content or ""
-    if content == "" then
-      return ToolView.restore(output, write_view_opts(ctx))
-    end
-    return build_view(content, input.path or "", ctx)
-  end,
-
-  handler = function(input, ctx)
+  handler = function(input)
     local raw = input.path
     if not raw then
       return { llm_output = "error: path is required", is_error = true }
@@ -98,7 +71,6 @@ maki.api.register_tool({
 
     return {
       llm_output = llm_output,
-      body = build_view(content, path, ctx),
       annotation = annotation,
       written_path = path,
     }

@@ -1,31 +1,82 @@
 //! The one vocabulary every driver uses to talk about a persisted session.
 
-use std::sync::Arc;
+mod queue;
+
+pub use queue::QueueError;
+
+use crate::permissions::{PermissionManager, stored_to_rules};
+use crate::{AgentEvent, Envelope};
+use maki_config::Effect;
+use maki_types::inbox::SubagentInbox;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use arc_swap::ArcSwap;
-use maki_providers::{ContextGauge, Message, TokenUsage};
-use maki_storage::StateDir;
+use maki_providers::{ContextGauge, Message, Model, TokenUsage, settle_session};
 use maki_storage::frame::StoredFrame;
 use maki_storage::id::{MakiId, SessionRef};
 use maki_storage::sessions::{
-    SAVE_FAILED, Session, SessionClaim, SessionError, StoredMode, StoredThinking,
+    QueueReceipt, QueueStatus, SAVE_FAILED, SessionClaim, SessionError, StoredEffect, StoredMode,
+    StoredRule, StoredThinking, StoredTokenUsage,
+};
+use maki_storage::{StateDir, StorageError};
+pub use maki_types::session::{
+    SessionHeader, StoredSession, record_task_event, rewind_turns, truncate_to_turn,
 };
 use thiserror::Error;
 use tracing::warn;
 
+use crate::agent::CallCapture;
 use crate::agent::{
-    History, HistorySnapshot, RunContextBuilder, SharedHeader, SharedMessages, publish_live_session,
+    CapturedCall, History, HistorySnapshot, RunContextBuilder, SharedHeader, SharedMessages,
+    publish_live_session,
 };
 use crate::types::EventSender;
-use crate::{
-    AgentInput, AgentMode, AgentRunParams, RunLedger, RunTotals, SessionMailbox, ToolOutput,
-};
+use crate::types::Spend;
+use crate::{AgentInput, AgentMode, AgentRunParams, RunLedger, RunTotals, SessionMailbox};
 
+pub const FORK_TITLE_PREFIX: &str = "fork of ";
 pub const NOTHING_TO_STORE: &str = "session has no messages, nothing to store";
+/// Settling a loaded file's rows prices them at standard rates, as a load
+/// does: the turns that wrote them were priced when they ran.
+const RESTORED_FAST: bool = false;
 
-/// The one spelling of a persisted maki session. It cannot live in
-/// maki-storage: [`ToolOutput`] is ours, and maki-storage must not depend on us.
-pub type StoredSession = Session<Message, TokenUsage, ToolOutput, maki_types::tool::ToolData>;
+/// A session's settings as the user last chose them, which a host can keep
+/// newer than any run's [`AgentInput`]: a toggle can come while a run is out.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionSettings {
+    pub thinking: Option<StoredThinking>,
+    pub fast: bool,
+    pub workflow: bool,
+    /// `None` when the session never chose, so `--yolo` stays one-shot.
+    pub yolo: Option<bool>,
+}
+
+impl SessionSettings {
+    pub fn of(session: &StoredSession) -> Self {
+        Self {
+            thinking: session.meta.thinking,
+            fast: session.meta.fast,
+            workflow: session.meta.workflow,
+            yolo: session.meta.yolo,
+        }
+    }
+
+    pub fn shared(self) -> SharedSettings {
+        Arc::new(ArcSwap::from_pointee(self))
+    }
+
+    fn write(&self, session: &mut StoredSession) {
+        session.meta.thinking = self.thinking;
+        session.meta.fast = self.fast;
+        session.meta.workflow = self.workflow;
+        session.meta.yolo = self.yolo;
+    }
+}
+
+/// Shared between a host and its driver: the host writes it in the order it
+/// takes changes, and every save of the driver reads the latest.
+pub type SharedSettings = Arc<ArcSwap<SessionSettings>>;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -56,41 +107,6 @@ pub fn save_new(
     }
     session.save(claim, dir)?;
     Ok(session.id)
-}
-
-/// What a session says about itself besides its transcript: what export and
-/// `maki.session.read` answer with.
-#[derive(Debug, Clone, PartialEq)]
-pub struct SessionHeader {
-    pub cwd: String,
-    /// Empty until a turn picks one.
-    pub model: String,
-    pub title: String,
-    pub mode: Option<StoredMode>,
-    pub thinking: Option<StoredThinking>,
-    pub fast: bool,
-    pub usage: TokenUsage,
-    pub context_size: u32,
-    pub updated_at: u64,
-    /// A turn is running. Always false for a session read from disk.
-    pub working: bool,
-}
-
-impl SessionHeader {
-    pub fn of(session: &StoredSession) -> Self {
-        Self {
-            cwd: session.cwd.clone(),
-            model: session.model.clone(),
-            title: session.title.clone(),
-            mode: session.meta.mode,
-            thinking: session.meta.thinking,
-            fast: session.meta.fast,
-            usage: session.token_usage,
-            context_size: session.meta.context_size,
-            updated_at: session.updated_at,
-            working: false,
-        }
-    }
 }
 
 /// A transcript a driver starts from. The id comes from the caller, because
@@ -145,49 +161,26 @@ impl Resumed {
     }
 }
 
-/// Everything a session run owns: what it said, how big that is, what it
-/// spent, and where it is written. [`AgentRunParams`] already wants `history`
-/// and `gauge` under one owner, and the store joins them so a driver cannot
-/// hold a transcript it never persists.
-///
-/// The transcript is only reachable through [`Self::turn`], whose guard writes
-/// it back when it drops, so "built an agent and forgot to persist it" is not a
-/// mistake a driver can make.
-///
-/// Work moved off a turn can keep spending after the last turn ended.
-/// Dropping the track writes that spend, so a driver drops it once the work
-/// is stopped.
+/// Owns the claimed session, its transcript and its context gauge. Turns save
+/// on drop; an explicit rewind commits a cut before changing the live history.
 pub struct SessionTrack {
     history: History,
     gauge: ContextGauge,
-    store: SessionStore,
-    /// Every turn's ledger is its child, so a round lands here once, when it
-    /// is paid, even from work that moved off a turn that ended long ago.
+    store: SessionControl,
     spend: Arc<RunLedger>,
-    /// What the session had spent before this process opened it.
     opened_usage: TokenUsage,
-    /// The part of `spend` some turn's ledger reported.
     reported: RunTotals,
 }
 
 impl SessionTrack {
-    /// Built once the provider resolves, so a run that never started leaves no
-    /// file behind. The state dir comes from the caller rather than being
-    /// resolved here, so the run writes where its history was read from.
-    ///
-    /// Takes the claim by value, so nobody else can write the session for as
-    /// long as this track can.
-    ///
-    /// Holds `mailbox`, so the live session outlives the last write, which
-    /// stores the receipts still in it.
-    ///
-    /// Publishes the transcript and the settings under the session's id, so
-    /// `maki.session.messages`, `export` and `read` work under a headless
-    /// driver too, before anything is saved.
-    ///
-    /// Bills the session to `spend`, which the driver keeps to read what this
-    /// process spent once nothing can add to it.
-    pub fn open(
+    /// Publishes the claimed session without writing a file. The first turn
+    /// with messages saves it, so a failed connection leaves no empty entry.
+    pub fn open(resumed: Resumed, claim: SessionClaim, storage: StateDir, cwd: &str) -> Self {
+        let mailbox = SessionMailbox::register(resumed.id.id());
+        Self::with_background(resumed, claim, storage, mailbox, Arc::default(), cwd)
+    }
+
+    pub fn with_background(
         resumed: Resumed,
         claim: SessionClaim,
         storage: StateDir,
@@ -196,18 +189,51 @@ impl SessionTrack {
         cwd: &str,
     ) -> Self {
         let mirror: SharedMessages = Arc::new(ArcSwap::from_pointee(HistorySnapshot::default()));
-        let store = SessionStore::open(storage, claim, mailbox, resumed.session, cwd);
+        let mut store = SessionStore::open(storage, claim, mailbox, resumed.session, cwd);
+        store.restored = store.persisted.as_ref().map(|_| resumed.history.clone());
         publish_live_session(resumed.id.id(), &mirror, &store.header);
+        store.history = Arc::clone(&mirror);
+        let history = History::restored(resumed.history)
+            .with_frame(resumed.frame)
+            .capturing_calls()
+            .with_mirror(mirror);
+        store.calls = history.call_capture();
         Self {
             opened_usage: store.session.token_usage,
-            store,
-            history: History::restored(resumed.history)
-                .with_frame(resumed.frame)
-                .with_mirror(mirror),
-            gauge: ContextGauge::restored(resumed.context_size),
             spend,
             reported: RunTotals::default(),
+            store: SessionControl(Arc::new(Mutex::new(store))),
+            history,
+            gauge: ContextGauge::restored(resumed.context_size),
         }
+    }
+
+    /// Every save then writes the host's latest settings, so no order of a
+    /// prompt and a toggle can store an older value.
+    pub fn with_settings(self, settings: SharedSettings) -> Self {
+        self.store.lock().settings = Some(settings);
+        self
+    }
+
+    pub fn with_permissions(self, permissions: Arc<PermissionManager>) -> Self {
+        let mut store = self.store.lock();
+        permissions.load_session_rules(stored_to_rules(&store.session.meta.session_rules));
+        store.permissions = Some(permissions);
+        drop(store);
+        self
+    }
+
+    pub fn control(&self) -> SessionControl {
+        self.store.clone()
+    }
+
+    pub fn save_settings(&mut self) {
+        let mut store = self.store.lock();
+        if let Some(settings) = store.settings.clone() {
+            settings.load().write(&mut store.session);
+        }
+        store.publish_header(false);
+        store.save_metadata();
     }
 
     /// One turn against this transcript. The returned guard is the only way to
@@ -222,59 +248,192 @@ impl SessionTrack {
     /// The settings come from `input` for the same reason: they are what the
     /// turn really runs under, so readers and the saved file never report a
     /// mode the driver switched away from.
-    ///
-    /// The turn's ledger opens with what moved work spent that no turn
-    /// reported yet. Moved work sends no events a frontend sees, so this
-    /// turn's `Done` is where that spend shows up.
     pub fn turn(&mut self, model_spec: String, input: &AgentInput) -> SessionTurn<'_> {
-        let unreported = self.spend.totals().since(&self.reported);
-        let ledger = RunLedger::carrying(&self.spend, unreported);
-        let session = &mut self.store.session;
-        session.set_model(model_spec);
-        session.meta.mode = Some(match input.mode {
-            AgentMode::Build => StoredMode::Build,
-            AgentMode::Plan(_) => StoredMode::Plan,
+        {
+            let mut store = self.store.lock();
+            store.session.meta.mode = Some(match input.mode {
+                AgentMode::Build => StoredMode::Build,
+                AgentMode::Plan(_) => StoredMode::Plan,
+            });
+            if let AgentMode::Plan(path) = &input.mode {
+                store.session.meta.plan_path = Some(path.to_string_lossy().into_owned());
+            }
+            if store.settings.is_none() {
+                store.session.meta.thinking = Some(input.thinking.into());
+                store.session.meta.fast = input.fast;
+                store.session.meta.workflow = input.workflow;
+            }
+        }
+        self.begin(model_spec)
+    }
+
+    /// A turn no prompt started, such as a `/compact`: the session keeps the
+    /// mode and the settings it had.
+    pub fn compaction(&mut self, model_spec: String) -> SessionTurn<'_> {
+        self.begin(model_spec)
+    }
+
+    pub fn rewind(
+        &mut self,
+        index: usize,
+        prompt: &str,
+        next_run: u64,
+    ) -> Result<Vec<QueueReceipt>, SessionError> {
+        let mut store = self.store.lock();
+        let mut snapshot = store.snapshot();
+        if !rewind_turns(snapshot.messages()).contains(&(index, prompt)) {
+            return Err(StorageError::NotFound("rewind turn changed".into()).into());
+        }
+        snapshot.meta.context_size = truncate_to_turn(&mut snapshot, index, self.gauge.size());
+        let surviving: HashSet<_> = snapshot
+            .messages()
+            .iter()
+            .flat_map(Message::tool_uses)
+            .map(|(id, _, _)| id.to_owned())
+            .collect();
+        let forgotten: Vec<_> = store
+            .mailbox
+            .unsettled()
+            .into_iter()
+            .filter(|id| !surviving.contains(id))
+            .collect();
+        snapshot
+            .meta
+            .pending_background
+            .retain(|id| surviving.contains(id));
+        let mut cancelled = Vec::new();
+        for work in &mut snapshot.meta.accepted_work {
+            if matches!(work.status, QueueStatus::Queued | QueueStatus::Running) {
+                work.status = QueueStatus::Cancelled;
+                work.input = None;
+                cancelled.push(work.clone());
+            }
+        }
+        if snapshot.messages().is_empty() {
+            snapshot.meta.accepted_work.clear();
+            if let Err(error) = StoredSession::delete(&store.claim, &store.dir)
+                && !error.is_not_found()
+            {
+                return Err(error);
+            }
+        } else {
+            snapshot.save(&store.claim, &store.dir)?;
+        }
+        for id in forgotten {
+            store.mailbox.forget(&id);
+        }
+        self.history = History::restored(snapshot.messages().to_vec())
+            .with_frame(snapshot.frame().cloned())
+            .capturing_calls()
+            .with_mirror(Arc::clone(&store.history));
+        self.history.mark_saved();
+        self.gauge = ContextGauge::restored(snapshot.meta.context_size);
+        store.task_from_run = next_run;
+        store.deleted_tasks.retain(|id| surviving.contains(id));
+        store.task_inboxes.retain(|id, _| {
+            snapshot
+                .subagents()
+                .iter()
+                .any(|task| task.tool_use_id == *id)
         });
-        session.meta.thinking = Some(input.thinking.into());
-        session.meta.fast = input.fast;
-        session.meta.workflow = input.workflow;
-        self.store.publish_header(true);
+        store.calls = self.history.call_capture();
+        store.persisted = Some(SessionSettings::of(&snapshot));
+        store.session = snapshot;
+        store.restored = None;
+        store.publish_header(false);
+        Ok(cancelled)
+    }
+
+    pub(crate) fn finish_queue(
+        &mut self,
+        status: QueueStatus,
+        error: Option<String>,
+    ) -> Result<Vec<QueueReceipt>, QueueError> {
+        if self.history.has_unsaved()
+            && self
+                .store
+                .lock()
+                .session
+                .meta
+                .accepted_work
+                .iter()
+                .any(|work| work.status == QueueStatus::Running)
+        {
+            return Err(QueueError::Invalid("turn transcript could not be saved"));
+        }
+        self.store.finish_queue(status, error)
+    }
+
+    fn begin(&mut self, model_spec: String) -> SessionTurn<'_> {
+        let ledger = RunLedger::carrying(&self.spend, self.spend.totals().since(&self.reported));
+        {
+            let mut store = self.store.lock();
+            store.session.set_model(model_spec);
+            if let Some(settings) = store.settings.clone() {
+                settings.load().write(&mut store.session);
+            }
+            store.publish_header(true);
+        }
         SessionTurn {
             track: self,
             ledger,
         }
     }
 
-    /// Puts what the session spent on it, and writes it when that or the
-    /// transcript moved since the last write. A turn that changed nothing
-    /// writes nothing: a rewrite would move `updated_at`, which reorders
-    /// `--continue`, stamp a model no turn ran on, and commit the
-    /// restore-time repair over the only copy of the transcript.
     fn settle(&mut self) {
-        let mut usage = self.opened_usage;
-        usage += self.spend.totals().usage;
-        let billed = usage != self.store.session.token_usage;
-        self.store.session.token_usage = usage;
-        if !billed && !self.history.has_unsaved() {
-            return;
+        let mut store = self.store.lock();
+        if let Some(settings) = store.settings.clone() {
+            settings.load().write(&mut store.session);
         }
-        let history = &mut self.history;
-        let store = &mut self.store;
-        match store.record_turn(history.as_slice(), history.frame(), self.gauge.size()) {
-            Ok(()) => history.mark_saved(),
-            // Only headless runs save through here (the TUI has its own
-            // writer), so printing cannot tear a drawn frame.
-            Err(e) => {
-                warn!(error = %e, session_id = %store.session.id, "failed to persist session");
-                eprintln!("{SAVE_FAILED}{}: {e}", store.session.id);
+        let Spend { totals, by_model } = self.spend.spend();
+        if !by_model.is_empty()
+            && let Some(recorded) = store.unsettled.take()
+        {
+            settle_baseline(&mut store.session, &recorded);
+            store.opened_rows = store.session.usage_by_model().clone();
+        }
+        let mut usage = self.opened_usage;
+        usage += totals.usage;
+        let billed = usage != store.session.token_usage;
+        store.session.token_usage = usage;
+        *store.session.usage_by_model_mut() = store.opened_rows.clone();
+        for (model, row) in by_model {
+            store.session.add_model_usage(&model, row);
+        }
+        let calls = self.history.take_calls();
+        if self.history.has_unsaved() || !calls.is_empty() {
+            match store.record_turn(
+                calls,
+                self.history.as_slice(),
+                self.history.frame(),
+                self.gauge.size(),
+            ) {
+                Ok(()) => {
+                    self.history.mark_saved();
+                    store.persisted = Some(SessionSettings::of(&store.session));
+                    store.restored = None;
+                }
+                Err(error) => {
+                    self.history.mark_unsaved();
+                    warn!(%error, session_id = %store.session.id, "failed to persist session");
+                    eprintln!("{SAVE_FAILED}{}: {error}", store.session.id);
+                }
             }
+        } else if billed {
+            store.save_metadata();
         }
     }
 }
 
+/// A host can accept a change and close the session before the driver saw
+/// it idle; cancelling the driver drops the track, which saves it then.
 impl Drop for SessionTrack {
     fn drop(&mut self) {
         self.settle();
+        let unsaved = self.store.lock().settings_unsaved();
+        if unsaved {
+            self.save_settings();
+        }
     }
 }
 
@@ -285,8 +444,8 @@ pub struct SessionTurn<'a> {
 }
 
 impl SessionTurn<'_> {
-    /// What the turn's agent bills to. The session's spend holds all of it,
-    /// so the agent must be built with this one.
+    /// What the turn's agent bills to. The turn adds it to the session's
+    /// usage when it ends, so the agent must be built with this one.
     pub fn ledger(&self) -> Arc<RunLedger> {
         Arc::clone(&self.ledger)
     }
@@ -306,10 +465,197 @@ impl SessionTurn<'_> {
 }
 
 impl Drop for SessionTurn<'_> {
+    /// A turn that changed nothing writes nothing. A rewrite would move
+    /// `updated_at`, which reorders `--continue`, stamp a model no turn ran
+    /// on, and commit the restore-time repair over the only copy of the
+    /// transcript. A turn that only spent, such as a paid summary that came
+    /// back empty, saves the bill under the transcript as it was.
     fn drop(&mut self) {
         self.track.reported += self.ledger.totals();
         self.track.settle();
-        self.track.store.publish_header(false);
+        self.track.store.lock().publish_header(false);
+    }
+}
+
+/// Prices what a loaded file held before exact rows join it, against the
+/// model it recorded, or the one the turn ran on when that no longer
+/// resolves, as an ACP load falls back. With neither, the counts stay as an
+/// unpriced row, which a later load can still price.
+fn settle_baseline(session: &mut StoredSession, recorded: &str) {
+    let before = session.token_usage;
+    match Model::from_spec(recorded).or_else(|_| Model::from_spec(&session.model)) {
+        Ok(model) => {
+            settle_session(&before, session.usage_by_model_mut(), &model, RESTORED_FAST);
+        }
+        Err(_) if session.usage_by_model().is_empty() && before != TokenUsage::default() => {
+            session.add_model_usage(recorded, before.billed(None));
+        }
+        Err(_) => {}
+    }
+}
+
+/// The claimed session store shared by its runner and host operations.
+#[derive(Clone)]
+pub struct SessionControl(Arc<Mutex<SessionStore>>);
+
+impl SessionControl {
+    fn lock(&self) -> MutexGuard<'_, SessionStore> {
+        self.0.lock().unwrap_or_else(|error| error.into_inner())
+    }
+
+    pub fn background_tasks(&self) -> usize {
+        self.lock().mailbox.unsettled().len()
+    }
+
+    pub fn snapshot(&self) -> StoredSession {
+        self.lock().snapshot()
+    }
+
+    /// Holds off queue starts and enqueues while `edit` changes idle state.
+    /// The callback must not call back into this session control.
+    pub fn while_idle<T>(&self, edit: impl FnOnce() -> T) -> Option<T> {
+        let store = self.lock();
+        if store.header.load().working
+            || store
+                .session
+                .meta
+                .accepted_work
+                .iter()
+                .any(|work| matches!(work.status, QueueStatus::Queued | QueueStatus::Running))
+        {
+            return None;
+        }
+        Some(edit())
+    }
+
+    pub fn task_inbox(&self, id: &str) -> Result<Arc<SubagentInbox>, SessionError> {
+        self.lock()
+            .task_inboxes
+            .get(id)
+            .cloned()
+            .ok_or_else(|| StorageError::NotFound(format!("task inbox: {id}")).into())
+    }
+
+    pub fn remove_task(&self, id: &str) -> Result<(), SessionError> {
+        let mut store = self.lock();
+        if !store
+            .session
+            .subagents()
+            .iter()
+            .any(|task| task.tool_use_id == id)
+        {
+            return Err(StorageError::NotFound(format!("unknown task: {id}")).into());
+        }
+        if store.task_inboxes.contains_key(id) {
+            return Err(StorageError::NotFound(format!("task is still running: {id}")).into());
+        }
+        let before = store.session.clone();
+        store.session.remove_subagent(id, |message| {
+            message
+                .tool_uses()
+                .map(|(id, _, _)| id.to_owned())
+                .collect()
+        });
+        store.commit(before)?;
+        store.deleted_tasks.insert(id.to_owned());
+        Ok(())
+    }
+
+    pub fn record_task(&self, envelope: &Envelope, plugin: Option<Arc<str>>) -> bool {
+        let mut store = self.lock();
+        let id = match &envelope.event {
+            AgentEvent::SubagentHistory { tool_use_id, .. } => Some(tool_use_id.as_str()),
+            AgentEvent::TaskEnded { id, .. } => Some(id.as_str()),
+            AgentEvent::ToolParts { id, .. } | AgentEvent::ToolMovable { id, .. }
+                if envelope.subagent.is_none() =>
+            {
+                Some(id.as_str())
+            }
+            AgentEvent::ToolDone(done) if envelope.subagent.is_none() => Some(done.id.as_str()),
+            AgentEvent::ToolProgress(progress) if envelope.subagent.is_none() => {
+                Some(progress.id.as_str())
+            }
+            _ => envelope
+                .subagent
+                .as_ref()
+                .map(|info| info.parent_tool_use_id.as_str()),
+        };
+        let parent_call = envelope
+            .subagent
+            .as_ref()
+            .and_then(|info| info.parent_call.as_deref())
+            .or(id);
+        let receipt_bound = plugin.is_none()
+            || envelope
+                .subagent
+                .as_ref()
+                .is_some_and(|info| info.parent_call.is_some())
+            || matches!(
+                envelope.event,
+                AgentEvent::ToolDone(_)
+                    | AgentEvent::ToolProgress(_)
+                    | AgentEvent::ToolParts { .. }
+                    | AgentEvent::ToolMovable { .. }
+            ) && envelope.subagent.is_none()
+            || id.is_some_and(|id| {
+                store
+                    .session
+                    .subagents()
+                    .iter()
+                    .any(|task| task.tool_use_id == id && task.parent_call.is_some())
+            });
+        if receipt_bound
+            && envelope.run_id < store.task_from_run
+            && !parent_call.is_some_and(|id| {
+                store
+                    .history
+                    .load()
+                    .messages
+                    .iter()
+                    .flat_map(Message::tool_uses)
+                    .any(|(known, _, _)| known == id)
+            })
+        {
+            return false;
+        }
+        if id.is_some_and(|id| store.deleted_tasks.contains(id)) {
+            return false;
+        }
+        if let Some(info) = &envelope.subagent
+            && let Some(inbox) = &info.inbox
+        {
+            store
+                .task_inboxes
+                .insert(info.parent_tool_use_id.clone(), Arc::clone(inbox));
+        }
+        if plugin.is_none()
+            && let AgentEvent::SubagentHistory { tool_use_id, .. } = &envelope.event
+        {
+            store.task_inboxes.remove(tool_use_id);
+        }
+        if let AgentEvent::StreamClosed = &envelope.event
+            && let Some(id) = id
+        {
+            store.task_inboxes.remove(id);
+        }
+        if record_task_event(&mut store.session, envelope, plugin) {
+            store.save_metadata();
+        }
+        true
+    }
+
+    pub fn set_cwd(&self, cwd: String) -> Result<(), SessionError> {
+        let mut store = self.lock();
+        let before = store.session.clone();
+        store.session.set_cwd(cwd);
+        store.commit(before)
+    }
+
+    pub fn set_title(&self, title: String) -> Result<(), SessionError> {
+        let mut store = self.lock();
+        let before = store.session.clone();
+        store.session.set_title(title);
+        store.commit(before)
     }
 }
 
@@ -317,12 +663,43 @@ struct SessionStore {
     dir: StateDir,
     claim: SessionClaim,
     mailbox: SessionMailbox,
+    opened_rows: HashMap<String, StoredTokenUsage>,
     session: StoredSession,
     /// `session`'s header as readers see it, republished whenever it moves.
     header: SharedHeader,
+    history: SharedMessages,
+    calls: Option<CallCapture>,
+    queue_ready: (flume::Sender<()>, flume::Receiver<()>),
+    settings: Option<SharedSettings>,
+    permissions: Option<Arc<PermissionManager>>,
+    persisted: Option<SessionSettings>,
+    restored: Option<Vec<Message>>,
+    unsettled: Option<String>,
+    task_from_run: u64,
+    task_inboxes: HashMap<String, Arc<SubagentInbox>>,
+    deleted_tasks: HashSet<String>,
 }
 
 impl SessionStore {
+    fn snapshot(&self) -> StoredSession {
+        let mut session = self.session.clone();
+        let history = self.history.load_full();
+        session.replace_messages(history.messages.as_ref().clone());
+        session.set_frame(history.frame.clone());
+        if let Some(settings) = &self.settings {
+            settings.load().write(&mut session);
+        }
+        if let Some(rules) = self.permission_rules() {
+            session.meta.session_rules = rules;
+        }
+        if let Some(calls) = &self.calls {
+            for (id, output, data) in calls.snapshot() {
+                session.insert_tool_output(id, output, data);
+            }
+        }
+        session
+    }
+
     /// Opening touches no file: the driver either read the session already or
     /// there is nothing under the id to read. A session nothing was written for
     /// yet is held in memory until [`Self::record_turn`] has something to
@@ -335,6 +712,8 @@ impl SessionStore {
         stored: Option<StoredSession>,
         cwd: &str,
     ) -> Self {
+        let persisted = stored.as_ref().map(SessionSettings::of);
+        let unsettled = stored.as_ref().map(|session| session.model.clone());
         let session = stored.unwrap_or_else(|| {
             let mut session = StoredSession::new("", cwd);
             session.id = claim.id();
@@ -344,8 +723,94 @@ impl SessionStore {
             dir,
             claim,
             mailbox,
+            opened_rows: session.usage_by_model().clone(),
             header: Arc::new(ArcSwap::from_pointee(SessionHeader::of(&session))),
             session,
+            history: Arc::default(),
+            calls: None,
+            queue_ready: flume::bounded(1),
+            settings: None,
+            permissions: None,
+            persisted,
+            restored: None,
+            unsettled,
+            task_from_run: 0,
+            task_inboxes: HashMap::new(),
+            deleted_tasks: HashSet::new(),
+        }
+    }
+
+    fn commit(&mut self, before: StoredSession) -> Result<(), SessionError> {
+        if let Some(settings) = &self.settings {
+            settings.load().write(&mut self.session);
+        }
+        if let Err(error) = self.persist_metadata() {
+            self.session = before;
+            return Err(error);
+        }
+        self.publish_header(self.header.load().working);
+        Ok(())
+    }
+
+    fn settings_unsaved(&self) -> bool {
+        self.settings
+            .as_ref()
+            .is_some_and(|settings| Some(&**settings.load()) != self.persisted.as_ref())
+            || self
+                .permission_rules()
+                .is_some_and(|rules| rules != self.session.meta.session_rules)
+    }
+
+    fn permission_rules(&self) -> Option<Vec<StoredRule>> {
+        self.permissions.as_ref().map(|permissions| {
+            permissions
+                .session_rules_snapshot()
+                .into_iter()
+                .map(|rule| StoredRule {
+                    tool: rule.tool.to_string(),
+                    scope: rule.scope,
+                    effect: match rule.effect {
+                        Effect::Allow => StoredEffect::Allow,
+                        Effect::Deny => StoredEffect::Deny,
+                    },
+                })
+                .collect()
+        })
+    }
+
+    fn sync_permissions(&mut self) {
+        if let Some(rules) = self.permission_rules() {
+            self.session.meta.session_rules = rules;
+        }
+    }
+
+    fn persist_metadata(&mut self) -> Result<(), SessionError> {
+        self.sync_permissions();
+        self.session.meta.pending_background = self.mailbox.unsettled();
+        let messages = self
+            .restored
+            .clone()
+            .unwrap_or_else(|| self.history.load().messages.as_ref().clone());
+        if messages.is_empty() && self.session.meta.accepted_work.is_empty() {
+            return Ok(());
+        }
+        self.session.replace_messages(messages);
+        if self.restored.is_none() {
+            self.session.set_frame(self.history.load().frame.clone());
+            if let Some(calls) = &self.calls {
+                for (id, output, data) in calls.snapshot() {
+                    self.session.insert_tool_output(id, output, data);
+                }
+            }
+        }
+        self.session.save(&self.claim, &self.dir)?;
+        self.persisted = Some(SessionSettings::of(&self.session));
+        Ok(())
+    }
+
+    fn save_metadata(&mut self) {
+        if let Err(error) = self.persist_metadata() {
+            warn!(%error, session_id = %self.session.id, "failed to save session meta");
         }
     }
 
@@ -360,21 +825,25 @@ impl SessionStore {
     /// its gauge from it. Stored without one, the next process is back to
     /// estimating a transcript this one had measured.
     ///
+    /// The turn's calls join the session first, so a failed write keeps them
+    /// for the next one.
+    ///
     /// An empty transcript is not a session, the same rule [`save_new`]
     /// holds a new one to. An empty log is one the picker offers and `--continue`
     /// resolves to, so a run killed before its first turn would leave a dead
     /// entry behind for good. The same guard stops a history that sanitized
     /// down to nothing from replacing the copy it was restored from.
-    ///
-    /// The receipts still unsettled go with the transcript that holds them,
-    /// so a process that dies with work out leaves a resume something to
-    /// tell the model.
     fn record_turn(
         &mut self,
+        calls: Vec<CapturedCall>,
         messages: &[Message],
         frame: Option<&Arc<StoredFrame>>,
         context_size: u32,
     ) -> Result<(), SessionError> {
+        self.sync_permissions();
+        for (id, output, data) in calls {
+            self.session.insert_tool_output(id, output, data);
+        }
         if messages.is_empty() {
             return Ok(());
         }
@@ -395,11 +864,14 @@ mod tests {
     use maki_storage::frame::PromptFacts;
     use maki_storage::id::MakiId;
     use maki_storage::sessions::{SESSIONS_DIR, generate_title};
+    use maki_types::event::{SubagentInfo, ToolDoneEvent};
+    use maki_types::input::{Compaction, SessionInput};
+    use maki_types::tool::{DEFAULT_DATA_VERSION, ToolData, ToolOutput};
     use tempfile::TempDir;
     use test_case::test_case;
 
     use crate::tools::RequestTools;
-    use crate::{BackgroundNotice, InputSource, RunContext, SessionDefaults, TaskEnd};
+    use crate::{InputSource, RunContext, SessionDefaults, TurnCompleteEvent};
 
     use super::*;
     use crate::agent::{live_header, live_history};
@@ -426,22 +898,23 @@ mod tests {
     const FRAME_MCP_TOOL: &str = "srv__tool";
     const FRAME_KEPT: &str = "a resumed process must send the prefix the transcript was sent under";
     const THINKING: StoredThinking = StoredThinking::Adaptive;
+    const PRICED_SPEC: &str = "anthropic/claude-sonnet-4-20250514";
+    const PRICED_ID: &str = "claude-sonnet-4-20250514";
+    const OTHER_ID: &str = "other-model";
+    const UNKNOWN_SPEC: &str = "no-such-provider/no-such-model";
+    const ONE_MILLION: u32 = 1_000_000;
+    const TURN_COST: f64 = 0.5;
+    const SETTLED: &str = "the older spending must be priced before exact rows join it";
     const TURN_INPUT_TOKENS: u32 = 1_000;
     const TURNS: u32 = 2;
     const SETTINGS_TRACKED: &str = "readers and the file must report what the last turn ran under";
     const USAGE_SUMMED: &str =
         "every turn's bill must add up on the session, in memory and on disk";
-    const BACKGROUND_TASK_ID: &str = "toolu_bg";
-    const BACKGROUND_RESULT: &str = "build finished";
-    const UNSETTLED_STORED: &str = "a receipt the model still waits on must reach the meta";
-    const SETTLED_CLEARED: &str = "a result a run read must leave the meta";
-    const TURN_COST: f64 = 0.25;
-    const LATE_COST: f64 = 0.5;
-    const LATE_INPUT_TOKENS: u32 = 300;
-    const LATE_REPORTED: &str = "the next turn must report what moved work spent after its turn";
-    const LATE_REPORTED_ONCE: &str = "late spend already reported must not be billed twice";
-    const LATE_STORED: &str =
-        "what moved work spent after the last turn must count once, with no turn to carry it";
+    const CALL_ID: &str = "tool-1";
+    const CALL_TOOL: &str = "bash";
+    const CALL_OUTPUT: &str = "ok";
+    const CALL_SUMMARY: &str = "ran the build";
+    const CALL_SAVED: &str = "a headless turn must save each call's output and data";
 
     fn session_id() -> MakiId {
         SESSION_ID.parse().unwrap()
@@ -471,10 +944,11 @@ mod tests {
             params.history.push(Message::user(PROMPT.into()));
             params.history.push(orphan);
         });
-        open_track(
+        SessionTrack::open(
             Resumed::stored(SessionRef::from(session_id()), load(tmp)),
             claim(tmp),
-            tmp,
+            state_dir(tmp),
+            CWD,
         )
     }
 
@@ -494,13 +968,8 @@ mod tests {
         SessionClaim::acquire(session_id(), &state_dir(tmp)).expect("nothing else holds it")
     }
 
-    fn open_track(resumed: Resumed, claim: SessionClaim, tmp: &TempDir) -> SessionTrack {
-        let mailbox = SessionMailbox::register(resumed.id.id());
-        SessionTrack::open(resumed, claim, state_dir(tmp), mailbox, Arc::default(), CWD)
-    }
-
     fn track_on(tmp: &TempDir) -> SessionTrack {
-        open_track(resumed(), claim(tmp), tmp)
+        SessionTrack::open(resumed(), claim(tmp), state_dir(tmp), CWD)
     }
 
     fn input(mode: AgentMode) -> AgentInput {
@@ -681,10 +1150,11 @@ mod tests {
         stored.set_title(TITLE.to_owned());
         stored.meta.plan_path = Some(PLAN_PATH.to_owned());
 
-        let mut track = open_track(
+        let mut track = SessionTrack::open(
             Resumed::stored(SessionRef::from(session_id()), stored),
             claim(&tmp),
-            &tmp,
+            state_dir(&tmp),
+            CWD,
         );
         push_prompt(&mut track, OTHER_SPEC, PROMPT);
 
@@ -715,16 +1185,17 @@ mod tests {
             frame: Some(Arc::clone(&frame)),
             ..resumed()
         };
-        let mut track = open_track(resumed, claim(&tmp), &tmp);
+        let mut track = SessionTrack::open(resumed, claim(&tmp), state_dir(&tmp), CWD);
         push_prompt(&mut track, MODEL_SPEC, OBSERVATION);
         drop(track);
 
         let stored = load(&tmp);
         assert_eq!(stored.frame(), Some(&frame), "{FRAME_KEPT}");
-        let reopened = open_track(
+        let reopened = SessionTrack::open(
             Resumed::stored(SessionRef::from(session_id()), stored),
             claim(&tmp),
-            &tmp,
+            state_dir(&tmp),
+            CWD,
         );
         assert_eq!(reopened.history.frame(), Some(&frame), "{FRAME_KEPT}");
     }
@@ -742,7 +1213,7 @@ mod tests {
             ..Resumed::empty(SessionRef::from(id))
         };
         let claim = SessionClaim::acquire(id, &state_dir(&tmp)).expect("nothing else holds it");
-        let mut track = open_track(resumed, claim, &tmp);
+        let mut track = SessionTrack::open(resumed, claim, state_dir(&tmp), CWD);
 
         let restored = live_history(id).expect("an open track is live");
         assert_eq!(restored.len(), 1);
@@ -765,7 +1236,12 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let id = MakiId::generate();
         let claim = SessionClaim::acquire(id, &state_dir(&tmp)).expect("nothing else holds it");
-        let mut track = open_track(Resumed::empty(SessionRef::from(id)), claim, &tmp);
+        let mut track = SessionTrack::open(
+            Resumed::empty(SessionRef::from(id)),
+            claim,
+            state_dir(&tmp),
+            CWD,
+        );
 
         let opened = live_header(id).expect("an open track publishes its header");
         assert_eq!(opened.cwd, CWD);
@@ -789,33 +1265,105 @@ mod tests {
         assert!(live_header(id).is_none());
     }
 
-    /// A process that dies with work out leaves only the meta to say so, and
-    /// a result a run has read is no longer something to report lost.
+    fn billed(model: &str, usage: TokenUsage, cost: Option<f64>) -> TurnCompleteEvent {
+        TurnCompleteEvent {
+            message: Message::default(),
+            usage,
+            model: model.into(),
+            cost,
+            subsidised_list_cost: None,
+            subsidised_by: None,
+            context_size: None,
+            context_window: 0,
+        }
+    }
+
     #[test]
-    fn each_turn_stores_the_receipts_still_unsettled() {
+    fn moved_work_is_reported_once_and_saved_after_the_last_turn() {
         let tmp = TempDir::new().unwrap();
         let id = MakiId::generate();
+        let dir = state_dir(&tmp);
+        let claim = SessionClaim::acquire(id, &dir).unwrap();
         let mailbox = SessionMailbox::register(id);
-        let claim = SessionClaim::acquire(id, &state_dir(&tmp)).expect("nothing else holds it");
-        let mut track = open_track(Resumed::empty(SessionRef::from(id)), claim, &tmp);
-        let stored = || StoredSession::load(id, &state_dir(&tmp)).unwrap();
+        let mut track = SessionTrack::with_background(
+            Resumed::empty(SessionRef::from(id)),
+            claim,
+            dir.clone(),
+            mailbox,
+            Arc::default(),
+            CWD,
+        );
+        let moved = {
+            let mut turn = track.turn(MODEL_SPEC.into(), &input(AgentMode::Build));
+            run_params(&mut turn)
+                .history
+                .push(Message::user(PROMPT.into()));
+            RunLedger::child(&turn.ledger())
+        };
+        moved.bill(&billed(OTHER_ID, million_input(), Some(TURN_COST)), None);
+        assert_eq!(
+            track
+                .turn(MODEL_SPEC.into(), &input(AgentMode::Build))
+                .ledger()
+                .totals()
+                .cost,
+            Some(TURN_COST)
+        );
+        assert_eq!(
+            track
+                .turn(MODEL_SPEC.into(), &input(AgentMode::Build))
+                .ledger()
+                .totals()
+                .cost,
+            None
+        );
+        moved.bill(&billed(OTHER_ID, million_input(), Some(TURN_COST)), None);
+        drop(track);
+        let saved = StoredSession::load(id, &dir).unwrap();
+        assert_eq!(saved.token_usage.input, ONE_MILLION * 2);
+        assert_eq!(saved.usage_by_model()[OTHER_ID].cost, Some(TURN_COST * 2.0));
+    }
 
-        mailbox.track(BACKGROUND_TASK_ID);
+    #[test]
+    fn receipts_remain_pending_until_the_model_reads_their_results() {
+        let tmp = TempDir::new().unwrap();
+        let id = MakiId::generate();
+        let dir = state_dir(&tmp);
+        let claim = SessionClaim::acquire(id, &dir).unwrap();
+        let mailbox = SessionMailbox::register(id);
+        let mut track = SessionTrack::with_background(
+            Resumed::empty(SessionRef::from(id)),
+            claim,
+            dir.clone(),
+            mailbox.clone(),
+            Arc::default(),
+            CWD,
+        );
+        mailbox.track(CALL_ID);
         push_prompt(&mut track, MODEL_SPEC, PROMPT);
         assert_eq!(
-            stored().meta.pending_background,
-            [BACKGROUND_TASK_ID],
-            "{UNSETTLED_STORED}"
+            StoredSession::load(id, &dir)
+                .unwrap()
+                .meta
+                .pending_background,
+            [CALL_ID]
         );
-
         mailbox.settle(
-            BACKGROUND_TASK_ID,
-            Some(BackgroundNotice {
-                text: BACKGROUND_RESULT.into(),
+            CALL_ID,
+            Some(crate::BackgroundNotice {
+                text: CALL_OUTPUT.into(),
                 display: None,
                 wake: true,
-                end: TaskEnd::Finished,
+                end: crate::TaskEnd::Finished,
             }),
+        );
+        push_prompt(&mut track, MODEL_SPEC, PROMPT);
+        assert_eq!(
+            StoredSession::load(id, &dir)
+                .unwrap()
+                .meta
+                .pending_background,
+            [CALL_ID]
         );
         push_turn(&mut track, MODEL_SPEC, |params| {
             for notice in mailbox.drain() {
@@ -823,9 +1371,168 @@ mod tests {
             }
         });
         assert!(
-            stored().meta.pending_background.is_empty(),
-            "{SETTLED_CLEARED}"
+            StoredSession::load(id, &dir)
+                .unwrap()
+                .meta
+                .pending_background
+                .is_empty()
         );
+    }
+
+    #[test]
+    fn a_rewind_keeps_the_events_and_inbox_of_a_surviving_task() {
+        let tmp = TempDir::new().unwrap();
+        let id = MakiId::generate();
+        let dir = state_dir(&tmp);
+        let claim = SessionClaim::acquire(id, &dir).unwrap();
+        let mut track = SessionTrack::open(Resumed::empty(SessionRef::from(id)), claim, dir, CWD);
+        push_prompt(&mut track, MODEL_SPEC, PROMPT);
+        push_turn(&mut track, MODEL_SPEC, |params| {
+            params.history.push(Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::tool_use(
+                    CALL_ID,
+                    CALL_TOOL,
+                    serde_json::json!({}),
+                )],
+                ..Default::default()
+            });
+            params.history.push(Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: CALL_ID.into(),
+                    content: CALL_OUTPUT.into(),
+                    is_error: false,
+                    loaded_tools: Vec::new(),
+                }],
+                ..Default::default()
+            });
+        });
+        let event = Envelope {
+            event: AgentEvent::Nudge,
+            run_id: 0,
+            subagent: Some(SubagentInfo {
+                parent_tool_use_id: CALL_ID.into(),
+                name: CALL_TOOL.into(),
+                prompt: None,
+                model: None,
+                opts: None,
+                answer_tx: None,
+                inbox: Some(Arc::default()),
+                parent_call: None,
+            }),
+        };
+        let control = track.control();
+        assert!(control.record_task(&event, None));
+        push_prompt(&mut track, MODEL_SPEC, PROMPT);
+        track.rewind(3, PROMPT, 1).unwrap();
+        assert!(control.record_task(&event, None));
+        assert!(control.task_inbox(CALL_ID).is_ok());
+    }
+
+    fn million_input() -> TokenUsage {
+        TokenUsage {
+            input: ONE_MILLION,
+            ..Default::default()
+        }
+    }
+
+    /// A stored session on a priced model, whose file holds `rows`.
+    fn priced_file(tmp: &TempDir, rows: &[(&str, Option<f64>)]) -> SessionTrack {
+        let mut stored = StoredSession::new(PRICED_SPEC, CWD);
+        stored.id = session_id();
+        stored.push_message(Message::user(PROMPT.into()));
+        stored.token_usage = million_input();
+        for (model, cost) in rows {
+            stored.add_model_usage(model, million_input().billed(*cost));
+        }
+        stored.save(&claim(tmp), &state_dir(tmp)).unwrap();
+        SessionTrack::open(
+            Resumed::stored(SessionRef::from(session_id()), load(tmp)),
+            claim(tmp),
+            state_dir(tmp),
+            CWD,
+        )
+    }
+
+    /// The rows are what a resume prices, so a headless turn writes its own,
+    /// and an older file's spending is settled before they join it.
+    #[test_case(&[] ; "counts_with_no_rows")]
+    #[test_case(&[(PRICED_ID, None)] ; "a_row_with_no_cost")]
+    fn a_headless_turn_saves_its_rows_and_keeps_the_older_spending(rows: &[(&str, Option<f64>)]) {
+        let tmp = TempDir::new().unwrap();
+        let recorded = Model::from_spec(PRICED_SPEC).unwrap();
+        let estimate = recorded.list_cost(&million_input(), false);
+        let mut track = priced_file(&tmp, rows);
+
+        push_turn(&mut track, PRICED_SPEC, |params| {
+            params.history.push(Message::user(PROMPT.into()));
+        });
+        track
+            .turn(PRICED_SPEC.into(), &input(AgentMode::Build))
+            .ledger()
+            .bill(&billed(OTHER_ID, million_input(), Some(TURN_COST)), None);
+        drop(track);
+
+        let saved = load(&tmp);
+        let saved_rows = saved.usage_by_model();
+        assert_eq!(saved_rows[PRICED_ID].cost, estimate, "{SETTLED}");
+        assert_eq!(saved_rows[OTHER_ID].cost, Some(TURN_COST));
+        assert_eq!(saved_rows[OTHER_ID].input, ONE_MILLION);
+    }
+
+    /// A file whose recorded model no longer resolves is priced against the
+    /// model the turn ran on, as an ACP load would price it.
+    #[test]
+    fn an_unresolvable_recorded_model_falls_back_to_the_turns() {
+        let tmp = TempDir::new().unwrap();
+        let mut stored = StoredSession::new(UNKNOWN_SPEC, CWD);
+        stored.id = session_id();
+        stored.push_message(Message::user(PROMPT.into()));
+        stored.token_usage = million_input();
+        stored.save(&claim(&tmp), &state_dir(&tmp)).unwrap();
+        let mut track = SessionTrack::open(
+            Resumed::stored(SessionRef::from(session_id()), load(&tmp)),
+            claim(&tmp),
+            state_dir(&tmp),
+            CWD,
+        );
+
+        track
+            .turn(PRICED_SPEC.into(), &input(AgentMode::Build))
+            .ledger()
+            .bill(&billed(OTHER_ID, million_input(), Some(TURN_COST)), None);
+        drop(track);
+
+        let fallback = Model::from_spec(PRICED_SPEC).unwrap();
+        let saved = load(&tmp);
+        assert_eq!(
+            saved.usage_by_model()[PRICED_ID].cost,
+            fallback.list_cost(&million_input(), false),
+            "{SETTLED}"
+        );
+    }
+
+    /// A paid summary that came back empty leaves the transcript as it was,
+    /// and its bill still reaches the file under the transcript as loaded.
+    #[test]
+    fn a_turn_that_only_spent_saves_its_bill() {
+        let tmp = TempDir::new().unwrap();
+        let mut track = reopen_with_orphan(&tmp);
+        let usage = TokenUsage {
+            input: TURN_INPUT_TOKENS,
+            ..Default::default()
+        };
+
+        track
+            .compaction(MODEL_SPEC.into())
+            .ledger()
+            .bill(&billed(MODEL_SPEC, usage, None), None);
+        drop(track);
+
+        let saved = load(&tmp);
+        assert_eq!(saved.token_usage.input, TURN_INPUT_TOKENS, "{USAGE_SUMMED}");
+        assert_eq!(saved.messages().len(), 2, "{NOT_WIPED}");
     }
 
     /// A headless driver keeps no other record of its settings or its spend,
@@ -836,21 +1543,28 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let id = MakiId::generate();
         let claim = SessionClaim::acquire(id, &state_dir(&tmp)).expect("nothing else holds it");
-        let mut track = open_track(Resumed::empty(SessionRef::from(id)), claim, &tmp);
+        let mut track = SessionTrack::open(
+            Resumed::empty(SessionRef::from(id)),
+            claim,
+            state_dir(&tmp),
+            CWD,
+        );
         let usage = TokenUsage {
             input: TURN_INPUT_TOKENS,
             ..Default::default()
         };
         for _ in 0..TURNS {
             let mut turn = track.turn(MODEL_SPEC.into(), &input(AgentMode::Plan(PLAN_PATH.into())));
-            turn.ledger().add(usage, None, None);
+            turn.ledger().bill(&billed(MODEL_SPEC, usage, None), None);
             run_params(&mut turn)
                 .history
                 .push(Message::user(PROMPT.into()));
         }
 
         let header = live_header(id).unwrap();
-        let stored = SessionHeader::of(&StoredSession::load(id, &state_dir(&tmp)).unwrap());
+        let saved = StoredSession::load(id, &state_dir(&tmp)).unwrap();
+        assert_eq!(saved.meta.plan_path.as_deref(), Some(PLAN_PATH));
+        let stored = SessionHeader::of(&saved);
         for header in [&*header, &stored] {
             assert_eq!(header.mode, Some(StoredMode::Plan), "{SETTINGS_TRACKED}");
             assert_eq!(header.thinking, Some(THINKING), "{SETTINGS_TRACKED}");
@@ -863,154 +1577,552 @@ mod tests {
         }
     }
 
-    fn tokens(input: u32) -> TokenUsage {
-        TokenUsage {
-            input,
-            ..Default::default()
-        }
-    }
-
-    /// A turn that pays its own round and moves work off, which keeps billing
-    /// the turn's ledger through the one returned.
-    fn turn_leaving_moved_work(track: &mut SessionTrack) -> Arc<RunLedger> {
-        let mut turn = track.turn(MODEL_SPEC.into(), &input(AgentMode::Build));
-        turn.ledger()
-            .add(tokens(TURN_INPUT_TOKENS), Some(TURN_COST), None);
-        run_params(&mut turn)
-            .history
-            .push(Message::user(PROMPT.into()));
-        RunLedger::child(&turn.ledger())
-    }
-
-    /// A moved subagent keeps billing the ledger of the turn it left after
-    /// that turn reported, and its events reach no frontend. The next turn
-    /// reports the late spend, once, and the session stores it.
     #[test]
-    fn moved_work_spend_lands_on_the_next_turn_once() {
+    fn rewind_commits_history_and_queue_together_and_keeps_the_claim() {
         let tmp = TempDir::new().unwrap();
         let mut track = track_on(&tmp);
-        let moved = turn_leaving_moved_work(&mut track);
-        moved.add(tokens(LATE_INPUT_TOKENS), Some(LATE_COST), None);
-
-        let reports: Vec<RunTotals> = (0..TURNS)
-            .map(|_| {
-                let mut turn = track.turn(MODEL_SPEC.into(), &input(AgentMode::Build));
-                run_params(&mut turn)
-                    .history
-                    .push(Message::user(PROMPT.into()));
-                turn.ledger().totals()
-            })
-            .collect();
-
-        assert_eq!(reports[0].usage.input, LATE_INPUT_TOKENS, "{LATE_REPORTED}");
-        assert_eq!(reports[0].cost, Some(LATE_COST), "{LATE_REPORTED}");
-        assert_eq!(reports[1].usage.input, 0, "{LATE_REPORTED_ONCE}");
-        assert_eq!(reports[1].cost, None, "{LATE_REPORTED_ONCE}");
+        push_prompt(&mut track, MODEL_SPEC, PROMPT);
+        push_prompt(&mut track, MODEL_SPEC, OBSERVATION);
+        let control = track.control();
+        control.enqueue(&queued_prompt()).unwrap();
+        let blocker = log_path(&tmp).with_extension("jsonl.tmp");
+        std::fs::create_dir(&blocker).unwrap();
+        assert!(track.rewind(1, OBSERVATION, 1).is_err());
+        assert_eq!(control.snapshot().messages(), load(&tmp).messages());
+        assert_eq!(control.queue()[0].status, QueueStatus::Queued);
+        std::fs::remove_dir(blocker).unwrap();
+        assert!(track.rewind(1, PROMPT, 1).is_err());
         assert_eq!(
-            SessionHeader::of(&load(&tmp)).usage.input,
-            TURN_INPUT_TOKENS + LATE_INPUT_TOKENS,
-            "{USAGE_SUMMED}"
+            track.rewind(1, OBSERVATION, 1).unwrap()[0].status,
+            QueueStatus::Cancelled
         );
+        assert_eq!(load(&tmp).messages().len(), 1);
+        track.rewind(0, PROMPT, 1).unwrap();
+        control.set_title(TITLE.into()).unwrap();
+        assert!(!log_path(&tmp).exists());
+        assert_eq!(control.snapshot().meta.context_size, 0);
+        assert!(SessionClaim::acquire(session_id(), &state_dir(&tmp)).is_err());
+        push_prompt(&mut track, MODEL_SPEC, OBSERVATION);
+        assert_eq!(load(&tmp).messages(), &[Message::user(OBSERVATION.into())]);
     }
 
-    /// Moved work can pay while a later turn runs. That turn's ledger is not
-    /// the one it bills, so the turn after reports it.
     #[test]
-    fn spend_during_a_later_turn_is_reported_by_the_next() {
+    fn task_removal_and_rewind_refuse_late_events() {
         let tmp = TempDir::new().unwrap();
         let mut track = track_on(&tmp);
-        let moved = turn_leaving_moved_work(&mut track);
-        let during = {
-            let turn = track.turn(MODEL_SPEC.into(), &input(AgentMode::Build));
-            moved.add(tokens(LATE_INPUT_TOKENS), Some(LATE_COST), None);
-            turn.ledger().totals()
+        push_prompt(&mut track, MODEL_SPEC, PROMPT);
+        let control = track.control();
+        let info = SubagentInfo {
+            parent_tool_use_id: CALL_ID.into(),
+            name: CALL_TOOL.into(),
+            prompt: None,
+            model: None,
+            opts: None,
+            answer_tx: None,
+            inbox: Some(Arc::default()),
+            parent_call: None,
         };
-        let next = track
-            .turn(MODEL_SPEC.into(), &input(AgentMode::Build))
-            .ledger()
-            .totals();
-
-        assert_eq!(during.usage.input, 0, "{LATE_REPORTED_ONCE}");
-        assert_eq!(next.usage.input, LATE_INPUT_TOKENS, "{LATE_REPORTED}");
+        let event = Envelope {
+            event: AgentEvent::ToolDone(Box::new(finished_call())),
+            subagent: Some(info.clone()),
+            run_id: 0,
+        };
+        assert!(control.record_task(&event, None));
+        assert!(control.remove_task(CALL_ID).is_err());
+        control
+            .task_inbox(CALL_ID)
+            .unwrap()
+            .push(input(AgentMode::Build));
+        assert_eq!(info.inbox.unwrap().texts(), [PROMPT]);
+        control.record_task(
+            &Envelope {
+                event: AgentEvent::SubagentHistory {
+                    tool_use_id: CALL_ID.into(),
+                    messages: vec![Message::user(PROMPT.into())],
+                },
+                subagent: None,
+                run_id: 0,
+            },
+            None,
+        );
+        assert_eq!(load(&tmp).tool_data()[CALL_ID].summary, CALL_SUMMARY);
+        control.remove_task(CALL_ID).unwrap();
+        assert!(!control.record_task(&event, None));
+        track.rewind(0, PROMPT, 1).unwrap();
+        let late = Envelope {
+            subagent: Some(SubagentInfo {
+                parent_tool_use_id: ORPHAN_TOOL_ID.into(),
+                ..event.subagent.unwrap()
+            }),
+            ..event
+        };
+        assert!(!control.record_task(&late, None));
+        assert!(control.snapshot().subagents().is_empty());
+        assert!(control.record_task(
+            &Envelope {
+                run_id: 1,
+                subagent: Some(SubagentInfo {
+                    parent_tool_use_id: CALL_ID.into(),
+                    ..late.subagent.unwrap()
+                }),
+                ..late
+            },
+            None
+        ));
     }
 
-    /// Work moved off the last turn keeps paying until it is stopped, and no
-    /// turn may come to carry it: `-p` lapsing, a stopped task, a closed
-    /// session. Dropping the track stores it, and the driver's spend reads
-    /// it, each once, also when a later turn already carried part of it.
-    #[test_case(0 ; "no turn after the move")]
-    #[test_case(1 ; "a turn carried part of it")]
-    fn spend_after_the_last_turn_lands_when_the_track_drops(turns_after_move: u32) {
+    #[test]
+    fn host_title_and_snapshot_during_a_turn_keep_messages_and_tool_data() {
         let tmp = TempDir::new().unwrap();
-        let spend = Arc::<RunLedger>::default();
-        let mailbox = SessionMailbox::register(session_id());
-        let mut track = SessionTrack::open(
-            resumed(),
+        let mut track = track_on(&tmp);
+        let control = track.control();
+        let mut turn = track.turn(MODEL_SPEC.into(), &input(AgentMode::Build));
+        let params = run_params(&mut turn);
+        params.history.push(Message::user(PROMPT.into()));
+        params
+            .history
+            .call_capture()
+            .unwrap()
+            .record(&finished_call());
+
+        control.set_title(TITLE.into()).unwrap();
+        let snapshot = control.snapshot();
+        assert_eq!(snapshot.title, TITLE);
+        assert_eq!(snapshot.messages().len(), 1);
+        assert_eq!(snapshot.tool_data()[CALL_ID].summary, CALL_SUMMARY);
+        assert_eq!(load(&tmp).tool_data()[CALL_ID].summary, CALL_SUMMARY);
+        params.history.push(Message::user(OBSERVATION.into()));
+        drop(turn);
+
+        let saved = load(&tmp);
+        assert_eq!(saved.title, TITLE);
+        assert_eq!(saved.messages().len(), 2);
+        assert_eq!(saved.tool_data()[CALL_ID].summary, CALL_SUMMARY);
+    }
+
+    #[test]
+    fn host_title_preserves_uncommitted_restore_repairs() {
+        let tmp = TempDir::new().unwrap();
+        let track = reopen_with_orphan(&tmp);
+        let original = load(&tmp).messages().to_vec();
+        track.control().set_title(TITLE.into()).unwrap();
+        let saved = load(&tmp);
+        assert_eq!(saved.title, TITLE);
+        assert_eq!(saved.messages(), original);
+    }
+
+    #[test]
+    fn a_failed_host_title_change_is_not_reported_as_saved() {
+        let tmp = TempDir::new().unwrap();
+        let mut track = track_on(&tmp);
+        push_prompt(&mut track, MODEL_SPEC, PROMPT);
+        let control = track.control();
+        let title = control.snapshot().title;
+        let blocker = log_path(&tmp).with_extension("jsonl.tmp");
+        std::fs::create_dir(&blocker).unwrap();
+        assert!(control.set_title(TITLE.into()).is_err());
+        assert_eq!(control.snapshot().title, title);
+        assert_eq!(load(&tmp).title, title);
+        std::fs::remove_dir(&blocker).unwrap();
+        control.set_title(TITLE.into()).unwrap();
+        assert_eq!(load(&tmp).title, TITLE);
+    }
+
+    fn queued_prompt() -> SessionInput {
+        SessionInput::Prompt(input(AgentMode::Build))
+    }
+
+    #[test]
+    fn accepted_work_survives_restart_without_replaying_a_started_item() {
+        let tmp = TempDir::new().unwrap();
+        let track = track_on(&tmp);
+        let control = track.control();
+        let running = control.enqueue(&queued_prompt()).unwrap();
+        assert_eq!(
+            control
+                .enqueue_with_id(&queued_prompt(), running.id)
+                .unwrap(),
+            running
+        );
+        assert_eq!(control.queue().len(), 1);
+        control.take_queued(None, None).unwrap().unwrap();
+        let waiting = control.enqueue(&queued_prompt()).unwrap();
+        drop(control);
+        drop(track);
+        let track = SessionTrack::open(
+            Resumed::stored(SessionRef::from(session_id()), load(&tmp)),
             claim(&tmp),
             state_dir(&tmp),
-            mailbox,
-            Arc::clone(&spend),
             CWD,
         );
-        let moved = turn_leaving_moved_work(&mut track);
-        for _ in 0..turns_after_move {
-            moved.add(tokens(LATE_INPUT_TOKENS), Some(LATE_COST), None);
-            push_prompt(&mut track, MODEL_SPEC, PROMPT);
-        }
-        moved.add(tokens(LATE_INPUT_TOKENS), Some(LATE_COST), None);
-        drop(track);
-
-        let late_rounds = turns_after_move + 1;
-        let expected_input = TURN_INPUT_TOKENS + LATE_INPUT_TOKENS * late_rounds;
+        let control = track.control();
+        let recovered = control.recover_queue(SessionDefaults::default()).unwrap();
         assert_eq!(
-            SessionHeader::of(&load(&tmp)).usage.input,
-            expected_input,
-            "{LATE_STORED}"
+            recovered
+                .iter()
+                .find(|work| work.id == running.id)
+                .unwrap()
+                .status,
+            QueueStatus::Interrupted
         );
-        let spent = spend.totals();
-        assert_eq!(spent.usage.input, expected_input, "{LATE_STORED}");
+        assert!(load(&tmp).meta.accepted_work[0].input.is_some());
+        let (_, receipts) = control.take_queued(None, None).unwrap().unwrap();
         assert_eq!(
-            spent.cost,
-            Some(TURN_COST + LATE_COST * f64::from(late_rounds)),
-            "{LATE_STORED}"
+            receipts
+                .iter()
+                .map(|receipt| receipt.id)
+                .collect::<Vec<_>>(),
+            [waiting.id]
+        );
+        control.finish_queue(QueueStatus::Done, None).unwrap();
+        assert!(control.take_queued(None, None).unwrap().is_none());
+        assert!(load(&tmp).meta.accepted_work[1].input.is_none());
+    }
+
+    #[test]
+    fn a_failed_queue_write_neither_accepts_nor_runs_work() {
+        let tmp = TempDir::new().unwrap();
+        let track = track_on(&tmp);
+        let control = track.control();
+        let first = control.enqueue(&queued_prompt()).unwrap();
+        let blocker = log_path(&tmp).with_extension("jsonl.tmp");
+        std::fs::create_dir(&blocker).unwrap();
+        assert!(control.enqueue(&queued_prompt()).is_err());
+        assert!(control.take_queued(None, None).is_err());
+        assert!(control.cancel_queued(first.id).is_err());
+        assert_eq!(control.queue(), load(&tmp).meta.accepted_work);
+        assert_eq!(control.queue().len(), 1);
+        assert_eq!(control.queue()[0].status, QueueStatus::Queued);
+        std::fs::remove_dir(&blocker).unwrap();
+        control.cancel_queued(first.id).unwrap();
+        assert!(control.take_queued(None, None).unwrap().is_none());
+        assert_eq!(
+            load(&tmp).meta.accepted_work[0].status,
+            QueueStatus::Cancelled
         );
     }
 
-    /// `-p` lapsing with a moved call out: the driver's mailbox clones are
-    /// gone by the time late spend makes the dropped track write. That write
-    /// must still store the receipt, or a resume never tells the model its
-    /// task was lost.
     #[test]
-    fn the_last_write_keeps_receipts_after_the_driver_lets_go() {
+    fn host_queue_batches_messages_and_keeps_mode_and_compaction_boundaries() {
         let tmp = TempDir::new().unwrap();
-        let id = MakiId::generate();
-        let mailbox = SessionMailbox::register(id);
-        let claim = SessionClaim::acquire(id, &state_dir(&tmp)).expect("nothing else holds it");
-        let mut track = SessionTrack::open(
-            Resumed::empty(SessionRef::from(id)),
-            claim,
+        let track = track_on(&tmp);
+        let control = track.control();
+        for _ in 0..2 {
+            control.enqueue(&queued_prompt()).unwrap();
+        }
+        control
+            .enqueue(&SessionInput::Prompt(input(AgentMode::Plan(
+                PLAN_PATH.into(),
+            ))))
+            .unwrap();
+        control
+            .enqueue(&SessionInput::Compact(Compaction {
+                instructions: None,
+                workflow: false,
+            }))
+            .unwrap();
+        let (trigger, cancel) = crate::CancelToken::new();
+        trigger.cancel();
+        assert!(
+            control
+                .take_queued(Some(&AgentMode::Build), Some(&cancel))
+                .unwrap()
+                .is_none()
+        );
+        let (run, receipts) = control.take_queued(None, None).unwrap().unwrap();
+        assert_eq!(receipts.len(), 2);
+        let SessionInput::Prompt(run) = run else {
+            panic!("expected queued messages")
+        };
+        assert_eq!(run.earlier.len(), 1);
+        control.finish_queue(QueueStatus::Done, None).unwrap();
+        assert!(
+            control
+                .take_queued(Some(&AgentMode::Build), None)
+                .unwrap()
+                .is_none()
+        );
+        let (_, receipts) = control.take_queued(None, None).unwrap().unwrap();
+        assert_eq!(receipts.len(), 1);
+        control.finish_queue(QueueStatus::Done, None).unwrap();
+        let (run, _) = control
+            .take_queued(Some(&AgentMode::Build), None)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(run, SessionInput::Compact(_)));
+    }
+
+    #[test]
+    fn legacy_pending_text_is_migrated_once_with_its_session_settings() {
+        let tmp = TempDir::new().unwrap();
+        push_prompt(&mut track_on(&tmp), MODEL_SPEC, PROMPT);
+        let mut stored = load(&tmp);
+        stored.meta.queued_messages.push(OBSERVATION.into());
+        stored.save(&claim(&tmp), &state_dir(&tmp)).unwrap();
+        let track = SessionTrack::open(
+            Resumed::stored(SessionRef::from(session_id()), stored),
+            claim(&tmp),
             state_dir(&tmp),
-            mailbox.clone(),
-            Arc::default(),
             CWD,
         );
-        mailbox.track(BACKGROUND_TASK_ID);
-        let moved = turn_leaving_moved_work(&mut track);
-        drop(mailbox);
+        let control = track.control();
+        let recovered = control.recover_queue(SessionDefaults::default()).unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert!(load(&tmp).meta.queued_messages.is_empty());
+        assert_eq!(
+            control.recover_queue(SessionDefaults::default()).unwrap()[0].id,
+            recovered[0].id
+        );
+        let (run, _) = control.take_queued(None, None).unwrap().unwrap();
+        let SessionInput::Prompt(run) = run else {
+            panic!("expected queued message")
+        };
+        assert_eq!(run.message, OBSERVATION);
+        assert_eq!(run.thinking, THINKING.into());
+        assert!(run.fast);
+    }
 
-        moved.add(tokens(LATE_INPUT_TOKENS), Some(LATE_COST), None);
+    #[test]
+    fn a_failed_run_keeps_waiting_input_without_executing_it() {
+        let tmp = TempDir::new().unwrap();
+        let track = track_on(&tmp);
+        let control = track.control();
+        control.enqueue(&queued_prompt()).unwrap();
+        control.take_queued(None, None).unwrap().unwrap();
+        let waiting = control.enqueue(&queued_prompt()).unwrap();
+        control
+            .finish_queue(QueueStatus::Error, Some(OBSERVATION.into()))
+            .unwrap();
+        let work = control
+            .queue()
+            .into_iter()
+            .find(|work| work.id == waiting.id)
+            .unwrap();
+        assert_eq!(work.status, QueueStatus::Interrupted);
+        assert!(work.input.is_some());
+        assert!(control.take_queued(None, None).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_failed_turn_save_cannot_publish_a_successful_queue_outcome() {
+        let tmp = TempDir::new().unwrap();
+        let mut track = track_on(&tmp);
+        let control = track.control();
+        control.enqueue(&queued_prompt()).unwrap();
+        control.take_queued(None, None).unwrap().unwrap();
+        std::fs::create_dir(log_path(&tmp).with_extension("jsonl.tmp")).unwrap();
+        push_prompt(&mut track, MODEL_SPEC, PROMPT);
+        assert!(track.finish_queue(QueueStatus::Done, None).is_err());
+        assert_eq!(
+            load(&tmp).meta.accepted_work[0].status,
+            QueueStatus::Running
+        );
+    }
+
+    fn finished_call() -> ToolDoneEvent {
+        let data = ToolData::new(
+            Arc::from(CALL_TOOL),
+            DEFAULT_DATA_VERSION,
+            serde_json::json!({}),
+            CALL_SUMMARY.into(),
+        );
+        ToolDoneEvent {
+            id: CALL_ID.into(),
+            tool: Arc::from(CALL_TOOL),
+            output: Arc::new(ToolOutput::Plain(CALL_OUTPUT.into())),
+            is_error: false,
+            annotation: None,
+            written_path: None,
+            call: None,
+            data: Some(Arc::new(data)),
+            backgrounded: false,
+        }
+    }
+
+    /// The headless and ACP drivers keep no other record of a call, so the
+    /// turn that ran it saves it, and a resumed session keeps it through
+    /// its next save.
+    #[test]
+    fn a_turn_saves_its_calls_with_their_data() {
+        let tmp = TempDir::new().unwrap();
+        push_turn(&mut track_on(&tmp), MODEL_SPEC, |params| {
+            params.history.push(Message::user(PROMPT.into()));
+            let capture = params
+                .history
+                .call_capture()
+                .expect("a track captures calls");
+            capture.record(&finished_call());
+        });
+        let saved = load(&tmp);
+        assert!(saved.tool_outputs().contains_key(CALL_ID), "{CALL_SAVED}");
+        assert_eq!(
+            saved.tool_data()[CALL_ID].summary,
+            CALL_SUMMARY,
+            "{CALL_SAVED}"
+        );
+
+        let mut track = SessionTrack::open(
+            Resumed::stored(SessionRef::from(session_id()), saved),
+            claim(&tmp),
+            state_dir(&tmp),
+            CWD,
+        );
+        push_prompt(&mut track, MODEL_SPEC, OBSERVATION);
         drop(track);
 
-        let stored = StoredSession::load(id, &state_dir(&tmp)).unwrap();
+        let resaved = load(&tmp);
+        assert_eq!(resaved.messages().len(), 2);
         assert_eq!(
-            stored.token_usage.input,
-            TURN_INPUT_TOKENS + LATE_INPUT_TOKENS,
-            "{LATE_STORED}"
+            resaved.tool_data()[CALL_ID].summary,
+            CALL_SUMMARY,
+            "{CALL_SAVED}"
         );
-        assert_eq!(
-            stored.meta.pending_background,
-            [BACKGROUND_TASK_ID],
-            "{UNSETTLED_STORED}"
+    }
+
+    /// A call that lands after a turn saved is still saved by the next turn,
+    /// even one that moves no message.
+    #[test]
+    fn a_call_captured_after_a_save_reaches_the_next_turn() {
+        let tmp = TempDir::new().unwrap();
+        let mut track = track_on(&tmp);
+        let mut retained = None;
+        push_turn(&mut track, MODEL_SPEC, |params| {
+            params.history.push(Message::user(PROMPT.into()));
+            retained = params.history.call_capture();
+        });
+        assert!(!load(&tmp).tool_outputs().contains_key(CALL_ID));
+
+        retained
+            .expect("a track captures calls")
+            .record(&finished_call());
+        push_turn(&mut track, MODEL_SPEC, |_| {});
+
+        assert!(
+            load(&tmp).tool_outputs().contains_key(CALL_ID),
+            "{CALL_SAVED}"
         );
+    }
+
+    /// A save that only captured calls started and that failed is retried
+    /// by the next turn, though neither turn moves a message.
+    #[test]
+    fn a_failed_save_of_captured_calls_is_retried() {
+        let tmp = TempDir::new().unwrap();
+        let mut track = track_on(&tmp);
+        let mut retained = None;
+        push_turn(&mut track, MODEL_SPEC, |params| {
+            params.history.push(Message::user(PROMPT.into()));
+            retained = params.history.call_capture();
+        });
+        let blocker = log_path(&tmp).with_extension("jsonl.tmp");
+        std::fs::create_dir(&blocker).unwrap();
+        retained
+            .expect("a track captures calls")
+            .record(&finished_call());
+        push_turn(&mut track, MODEL_SPEC, |_| {});
+        assert!(!load(&tmp).tool_outputs().contains_key(CALL_ID));
+
+        std::fs::remove_dir(&blocker).unwrap();
+        push_turn(&mut track, MODEL_SPEC, |_| {});
+
+        assert!(load(&tmp).tool_outputs().contains_key(CALL_ID), "{RETRIED}");
+    }
+
+    fn hosted_track(tmp: &TempDir, settings: &SharedSettings) -> SessionTrack {
+        SessionTrack::open(resumed(), claim(tmp), state_dir(tmp), CWD)
+            .with_settings(Arc::clone(settings))
+    }
+
+    fn host_settings(fast: bool) -> SessionSettings {
+        SessionSettings {
+            thinking: Some(StoredThinking::Off),
+            fast,
+            workflow: true,
+            yolo: Some(true),
+        }
+    }
+
+    /// A toggle that came while the run was out is newer than the prompt the
+    /// run carried, so the turn's save must not put the older value back.
+    #[test]
+    fn a_hosts_newer_settings_win_over_the_turns_own() {
+        let tmp = TempDir::new().unwrap();
+        let settings: SharedSettings = Arc::new(ArcSwap::from_pointee(host_settings(false)));
+        let mut track = hosted_track(&tmp, &settings);
+        {
+            let mut turn = track.turn(MODEL_SPEC.into(), &input(AgentMode::Build));
+            run_params(&mut turn)
+                .history
+                .push(Message::user(PROMPT.into()));
+            settings.store(Arc::new(host_settings(true)));
+        }
+
+        assert_eq!(SessionSettings::of(&load(&tmp)), host_settings(true));
+    }
+
+    #[test]
+    fn an_idle_save_writes_no_file_for_an_empty_session() {
+        let tmp = TempDir::new().unwrap();
+        let settings: SharedSettings = Arc::new(ArcSwap::from_pointee(host_settings(true)));
+        let mut track = hosted_track(&tmp, &settings);
+        track.save_settings();
+        drop(track);
+        assert!(!log_path(&tmp).exists(), "{NO_EMPTY_FILE}");
+    }
+
+    /// A host can accept a change and close the session before the driver
+    /// saw it idle; the track saves it as it drops.
+    #[test]
+    fn dropping_the_track_saves_unsaved_settings() {
+        let tmp = TempDir::new().unwrap();
+        let settings: SharedSettings = Arc::new(ArcSwap::from_pointee(host_settings(false)));
+        let mut track = hosted_track(&tmp, &settings);
+        {
+            let mut turn = track.turn(MODEL_SPEC.into(), &input(AgentMode::Build));
+            run_params(&mut turn)
+                .history
+                .push(Message::user(PROMPT.into()));
+        }
+        settings.store(Arc::new(host_settings(true)));
+        drop(track);
+
+        assert_eq!(SessionSettings::of(&load(&tmp)), host_settings(true));
+    }
+
+    /// Copying a change into the meta is not saving it: a turn that writes
+    /// nothing leaves it unsaved, and the track's drop still has to save it.
+    #[test]
+    fn a_change_a_no_op_turn_copied_is_saved_on_drop() {
+        let tmp = TempDir::new().unwrap();
+        let settings: SharedSettings = Arc::new(ArcSwap::from_pointee(host_settings(false)));
+        let mut track = hosted_track(&tmp, &settings);
+        {
+            let mut turn = track.turn(MODEL_SPEC.into(), &input(AgentMode::Build));
+            run_params(&mut turn)
+                .history
+                .push(Message::user(PROMPT.into()));
+        }
+        settings.store(Arc::new(host_settings(true)));
+        drop(track.turn(MODEL_SPEC.into(), &input(AgentMode::Build)));
+        drop(track);
+
+        assert_eq!(SessionSettings::of(&load(&tmp)), host_settings(true));
+    }
+
+    /// A toggle before any turn must not commit the repair the history made:
+    /// only a turn that ran on the repaired copy may store it.
+    #[test]
+    fn an_idle_settings_save_keeps_the_transcript_as_loaded() {
+        let tmp = TempDir::new().unwrap();
+        let track = reopen_with_orphan(&tmp);
+        let on_disk = load(&tmp).messages().to_vec();
+        let settings = host_settings(true).shared();
+        let mut track = track.with_settings(Arc::clone(&settings));
+
+        track.save_settings();
+
+        let saved = load(&tmp);
+        assert_eq!(saved.messages(), on_disk.as_slice(), "{NOT_WIPED}");
+        assert_eq!(SessionSettings::of(&saved), host_settings(true));
     }
 }

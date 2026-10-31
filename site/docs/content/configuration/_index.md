@@ -57,6 +57,36 @@ All fields are optional. Typos in field names cause an error right away.
 
 `maki.setup()` can only be called once per init.lua.
 
+## ui.lua
+
+UI settings can also go in `ui.lua`, next to `init.lua`: `~/.config/maki/ui.lua`
+and a project `.maki/ui.lua`. The project file runs only once you trust that
+folder on the machine where the UI runs. `maki` runs `init.lua` first, then
+`ui.lua`. `maki acp` ignores `ui.lua`, and [`maki connect`](/docs/cli/#maki-connect)
+runs `ui.lua` alone.
+
+```lua
+maki.setup({
+    ui = { theme = "tokyonight" },
+    plugins = {
+        sessions = { enabled = false },
+    },
+})
+```
+
+`maki.setup()` in `ui.lua` takes `ui`, `plugins`, `net`, and
+`storage.input_history_size`. Maki warns about any other section and ignores it.
+A field set in both files takes the `ui.lua` value, and the
+`net.allowed_private_hosts` lists of both files add up.
+
+`plugins.<name>.enabled` in `init.lua` turns the whole plugin on or off. The same
+key in `ui.lua` overrides it for the plugin's UI entry alone. An option goes to
+the entry whose schema declares it. An option in `ui.lua` wins over the same key
+in `init.lua`, and Maki warns when the two values differ.
+
+The global `ui.lua` can declare packages for their UI entry, see
+[Lua Packages](/docs/packages/#declare-the-ui-entry).
+
 ## Full Reference
 
 ### Top-level
@@ -288,12 +318,6 @@ maki.setup({
 | `max_output_lines` | integer | - | - | Override `agent.max_output_lines` for this tool. |
 | `timeout_secs` | integer | `30` | 5 | Script execution time budget in seconds; waiting on tool calls does not count. A call's `timeout` param overrides it. |
 
-### `plugins.completion`
-
-| Field | Type | Default | Min | Description |
-|-------|------|---------|-----|-------------|
-| `max_items` | integer | `10` | 1 | Rows the completion popup shows at once. |
-
 ### `plugins.edit`
 
 | Field | Type | Default | Min | Description |
@@ -380,7 +404,7 @@ Maki follows platform directory conventions. On Linux and macOS that is XDG. On 
 | Logs | `~/.local/logs/maki/` | `%APPDATA%\maki\` |
 | Cache | `~/.cache/maki/` | `%LOCALAPPDATA%\maki\` |
 
-Config holds `init.lua`, `permissions.toml`, `mcp.toml`, `providers.toml`, and `commands/`. State holds sessions, auth tokens, memories, plans, folder trust, and model-tier overrides. The install script puts the binary under `%LOCALAPPDATA%\maki` on Windows; that is separate from these runtime dirs.
+Config holds `init.lua`, `ui.lua`, `permissions.toml`, `mcp.toml`, `providers.toml`, and `commands/`. State holds sessions, auth tokens, memories, plans, folder trust, and model-tier overrides. The install script puts the binary under `%LOCALAPPDATA%\maki` on Windows; that is separate from these runtime dirs.
 
 `~/.maki/` (or `%USERPROFILE%\.maki\`) is checked as a legacy fallback. If that directory still exists, maki uses it for everything until you migrate.
 

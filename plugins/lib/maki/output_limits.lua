@@ -10,10 +10,17 @@ local DEFAULT_MAX_LINE_BYTES = 500
 local FULL_OUTPUT_MAX_BYTES = 64 * 1024 * 1024
 local FULL_OUTPUT_MAX_LINES = FULL_OUTPUT_MAX_BYTES // 64
 local UTF8_CONTINUATION = "^[\128-\191]"
+-- The most display text a reply keeps in its state for its renderer, so a
+-- session does not grow without bound: half of `MAX_PAYLOAD_BYTES` in
+-- maki-wire/src/render.rs, the most one call's data carries over ACP. A
+-- reply with more keeps none, and its renderer draws what the model got.
+-- The wire still leaves out a state that does not fit once escaped.
+local STATE_TEXT_MAX_BYTES = 512 * 1024
 
 local M = {}
 
 M.DEFAULT_MAX_LINE_BYTES = DEFAULT_MAX_LINE_BYTES
+M.STATE_TEXT_MAX_BYTES = STATE_TEXT_MAX_BYTES
 M.FULL_OUTPUT_MAX_BYTES = FULL_OUTPUT_MAX_BYTES
 M.FULL_OUTPUT_MAX_LINES = FULL_OUTPUT_MAX_LINES
 --- Appended where full-mode output passed the ceilings, which callers that
@@ -207,6 +214,16 @@ function M.cut_middle(text, max_lines, max_bytes)
     end
     collector:append(text:sub(pos, newline - 1))
     pos = newline + 1
+  end
+end
+
+-- Display text is bounded independently of the model's full-output mode.
+function M.live_collector(ctx, state)
+  local display = M.collector(DEFAULT_MAX_OUTPUT_LINES, STATE_TEXT_MAX_BYTES)
+  return function(line)
+    display:append(line)
+    state.text = display:result()
+    ctx:set_state(state)
   end
 end
 
