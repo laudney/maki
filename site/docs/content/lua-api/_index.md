@@ -2540,7 +2540,7 @@ Requires the `run` [plugin permission](#plugin-permissions).
     for each stdout line, the stream name third as in Neovim (which
     passes a list of lines where maki passes one). `bytes` is the line's
     length before `max_line_bytes` cut it, so it equals `#line` unless
-    the line was cut.
+    the line was cut. Bytes that are not UTF-8 arrive as U+FFFD.
   - `on_stderr` (`function?`) called with `(job_id, line, "stderr", bytes)`
     for each stderr line.
   - `on_exit` (`function?`) called with `(job_id, code)` when the process finishes.

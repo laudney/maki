@@ -239,10 +239,12 @@ impl From<&str> for Line {
 /// A line over `max_bytes` is cut and gets [`LINE_CUT_MARKER`]. The rest of it
 /// is skipped without ever landing in memory, which is how a file that is one
 /// 300 MB line still pages fine. Without `max_bytes`, a line over
-/// [`MAX_READ_BYTES`] fails the read.
+/// [`MAX_READ_BYTES`] fails the read. Bytes that are not UTF-8 fail the read,
+/// or become U+FFFD when `lossy`.
 pub(crate) fn next_line(
     reader: &mut impl BufRead,
     max_bytes: Option<u64>,
+    lossy: bool,
 ) -> IoResult<Option<Line>> {
     let keep = max_bytes.unwrap_or(MAX_READ_BYTES);
     // The extra 2 bytes let a line of exactly `keep` bytes see its `\r\n`, so it is not cut.
@@ -266,22 +268,26 @@ pub(crate) fn next_line(
         } == Some(b'\r');
         read + rest - u64::from(ends_in_cr)
     };
-    if line.len() as u64 <= keep {
-        let text = String::from_utf8(line).map_err(|_| non_utf8())?;
-        return Ok(Some(Line { text, bytes }));
-    }
-    if max_bytes.is_none() {
-        return Err(too_large());
-    }
-    line.truncate(keep as usize);
-    match std::str::from_utf8(&line) {
-        Ok(_) => {}
+    if line.len() as u64 > keep {
+        if max_bytes.is_none() {
+            return Err(too_large());
+        }
+        line.truncate(keep as usize);
         // An error with no length is a char the cut split in half, so drop what is left of it.
-        Err(e) if e.error_len().is_none() => line.truncate(e.valid_up_to()),
-        Err(_) => return Err(non_utf8()),
+        let split_char = line
+            .utf8_chunks()
+            .last()
+            .map(|chunk| chunk.invalid())
+            .filter(|tail| std::str::from_utf8(tail).is_err_and(|e| e.error_len().is_none()))
+            .map_or(0, <[u8]>::len);
+        line.truncate(line.len() - split_char);
+        line.extend_from_slice(LINE_CUT_MARKER.as_bytes());
     }
-    line.extend_from_slice(LINE_CUT_MARKER.as_bytes());
-    let text = String::from_utf8(line).map_err(|_| non_utf8())?;
+    let text = match String::from_utf8(line) {
+        Ok(text) => text,
+        Err(e) if lossy => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+        Err(_) => return Err(non_utf8()),
+    };
     Ok(Some(Line { text, bytes }))
 }
 
@@ -357,7 +363,7 @@ fn read_line_page(
     let mut lines = Vec::new();
     let mut bytes = 0;
     while query.limit.is_none_or(|l| (lines.len() as u64) < l)
-        && let Some(Line { text: line, .. }) = next_line(&mut reader, query.max_line_bytes)?
+        && let Some(Line { text: line, .. }) = next_line(&mut reader, query.max_line_bytes, false)?
     {
         // A line costs its `String` here and a string and a table slot in Lua,
         // so even a file of empty lines has to run into the limit.
@@ -1578,7 +1584,9 @@ mod tests {
         let (lines, total) = read_line_page(&mut reader, &query).unwrap();
         assert_eq!(lines, ["l2"]);
         assert_eq!(total, None);
-        let next = next_line(&mut reader, None).unwrap().map(|line| line.text);
+        let next = next_line(&mut reader, None, false)
+            .unwrap()
+            .map(|line| line.text);
         assert_eq!(next.as_deref(), Some("l3"));
     }
 
@@ -1589,7 +1597,7 @@ mod tests {
     #[test_case("abcdefgh", 8; "cut_line_at_eof")]
     #[test_case("abc\r\n", 3; "whole_crlf_line")]
     fn next_line_reports_the_uncut_length(content: &str, expected: u64) {
-        let line = next_line(&mut small_reader(content.as_bytes()), Some(4))
+        let line = next_line(&mut small_reader(content.as_bytes()), Some(4), false)
             .unwrap()
             .unwrap();
         assert_eq!(line.bytes, expected);
@@ -1619,10 +1627,19 @@ mod tests {
             reads: 0,
         };
         let mut reader = BufReader::with_capacity(CHUNK, inner);
-        let cut = next_line(&mut reader, Some(2)).unwrap().unwrap();
+        let cut = next_line(&mut reader, Some(2), false).unwrap().unwrap();
         assert_eq!((cut.text.as_str(), cut.bytes), ("ab...", 8));
-        let next = next_line(&mut reader, Some(2)).unwrap().unwrap();
+        let next = next_line(&mut reader, Some(2), false).unwrap().unwrap();
         assert_eq!(next.bytes, 4);
+    }
+
+    #[test_case(b"a\xffb\n", "a\u{FFFD}b"; "whole_line")]
+    #[test_case(b"\xffa\xc3\xa9b\n", "\u{FFFD}a..."; "cut_through_a_char")]
+    fn next_line_lossy_replaces_non_utf8(content: &[u8], expected: &str) {
+        let line = next_line(&mut small_reader(content), Some(3), true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(line.text, expected);
     }
 
     #[test_case(b"ok\xff\n"; "inside_the_kept_bytes")]
