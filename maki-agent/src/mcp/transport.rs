@@ -480,12 +480,13 @@ where
     let mut cursor = None;
     loop {
         let (page_items, next_cursor) =
-            page(PaginatedRequestParams::default().with_cursor(cursor)).await?;
+            page(PaginatedRequestParams::default().with_cursor(cursor.clone())).await?;
         items.extend(page_items);
-        cursor = next_cursor;
-        if cursor.is_none() {
+        let advanced = next_cursor.filter(|next| !next.is_empty() && cursor.as_ref() != Some(next));
+        let Some(next) = advanced else {
             return Ok(items);
-        }
+        };
+        cursor = Some(next);
     }
 }
 
@@ -864,6 +865,19 @@ mod tests {
         });
         let names: Vec<_> = tools.iter().map(|tool| tool.name.as_ref()).collect();
         assert_eq!(names, [FIRST_TOOL, LAST_TOOL]);
+    }
+
+    #[test_case("", 1 ; "empty_cursor")]
+    #[test_case("same", 2 ; "repeated_cursor")]
+    fn paginate_stops_on_a_cursor_that_does_not_advance(stuck_cursor: &str, expected_calls: usize) {
+        let mut calls = 0;
+        let items = smol::block_on(paginate(|_| {
+            calls += 1;
+            let page = Ok((vec![calls], Some(stuck_cursor.to_owned())));
+            async move { page }
+        }))
+        .unwrap();
+        assert_eq!(items.len(), expected_calls);
     }
 
     #[test_case(
