@@ -31,7 +31,7 @@ provide the full agent hook relay that the TUI path supplies.
 | Text and thinking | `start_event_pump`, [`translate.rs`](../../maki-acp/src/translate.rs) | Existing useful standard data path |
 | Tool results | `translate::tool_done` | Diffs stay structured, most other output becomes fenced text |
 | Permission requests | `PermissionRoute`, `OwnedAsks`, [`permissions.rs`](../../maki-acp/src/permissions.rs) | Target must preserve complete answer semantics and ownership |
-| Questions | `question_tool`, [`elicitation.rs`](../../maki-acp/src/elicitation.rs) | Native form path when supported, otherwise `question` is excluded |
+| Questions | `question_tool`, [`elicitation.rs`](../../maki-wire/src/elicitation.rs) | Native form path when supported, otherwise `question` is excluded |
 | Replay | `translate::replay_history` | Insufficient for the TUI's full structured display and child history |
 | Agent events | `start_event_pump` | Drops child display events and many progress/lifecycle/render events |
 | Transport | `serve`, `read_stdin`, `send` | Only stdio is implemented |

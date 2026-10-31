@@ -46,7 +46,7 @@ existing packages to the two domains, including mixed tools and UI features.
 | --- | --- |
 | Current adapter | [`server.rs`](../maki-acp/src/server.rs), `serve`, `Server`, `start_session`, `start_event_pump` |
 | Tool data and replay | [`translate.rs`](../maki-acp/src/translate.rs), `tool_start`, `tool_done`, `replay_history` |
-| Question interaction | [`elicitation.rs`](../maki-acp/src/elicitation.rs), `form_request`, and `question_tool` in `server.rs` |
+| Question interaction | [`elicitation.rs`](../maki-wire/src/elicitation.rs), `form_request`, and `question_tool` in `server.rs` |
 | Permission options | [`permissions.rs`](../maki-acp/src/permissions.rs) |
 | UI event processing | [`event_loop.rs`](../maki-ui/src/event_loop.rs), `EventLoopParams`, `handle_ui_action` |
 | Tool presentation | [`tool_display.rs`](../maki-ui/src/components/tool_display.rs), `build_tool_lines`, and [`messages/mod.rs`](../maki-ui/src/components/messages/mod.rs) |

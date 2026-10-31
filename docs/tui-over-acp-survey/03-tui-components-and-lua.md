@@ -86,14 +86,14 @@ finished todo panel.
 
 ### Completion and pickers
 
-[`completion`](../../plugins/completion/init.lua) watches local input and
+[`completion`](../../plugins/completion/ui.lua) watches local input and
 uses [`completion.sources`](../../plugins/completion/sources.lua) callbacks
 from other plugins. That slot and all input/window handling stay in UI Lua.
 Remote workspace sources request data and discard stale responses. A UI
 source cannot hold a callback from the agent runtime.
 
-[`thinking`](../../plugins/thinking/init.lua) and
-[`sessions`](../../plugins/sessions/init.lua) are UI components. They call
+[`thinking`](../../plugins/thinking/ui.lua) and
+[`sessions`](../../plugins/sessions/ui.lua) are UI components. They call
 agent operations through the ACP facade. Model capabilities and stored
 sessions remain agent-owned. The agent does not need the UI's focused tab.
 
