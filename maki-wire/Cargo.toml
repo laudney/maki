@@ -1,0 +1,27 @@
+[package]
+name = "maki-wire"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+maki-storage = { workspace = true }
+maki-types = { workspace = true }
+agent-client-protocol-schema = { workspace = true }
+tokio-tungstenite = { workspace = true }
+futures = { workspace = true }
+url = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+futures-lite = { workspace = true }
+flume = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+test-case = { workspace = true }
+
+[lints]
+workspace = true

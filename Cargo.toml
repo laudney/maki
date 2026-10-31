@@ -66,6 +66,7 @@ members = [
   "maki-storage",
   "maki-types",
   "maki-ui",
+  "maki-wire",
 ]
 resolver = "3"
 
@@ -88,6 +89,7 @@ maki-providers = { path = "maki-providers" }
 maki-storage = { path = "maki-storage" }
 maki-types = { path = "maki-types" }
 maki-ui = { path = "maki-ui" }
+maki-wire = { path = "maki-wire" }
 maki-lua = { path = "maki-lua" }
 maki-config-macro = { path = "maki-config-macro" }
 maki-lua-macro = { path = "maki-lua-macro" }
@@ -144,6 +146,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"
 arc-swap = "1"
 bitflags = "2"
 event-listener = "5"
+tokio-tungstenite = { version = "0.29", features = ["rustls-tls-native-roots"] }
 futures-lite = "2"
 futures = "0.3"
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
@@ -214,7 +217,7 @@ serde-value = "0.7"
 serde_path_to_error = "0.1"
 indexmap = { version = "2", features = ["serde"] }
 shell-words = "1"
-agent-client-protocol-schema = "1.10"
+agent-client-protocol-schema = "1.12"
 wait-timeout = "0.2"
 inventory = "0.3"
 
