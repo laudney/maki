@@ -52,6 +52,7 @@ test-case = { workspace = true }
 [workspace]
 members = [
   "maki-acp",
+  "maki-acp-agent",
   "maki-agent",
   "maki-config",
   "maki-config-macro",

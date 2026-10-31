@@ -3183,6 +3183,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "maki-acp-agent"
+version = "0.7.0"
+dependencies = [
+ "clap",
+ "color-eyre",
+ "maki-host",
+ "tokio",
+]
+
+[[package]]
 name = "maki-agent"
 version = "0.7.0"
 dependencies = [
