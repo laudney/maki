@@ -48,7 +48,7 @@ If you pass a prompt (or pipe stdin) without `--print`, the TUI still opens and 
 | `--output-format <text\|json\|stream-json>` | Output shape for `--print` (default `text`) |
 | `--input-format <text\|stream-json>` | With `--print`, `stream-json` enters SDK mode |
 | `--no-commands` | Skip custom commands from `.maki/commands`, `.claude/commands`, etc. |
-| `--no-plugins` | Skip user `init.lua` (global and project); keep the Lua host and builtin plugins so tools and the default keymap still load |
+| `--no-plugins` | Skip user `init.lua` and `ui.lua` (global and project) and installed packages; keep the Lua host and builtin plugins so tools and the default keymap still load. Under [`maki connect`](#maki-connect) no bundled plugin starts either |
 | `--no-jit` | Run plugin Lua on the interpreter with full debug info |
 | `--yolo` | Skip permission prompts on gated tools (alias: `--dangerously-skip-permissions`). Deny rules still apply |
 | `--trust` | Load the project's `.maki` config for this run without asking, recording no decision. See [Folder Trust](/docs/folder-trust/#containers-and-ci) |
@@ -199,6 +199,34 @@ maki --no-jit acp
 ```
 
 Starts an [ACP](/docs/acp/) server on stdio for editors like Zed. Subcommand flags are only `-m` / `--model` and `--yolo`. Global flags like `--no-jit` must come before the subcommand.
+
+### `maki connect`
+
+```bash
+maki connect http://127.0.0.1:7803/acp
+maki connect --token-env MY_TOKEN --cwd /srv/project https://agent.example/acp
+maki connect -p "summarize the README" --exit-on-done -- maki acp
+maki connect -c -- maki acp
+```
+
+Runs the Maki TUI against an ACP agent that runs somewhere else. A URL with `http`, `https`, `ws` or `wss` opens a WebSocket at that path, and `http` means an unencrypted upgrade. A command after `--` starts the agent as a child process and talks to it over stdio.
+
+| Flag | Meaning |
+|------|---------|
+| `-p` / `--prompt` | Submit this prompt once the session is open |
+| `--token-env NAME` | Send the value of `NAME` as a bearer token. Default `MAKI_ACP_TOKEN`, sent only when set |
+| `--cwd PATH` | Workspace path sent to the agent, default the current directory. It need not exist on this machine |
+| `--exit-on-done` | Exit when the first run ends |
+| `-c` / `--continue` | Resume the agent's newest session for the workspace, or start a new one if it has none |
+| `-r` / `--resume ID` | Resume the agent's session with this ID. Alias `--session` |
+
+The agent owns the model, tools, settings and session history, so the client starts no provider or MCP server, loads neither your `init.lua` nor the agent entries of your packages, and writes nothing to the local session store. A resumed session shows the history the agent replays. `/model` lists the agent's own models, `/new` asks the agent for a new session on the same connection, and `/fast`, `/workflow` and `/yolo` change the agent's settings when it offers them. `/compact` and `/btw` run on the agent, against its transcript and model, and `/usage` shows the agent's session totals, per-model rows and provider quota. In plan mode, the plan form opens when the agent writes its plan, and `Ctrl+O` edits a copy of the agent's plan in your `$EDITOR`, which is saved back unless the agent changed the plan meanwhile or is still running; otherwise the copy is kept and its path shown. When the agent asks with its `question` tool, the client shows the same form as a local session, and a typed answer reaches the agent as typed. A message queued during a run reaches the agent at its next turn boundary, as it does locally, and a message queued in the other mode switches the run to that mode. For an agent started after `--`, `/login` runs that agent's own provider login (`maki acp --login`) in this terminal, so the credentials stay with the agent; the agent uses them from the next prompt. The client keeps its own input on this machine, per agent: the input history of the workspace, and the unsent draft and queued messages of each session, which `-c` or `-r` brings back. Commands that need local agent state, such as `/fork` and `/cd`, report that they are not available. The session ends with the connection, and the client never resends a prompt after a disconnect.
+
+The client runs two bundled plugins, and both talk to the agent. `/thinking` and `Alt+T` change the agent's thinking level. `/sessions` and `Ctrl+P` list the agent's sessions for the workspace. Opening another session from the picker, creating, renaming or deleting one, and `/rename` report that they are not available. The [Lua API reference](/docs/lua-api/#maki-session) says which `maki.session`, `maki.model`, `maki.task` and `maki.plan` calls the agent answers here.
+
+The client also runs your own UI code on this machine: the global [`ui.lua`](/docs/configuration/#ui-lua) and the UI entries of your [packages](/docs/packages/#packages-in-maki-connect). A project `.maki/ui.lua` comes from the directory the client starts in, not from `--cwd`, and runs only once you trust that folder. The client asks on its own terminal before it connects and keeps the answer on this machine. `maki --no-plugins connect` skips all of this and both bundled plugins, to rule them out when the UI misbehaves.
+
+When the agent can load sessions, `/reload`, `/trust`, `/packupdate` and `/packdel` work in the client and act on its own plugins, trust and UI packages. A reload restarts the client's plugins and reopens the same session on the same connection. It asks the agent again for the model and settings picked before, and reports any the agent does not take.
 
 ### `maki index`
 

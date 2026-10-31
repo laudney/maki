@@ -69,3 +69,15 @@ Plan mode in ACP uses the same state-directory plan files as the TUI (`…/plans
 Moves are on unless you pass `--background-timeout 0`, which turns them off. ACP only checks whether they are on, since results arrive with the next prompt. It is a global flag: `maki --background-timeout 0 acp`. See [Background Tasks](/docs/background-tasks/#headless-sdk-and-acp).
 
 SIGINT or SIGTERM closes the session like the end of input, then exits with 130 or 143.
+
+## Config and packages
+
+`maki acp` loads your `init.lua` and the agent entry of your packages, but it has no terminal UI, so it ignores [`ui.lua`](/docs/configuration/#ui-lua) and every package's UI entry. A UI call in `init.lua`, such as `maki.keymap.set`, `maki.api.register_command` or `maki.ui.flash`, does nothing there, and Maki logs each one once. The config you wrote for the TUI loads unchanged.
+
+In a package the same call fails. When one of its `plugin/*.lua` files calls a UI API, the error names the call:
+
+```text
+maki.keymap.set is not available in the agent runtime: move UI code to the package's ui/ entry
+```
+
+A call made while the package loads stops the package from loading. The same package still works in the TUI. Move the UI code to the package's `ui/*.lua` entry and add a [`[ui]` table](/docs/packages/#ui-permissions) to its `plugin.toml`. `maki acp` then loads the rest, and the TUI and [`maki connect`](/docs/cli/#maki-connect) run the UI entry. A managed package also needs a [declaration in `ui.lua`](/docs/packages/#declare-the-ui-entry) for its UI entry.

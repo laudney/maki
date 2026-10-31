@@ -146,6 +146,11 @@ state saved with the session, like `batch` or `question`. That state is what get
 re-rendered on restore, so a value redacted in the text would come back after a
 restart.
 
+A tool that declares `data_version` 2 or later keeps its state apart from the
+text, so its output slot fires. When a layer changes the text, maki drops the
+call's state and draws the call with the default renderer, live and after a
+restart.
+
 ### Asking the user
 
 Some calls are risky in a way only a plugin can spot. Return
