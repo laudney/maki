@@ -407,6 +407,9 @@ pub struct InteractiveParams {
     /// session from, so a run cannot read one session and write another.
     pub storage: StateDir,
     pub yolo: bool,
+    /// Nobody answers permission prompts, so they are denied at once instead
+    /// of waiting forever.
+    pub unattended: bool,
     pub system_prompt_override: Option<String>,
     pub append_system_prompt: Option<String>,
     /// The `always_*` knobs. `workflow` picks the tool catalog here; the rest
@@ -629,10 +632,12 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
                 turn.run_params(event_tx, Arc::clone(&context)),
             )
             .with_loaded_instructions(instructions.loaded.clone(), instructions.files.clone())
-            .with_user_response_rx(Arc::clone(&answer_rx))
             .with_cancel(cancel)
             .with_local_tools(Arc::clone(&params.local_tools))
             .with_mcp(mcp.clone());
+            if !params.unattended {
+                agent = agent.with_user_response_rx(Arc::clone(&answer_rx));
+            }
 
             let result = agent.run(input).await;
             drop(agent);

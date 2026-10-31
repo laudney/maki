@@ -480,6 +480,7 @@ fn start_session(
         claim: claim.clone(),
         storage: params.storage.clone(),
         yolo: params.yolo,
+        unattended: false,
         system_prompt_override: None,
         append_system_prompt: None,
         defaults: params.defaults,

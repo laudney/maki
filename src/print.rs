@@ -296,6 +296,7 @@ pub fn run(params: PrintParams) -> Result<Interrupt> {
         claim,
         storage,
         yolo: false,
+        unattended: true,
         system_prompt_override: None,
         append_system_prompt: None,
         defaults,

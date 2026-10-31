@@ -593,6 +593,7 @@ pub fn run(params: SdkParams) -> Result<Interrupt> {
         claim,
         storage,
         yolo: permission_mode == PermissionMode::BypassPermissions,
+        unattended: false,
         system_prompt_override: cli.system_prompt.clone().filter(|s| !s.is_empty()),
         append_system_prompt: cli.append_system_prompt.clone().filter(|s| !s.is_empty()),
         defaults,
