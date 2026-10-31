@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use clap::{ArgGroup, Parser, Subcommand, ValueEnum, value_parser};
+use clap::{Arg, ArgGroup, Parser, Subcommand, ValueEnum, value_parser};
 use color_eyre::Result;
 use color_eyre::eyre::bail;
 
@@ -9,7 +9,11 @@ use maki_agent::tools::{all_builtin_tool_names, is_builtin_tool};
 
 use crate::print::OutputFormat;
 
+use maki_acp_client::ConnectArgs;
 pub use maki_host::{AcpArgs, HostFlags};
+
+const CLIENT_NO_PLUGINS_NOTE: &str = "Under `connect` it skips `ui.lua` and UI packages, and no \
+     bundled UI plugin starts either: the client has no builtin it must keep";
 
 const DEFAULT_BACKGROUND_TIMEOUT_SECS: u64 = 600;
 /// A week. The deadline is an `Instant`, which panics on overflow.
@@ -36,6 +40,7 @@ pub enum InputFormat {
 // one. `--fork-session` requires it, since forking nothing used to start a
 // blank session.
 #[command(group = ArgGroup::new("loaded").args(["continue_session", "resume"]))]
+#[command(mut_arg("no_plugins", with_client_note))]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Command>,
@@ -265,6 +270,8 @@ pub enum Command {
     Rollback,
     /// Run as an ACP (Agent Client Protocol) server over stdio
     Acp(AcpArgs),
+    /// Run the TUI against an ACP agent, over WebSocket or a child process
+    Connect(ConnectArgs),
     /// Show the rendered system prompt or tool definitions
     Prompt {
         /// Prompt variant: system (default), research, general
@@ -383,6 +390,12 @@ pub enum AuthAction {
     Status,
 }
 
+/// `maki-acp-agent` shares the flag, and has no `connect`.
+fn with_client_note(arg: Arg) -> Arg {
+    let help = arg.get_help().map(ToString::to_string).unwrap_or_default();
+    arg.help(format!("{help}. {CLIENT_NO_PLUGINS_NOTE}"))
+}
+
 pub fn normalize_tool_name(name: &str) -> Result<String> {
     let mut result = String::with_capacity(name.len() + 4);
     for (i, c) in name.chars().enumerate() {
@@ -441,6 +454,10 @@ mod tests {
     #[test_case(&["--fork-session", "-c"], true ; "a fork of the latest")]
     #[test_case(&["--fork-session", "-r", SESSION_ID], true ; "a fork of a named session")]
     #[test_case(&["-c", "--session-id", SESSION_ID], true ; "a redirected continue")]
+    #[test_case(&["connect", "-c", "-r", SESSION_ID], false ; "connect with two sessions to load")]
+    #[test_case(&["connect", "-c", "--session", SESSION_ID], false ; "connect with two sessions through the alias")]
+    #[test_case(&["connect", "-r", SESSION_ID, "--", "maki", "acp"], true ; "connect resuming a named session")]
+    #[test_case(&["connect", "-c", "ws://agent"], true ; "connect continuing the latest")]
     #[test_case(&["acp", "--login"], true ; "the terminal login of an acp agent")]
     fn session_flag_combinations(args: &[&str], accepted: bool) {
         let argv = std::iter::once("maki").chain(args.iter().copied());

@@ -61,6 +61,9 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         Some(Command::Rollback) => {
             update::rollback().map_err(|e| color_eyre::eyre::eyre!("{e}"))?;
         }
+        Some(Command::Connect(args)) => {
+            maki_acp_client::connect(args, cli.host.no_jit, cli.host.no_plugins)?
+        }
         Some(Command::Acp(mut args)) => {
             args.background_timeout = args.background_timeout.or(background_timeout);
             maki_host::acp(args, &cli.host)?;

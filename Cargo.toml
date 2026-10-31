@@ -20,6 +20,7 @@ crossterm = { workspace = true }
 maki-acp = { workspace = true }
 maki-wire = { workspace = true }
 agent-client-protocol-schema = { workspace = true }
+maki-acp-client = { workspace = true }
 maki-ui = { workspace = true }
 maki-agent = { workspace = true }
 maki-host = { workspace = true }
@@ -53,6 +54,7 @@ test-case = { workspace = true }
 members = [
   "maki-acp",
   "maki-acp-agent",
+  "maki-acp-client",
   "maki-agent",
   "maki-config",
   "maki-config-macro",
@@ -103,6 +105,7 @@ maki-config-macro = { path = "maki-config-macro" }
 maki-lua-macro = { path = "maki-lua-macro" }
 maki-highlight = { path = "maki-highlight" }
 maki-host = { path = "maki-host" }
+maki-acp-client = { path = "maki-acp-client" }
 maki-markdown = { path = "maki-markdown" }
 maki-otel = { path = "maki-otel" }
 maki-pack = { path = "maki-pack" }
