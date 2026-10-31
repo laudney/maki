@@ -57,5 +57,30 @@ gen-docs-check:
 machete:
     cargo machete
 
+# Crates the display path links must stay below the agent and providers
+# Each line: a package and the crates it must not reach.
+deps-check:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    status=0
+    while IFS='|' read -r crate forbidden; do
+        reached=$(cargo tree -p "$crate" -e normal --prefix none | awk '{print $1}' | sort -u)
+        for dep in $forbidden; do
+            if grep -qxF "$dep" <<<"$reached"; then
+                echo "$crate must not depend on $dep" >&2
+                status=1
+            fi
+        done
+    done <<'EOF'
+    maki-types|maki-agent maki-providers
+    maki-wire|maki-agent maki-providers
+    maki-lua-core|maki-agent maki-providers maki-interpreter maki-highlight maki-markdown crossterm ratatui
+    maki-lua-ui|maki-agent maki-providers maki-interpreter maki-lua ratatui
+    maki-host|maki-ui maki-lua-ui crossterm ratatui
+    maki-acp-agent|maki-ui maki-lua-ui crossterm ratatui
+    maki-acp-client|maki-agent maki-providers maki-lua maki-acp
+    EOF
+    exit $status
+
 # Full CI check
-ci: fmt-check lint pylint test gen-docs-check machete
+ci: fmt-check lint pylint test gen-docs-check machete deps-check
