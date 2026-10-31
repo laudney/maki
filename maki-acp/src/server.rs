@@ -1464,8 +1464,7 @@ mod tests {
     async fn a_failed_load_leaves_the_running_session_alone(held_elsewhere: bool) {
         let tmp = TempDir::new().unwrap();
         let storage = StateDir::from_path(tmp.path().to_path_buf());
-        let mut stored: Session<Message, TokenUsage, maki_agent::ToolOutput> =
-            Session::new(SELECTED_SPEC, "/project");
+        let mut stored: StoredSession = Session::new(SELECTED_SPEC, "/project");
         let claim = SessionClaim::acquire(stored.id, &storage).unwrap();
         stored.save(&claim, &storage).unwrap();
         let _elsewhere = held_elsewhere.then_some(claim);
@@ -2267,13 +2266,11 @@ mod tests {
         use std::str::FromStr as _;
         let tmp = TempDir::new().unwrap();
         let dir = StateDir::from_path(tmp.path().to_path_buf());
-        let mut here: Session<Message, TokenUsage, maki_agent::ToolOutput> =
-            Session::new(SELECTED_SPEC, "/project");
+        let mut here: StoredSession = Session::new(SELECTED_SPEC, "/project");
         here.replace_messages(vec![Message::user("keep".into())]);
         here.save(&SessionClaim::acquire(here.id, &dir).unwrap(), &dir)
             .unwrap();
-        let mut elsewhere: Session<Message, TokenUsage, maki_agent::ToolOutput> =
-            Session::new(SELECTED_SPEC, "/other");
+        let mut elsewhere: StoredSession = Session::new(SELECTED_SPEC, "/other");
         elsewhere.replace_messages(vec![Message::user("away".into())]);
         elsewhere
             .save(&SessionClaim::acquire(elsewhere.id, &dir).unwrap(), &dir)
@@ -2304,8 +2301,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let storage = StateDir::from_path(tmp.path().to_path_buf());
         let cwd = std::env::current_dir().unwrap();
-        let mut session: Session<Message, TokenUsage, maki_agent::ToolOutput> =
-            Session::new(SELECTED_SPEC, &cwd.to_string_lossy());
+        let mut session: StoredSession = Session::new(SELECTED_SPEC, &cwd.to_string_lossy());
         session.replace_messages(vec![Message::user("here".into())]);
         session
             .save(
@@ -2313,8 +2309,7 @@ mod tests {
                 &storage,
             )
             .unwrap();
-        let mut foreign: Session<Message, TokenUsage, maki_agent::ToolOutput> =
-            Session::new(SELECTED_SPEC, "/somewhere-else");
+        let mut foreign: StoredSession = Session::new(SELECTED_SPEC, "/somewhere-else");
         foreign.replace_messages(vec![Message::user("there".into())]);
         foreign
             .save(
@@ -2362,8 +2357,7 @@ mod tests {
                 ..Default::default()
             },
         ];
-        let mut session: Session<Message, TokenUsage, maki_agent::ToolOutput> =
-            Session::new("anthropic/test-model", "/project");
+        let mut session: StoredSession = Session::new("anthropic/test-model", "/project");
         session.replace_messages(messages.clone());
         session.token_usage = TokenUsage {
             input: 1_000,
@@ -2392,8 +2386,7 @@ mod tests {
     fn load_history_prices_a_resumed_session_at_what_it_paid() {
         let tmp = TempDir::new().unwrap();
         let dir = StateDir::from_path(tmp.path().to_path_buf());
-        let mut session: Session<Message, TokenUsage, maki_agent::ToolOutput> =
-            Session::new(RETIRED_SPEC, "/project");
+        let mut session: StoredSession = Session::new(RETIRED_SPEC, "/project");
         session.token_usage = TokenUsage {
             input: 1_000_000,
             output: 200_000,
@@ -2439,8 +2432,7 @@ mod tests {
     fn load_history_records_absolute_cwd_only() {
         let tmp = TempDir::new().unwrap();
         let dir = StateDir::from_path(tmp.path().to_path_buf());
-        let mut session: Session<Message, TokenUsage, maki_agent::ToolOutput> =
-            Session::new("anthropic/test-model", "relative/project");
+        let mut session: StoredSession = Session::new("anthropic/test-model", "relative/project");
         session
             .save(&SessionClaim::acquire(session.id, &dir).unwrap(), &dir)
             .unwrap();

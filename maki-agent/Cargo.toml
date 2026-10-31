@@ -15,6 +15,7 @@ tracing = { workspace = true }
 ignore = { workspace = true }
 strum = { workspace = true }
 maki-storage = { workspace = true }
+maki-types = { workspace = true }
 similar = { workspace = true }
 jsonrepair = { workspace = true }
 jiff = { workspace = true }

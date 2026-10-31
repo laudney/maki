@@ -51,7 +51,7 @@ const NON_SESSION_STEMS: [&str; 2] = [CWD_INDEX_STEM, SCAN_CACHE_STEM];
 /// `warn!` in a scripted run or a status bar that is about to close, and the
 /// next `-c` would quietly continue a session missing a turn.
 pub const SAVE_FAILED: &str = "maki: failed to save session ";
-const DEFAULT_TITLE: &str = "New session";
+pub const DEFAULT_TITLE: &str = "New session";
 const MAX_TITLE_LEN: usize = 60;
 const EPOCH_CHANGED: &str = "messages were rewritten";
 const FILE_CHANGED_UNDERNEATH: &str = "file changed underneath";
@@ -240,11 +240,12 @@ impl SessionClaim {
 
     /// Writes `session` the cheapest sound way: an append while the cursor this
     /// claim keeps still describes the file, a full rewrite otherwise.
-    pub fn persist<M, U, T>(&self, session: &Session<M, U, T>) -> Result<(), SessionError>
+    pub fn persist<M, U, T, D>(&self, session: &Session<M, U, T, D>) -> Result<(), SessionError>
     where
         M: Serialize,
         U: Serialize,
         T: Serialize,
+        D: Serialize,
     {
         let mut cursor = self.0.cursor.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(log) = cursor.as_mut() {
@@ -405,6 +406,8 @@ pub struct SessionMeta {
     pub input_draft_writers: Option<StoredWriters>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub queued_messages: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accepted_work: Vec<QueueReceipt>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking: Option<StoredThinking>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -462,7 +465,7 @@ impl<M> Default for HistorySnapshot<M> {
 /// gets a field of its own instead, so a checkpoint never copies it out and
 /// back in only to compare it against itself.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Session<M, U, T> {
+pub struct Session<M, U, T, D> {
     pub version: u32,
     pub id: MakiId,
     pub title: String,
@@ -472,6 +475,10 @@ pub struct Session<M, U, T> {
     pub token_usage: U,
     #[serde(default = "HashMap::new")]
     tool_outputs: HashMap<String, Arc<T>>,
+    /// What a renderer draws of a call, under its output's id. It is never
+    /// without an output there, and goes wherever its output goes.
+    #[serde(default = "HashMap::new", skip_serializing_if = "HashMap::is_empty")]
+    tool_data: HashMap<String, Arc<D>>,
     #[serde(default = "HashMap::new", skip_serializing_if = "HashMap::is_empty")]
     subagent_messages: HashMap<String, Arc<Vec<M>>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -708,6 +715,8 @@ impl fmt::Display for StoredThinking {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StoredSubagent {
     pub tool_use_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_call: Option<String>,
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
@@ -774,7 +783,7 @@ pub fn generate_title<M: TitleSource>(messages: &[M]) -> String {
 
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "t")]
-enum LogRecord<M, U, T> {
+enum LogRecord<M, U, T, D> {
     #[serde(rename = "header")]
     Header {
         v: u32,
@@ -786,7 +795,12 @@ enum LogRecord<M, U, T> {
     #[serde(rename = "msg")]
     Msg { d: M },
     #[serde(rename = "out")]
-    Out { id: String, d: T },
+    Out {
+        id: String,
+        d: T,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        data: Option<D>,
+    },
     #[serde(rename = "sub_msg")]
     SubMsg { sub: String, d: M },
     /// Written only when the frame changes. The last one wins on load.
@@ -836,7 +850,7 @@ fn sub_msg_snapshot<M>(map: &HashMap<String, Arc<Vec<M>>>) -> HashMap<String, us
 /// out would take the dropped turns with it, so the old file gets a second name
 /// under `archive/<id>/` first. Its own path is untouched until the rename, so
 /// [`SessionLog::rewrite`] keeps its crash-safety promise.
-fn archive_if_shrinking<M, U, T>(dir: &Path, session: &Session<M, U, T>) {
+fn archive_if_shrinking<M, U, T, D>(dir: &Path, session: &Session<M, U, T, D>) {
     let path = jsonl_path(dir, session.id);
     let new_count = session.messages.len();
     if !log_msg_count_exceeds(&path, new_count) {
@@ -980,15 +994,16 @@ impl SessionLog {
     /// the live one.
     ///
     /// Drops the claim's own cursor, since its file is the one renamed over.
-    pub fn rewrite<M, U, T>(
+    pub fn rewrite<M, U, T, D>(
         dir: &Path,
         claim: &SessionClaim,
-        session: &Session<M, U, T>,
+        session: &Session<M, U, T, D>,
     ) -> Result<Self, SessionError>
     where
         M: Serialize,
         U: Serialize,
         T: Serialize,
+        D: Serialize,
     {
         claim.forget_cursor();
         Self::rewrite_claimed(dir, claim, session)
@@ -996,15 +1011,16 @@ impl SessionLog {
 
     /// [`Self::rewrite`] for [`SessionClaim::persist`], which holds the cursor
     /// it is about to replace.
-    fn rewrite_claimed<M, U, T>(
+    fn rewrite_claimed<M, U, T, D>(
         dir: &Path,
         claim: &SessionClaim,
-        session: &Session<M, U, T>,
+        session: &Session<M, U, T, D>,
     ) -> Result<Self, SessionError>
     where
         M: Serialize,
         U: Serialize,
         T: Serialize,
+        D: Serialize,
     {
         claim.allows(session.id)?;
         let log = Self::write_canonical(dir, session)?;
@@ -1015,14 +1031,15 @@ impl SessionLog {
     /// [`Self::rewrite`] without claiming the cwd index: migrating a legacy
     /// file on load must not make that session the cwd's latest. Private, so a
     /// claim is the only way in.
-    fn write_canonical<M, U, T>(
+    fn write_canonical<M, U, T, D>(
         dir: &Path,
-        session: &Session<M, U, T>,
+        session: &Session<M, U, T, D>,
     ) -> Result<Self, SessionError>
     where
         M: Serialize,
         U: Serialize,
         T: Serialize,
+        D: Serialize,
     {
         fs::create_dir_all(dir).map_err(StorageError::from)?;
         let path = jsonl_path(dir, session.id);
@@ -1054,15 +1071,16 @@ impl SessionLog {
     /// The claim looks redundant, since a log only comes from [`Self::rewrite`],
     /// which took one. It is here so a log kept after its claim was dropped
     /// cannot append.
-    pub fn append<M, U, T>(
+    pub fn append<M, U, T, D>(
         &mut self,
         claim: &SessionClaim,
-        session: &Session<M, U, T>,
+        session: &Session<M, U, T, D>,
     ) -> Result<(), SessionError>
     where
         M: Serialize,
         U: Serialize,
         T: Serialize,
+        D: Serialize,
     {
         claim.allows(session.id)?;
         self.require_same_id(session)?;
@@ -1073,19 +1091,13 @@ impl SessionLog {
         let mut new_tool_ids = Vec::new();
 
         for msg in &session.messages[self.saved_msg_count..] {
-            append_record(&mut buf, &LogRecord::<&M, &U, &T>::Msg { d: msg })?;
+            append_record(&mut buf, &LogRecord::<&M, &U, &T, &D>::Msg { d: msg })?;
             new_msg_count += 1;
         }
 
         for (id, output) in &session.tool_outputs {
             if !self.saved_tool_ids.contains(id) {
-                append_record(
-                    &mut buf,
-                    &LogRecord::<&M, &U, &T>::Out {
-                        id: id.clone(),
-                        d: output,
-                    },
-                )?;
+                append_record(&mut buf, &out_record(session, id, output))?;
                 new_tool_ids.push(id.clone());
             }
         }
@@ -1096,7 +1108,7 @@ impl SessionLog {
             for msg in &msgs[saved..] {
                 append_record(
                     &mut buf,
-                    &LogRecord::<&M, &U, &T>::SubMsg {
+                    &LogRecord::<&M, &U, &T, &D>::SubMsg {
                         sub: sub_id.clone(),
                         d: msg,
                     },
@@ -1109,7 +1121,7 @@ impl SessionLog {
 
         let frame_changed = session.frame != self.saved_frame;
         if frame_changed && let Some(frame) = &session.frame {
-            append_frame::<M, U, T>(&mut buf, frame)?;
+            append_frame::<M, U, T, D>(&mut buf, frame)?;
         }
 
         let meta = meta_record(session)?;
@@ -1145,11 +1157,12 @@ impl SessionLog {
         Ok(())
     }
 
-    fn cursor_from<M, U, T>(session: &Session<M, U, T>, file: File) -> Self
+    fn cursor_from<M, U, T, D>(session: &Session<M, U, T, D>, file: File) -> Self
     where
         M: Serialize,
         U: Serialize,
         T: Serialize,
+        D: Serialize,
     {
         let saved_len = file.metadata().map(|m| m.len()).unwrap_or_default();
         Self {
@@ -1167,7 +1180,10 @@ impl SessionLog {
         }
     }
 
-    fn require_same_id<M, U, T>(&self, session: &Session<M, U, T>) -> Result<(), SessionError> {
+    fn require_same_id<M, U, T, D>(
+        &self,
+        session: &Session<M, U, T, D>,
+    ) -> Result<(), SessionError> {
         if session.id != self.session_id {
             return Err(SessionError::IdMismatch {
                 log_id: self.session_id,
@@ -1180,7 +1196,10 @@ impl SessionLog {
     /// Ok only while every cursor still describes the file, which is what makes
     /// `saved_len` the file length and the rest of the cursors its content, and
     /// while appending is still cheaper than starting the file over.
-    fn ensure_appendable<M, U, T>(&self, session: &Session<M, U, T>) -> Result<(), SessionError> {
+    fn ensure_appendable<M, U, T, D>(
+        &self,
+        session: &Session<M, U, T, D>,
+    ) -> Result<(), SessionError> {
         let reason = if session.epoch != self.saved_epoch || session.rewrites != self.saved_rewrites
         {
             EPOCH_CHANGED
@@ -1201,7 +1220,7 @@ impl SessionLog {
         Err(SessionError::LogDiverged { reason })
     }
 
-    fn cursor_ahead<M, U, T>(&self, session: &Session<M, U, T>) -> bool {
+    fn cursor_ahead<M, U, T, D>(&self, session: &Session<M, U, T, D>) -> bool {
         self.saved_msg_count > session.messages.len()
             || self
                 .saved_tool_ids
@@ -1216,30 +1235,32 @@ impl SessionLog {
     }
 }
 
-fn append_frame<M, U, T>(buf: &mut Vec<u8>, frame: &Arc<StoredFrame>) -> Result<(), SessionError>
+fn append_frame<M, U, T, D>(buf: &mut Vec<u8>, frame: &Arc<StoredFrame>) -> Result<(), SessionError>
 where
     M: Serialize,
     U: Serialize,
     T: Serialize,
+    D: Serialize,
 {
     append_record(
         buf,
-        &LogRecord::<&M, &U, &T>::Frame {
+        &LogRecord::<&M, &U, &T, &D>::Frame {
             d: Arc::clone(frame),
         },
     )
 }
 
-fn meta_record<M, U, T>(session: &Session<M, U, T>) -> Result<Vec<u8>, SessionError>
+fn meta_record<M, U, T, D>(session: &Session<M, U, T, D>) -> Result<Vec<u8>, SessionError>
 where
     M: Serialize,
     U: Serialize,
     T: Serialize,
+    D: Serialize,
 {
     let mut buf = Vec::new();
     append_record(
         &mut buf,
-        &LogRecord::<&M, &U, &T>::Meta {
+        &LogRecord::<&M, &U, &T, &D>::Meta {
             title: session.title.clone(),
             token_usage: &session.token_usage,
             updated_at: session.updated_at,
@@ -1251,19 +1272,20 @@ where
     Ok(buf)
 }
 
-fn write_full_session<M, U, T>(
+fn write_full_session<M, U, T, D>(
     file: &mut File,
-    session: &Session<M, U, T>,
+    session: &Session<M, U, T, D>,
 ) -> Result<(), SessionError>
 where
     M: Serialize,
     U: Serialize,
     T: Serialize,
+    D: Serialize,
 {
     let mut buf = Vec::new();
     append_record(
         &mut buf,
-        &LogRecord::<&M, &U, &T>::Header {
+        &LogRecord::<&M, &U, &T, &D>::Header {
             v: LOG_FORMAT_VERSION,
             id: session.id,
             model: session.model.clone(),
@@ -1272,22 +1294,16 @@ where
         },
     )?;
     for msg in session.messages.iter() {
-        append_record(&mut buf, &LogRecord::<&M, &U, &T>::Msg { d: msg })?;
+        append_record(&mut buf, &LogRecord::<&M, &U, &T, &D>::Msg { d: msg })?;
     }
     for (id, output) in &session.tool_outputs {
-        append_record(
-            &mut buf,
-            &LogRecord::<&M, &U, &T>::Out {
-                id: id.clone(),
-                d: output,
-            },
-        )?;
+        append_record(&mut buf, &out_record(session, id, output))?;
     }
     for (sub_id, msgs) in &session.subagent_messages {
         for msg in msgs.iter() {
             append_record(
                 &mut buf,
-                &LogRecord::<&M, &U, &T>::SubMsg {
+                &LogRecord::<&M, &U, &T, &D>::SubMsg {
                     sub: sub_id.clone(),
                     d: msg,
                 },
@@ -1295,11 +1311,24 @@ where
         }
     }
     if let Some(frame) = &session.frame {
-        append_frame::<M, U, T>(&mut buf, frame)?;
+        append_frame::<M, U, T, D>(&mut buf, frame)?;
     }
     buf.extend_from_slice(&meta_record(session)?);
     file.write_all(&buf).map_err(StorageError::from)?;
     Ok(())
+}
+
+/// An output's record, carrying the data stored under its id.
+fn out_record<'a, M, U, T, D>(
+    session: &'a Session<M, U, T, D>,
+    id: &str,
+    output: &'a T,
+) -> LogRecord<&'a M, &'a U, &'a T, &'a D> {
+    LogRecord::Out {
+        id: id.to_owned(),
+        d: output,
+        data: session.tool_data.get(id).map(Arc::as_ref),
+    }
 }
 
 fn append_record<R: Serialize>(buf: &mut Vec<u8>, record: &R) -> Result<(), SessionError> {
@@ -1336,11 +1365,15 @@ fn check_log_format(v: u32) -> Result<(), SessionError> {
     Ok(())
 }
 
-fn load_jsonl<M, U, T>(data: &[u8], display_path: &str) -> Result<Session<M, U, T>, SessionError>
+fn load_jsonl<M, U, T, D>(
+    data: &[u8],
+    display_path: &str,
+) -> Result<Session<M, U, T, D>, SessionError>
 where
     M: DeserializeOwned,
     U: DeserializeOwned + Default,
     T: DeserializeOwned,
+    D: DeserializeOwned,
 {
     let mut line_count = 0usize;
 
@@ -1350,6 +1383,7 @@ where
     let mut created_at = 0u64;
     let mut messages: Vec<M> = Vec::new();
     let mut tool_outputs = HashMap::new();
+    let mut tool_data = HashMap::new();
     let mut subagent_messages: HashMap<String, Vec<M>> = HashMap::new();
     let mut title = DEFAULT_TITLE.to_string();
     let mut token_usage = U::default();
@@ -1365,7 +1399,7 @@ where
         if line.is_empty() {
             continue;
         }
-        let record: LogRecord<M, U, T> = match serde_json::from_slice(line) {
+        let record: LogRecord<M, U, T, D> = match serde_json::from_slice(line) {
             Ok(r) => r,
             Err(e) => {
                 if !got_header
@@ -1403,7 +1437,15 @@ where
                 got_header = true;
             }
             LogRecord::Msg { d } => messages.push(d),
-            LogRecord::Out { id: out_id, d } => {
+            LogRecord::Out {
+                id: out_id,
+                d,
+                data,
+            } => {
+                match data {
+                    Some(data) => tool_data.insert(out_id.clone(), Arc::new(data)),
+                    None => tool_data.remove(&out_id),
+                };
                 tool_outputs.insert(out_id, Arc::new(d));
             }
             LogRecord::SubMsg { sub, d } => {
@@ -1444,6 +1486,7 @@ where
         messages: Arc::new(messages),
         token_usage,
         tool_outputs,
+        tool_data,
         subagent_messages: subagent_messages
             .into_iter()
             .map(|(id, msgs)| (id, Arc::new(msgs)))
@@ -1560,11 +1603,15 @@ fn remove_legacy_files(dir: &Path, id: MakiId) -> Result<bool, SessionError> {
 /// Rewriting a pre-jsonl file as jsonl is a write like any other, so it needs a
 /// claim. A plain read has none to lend and takes its own. A session another
 /// process owns is left for that process to migrate.
-fn migrate_legacy<M, U, T>(dir: &Path, session: &Session<M, U, T>, held: Option<&SessionClaim>)
-where
+fn migrate_legacy<M, U, T, D>(
+    dir: &Path,
+    session: &Session<M, U, T, D>,
+    held: Option<&SessionClaim>,
+) where
     M: Serialize,
     U: Serialize,
     T: Serialize,
+    D: Serialize,
 {
     let claim = match held {
         Some(claim) => claim.clone(),
@@ -1815,20 +1862,21 @@ fn locate_session_file(dir: &Path, id: MakiId) -> Option<PathBuf> {
         .cloned()
 }
 
-fn load_session_at<M, U, T>(path: &Path) -> Result<Session<M, U, T>, SessionError>
+fn load_session_at<M, U, T, D>(path: &Path) -> Result<Session<M, U, T, D>, SessionError>
 where
     M: DeserializeOwned,
     U: DeserializeOwned + Default,
     T: DeserializeOwned,
+    D: DeserializeOwned,
 {
     let data = fs::read(path).map_err(StorageError::from)?;
     // Held across both formats: either one decodes the same image payload once
     // per record that mentions it.
     let _intern = crate::intern::Scope::enter();
-    let mut session: Session<M, U, T> = if path.extension().is_some_and(|e| e == "jsonl") {
+    let mut session: Session<M, U, T, D> = if path.extension().is_some_and(|e| e == "jsonl") {
         load_jsonl(&data, &path.display().to_string())?
     } else {
-        let session: Session<M, U, T> =
+        let session: Session<M, U, T, D> =
             serde_json::from_slice(&data).map_err(StorageError::from)?;
         if session.version != SESSION_VERSION {
             return Err(SessionError::VersionMismatch {
@@ -1844,11 +1892,12 @@ where
 
 // -- Session impl --
 
-impl<M, U, T> Session<M, U, T>
+impl<M, U, T, D> Session<M, U, T, D>
 where
     M: Serialize + DeserializeOwned + TitleSource + Clone,
     U: Serialize + DeserializeOwned + Default,
     T: Serialize + DeserializeOwned,
+    D: Serialize + DeserializeOwned,
 {
     pub fn new(model: &str, cwd: &str) -> Self {
         let now = now_epoch();
@@ -1861,6 +1910,7 @@ where
             messages: Arc::default(),
             token_usage: U::default(),
             tool_outputs: HashMap::new(),
+            tool_data: HashMap::new(),
             subagent_messages: HashMap::new(),
             subagents: Vec::new(),
             usage_by_model: HashMap::new(),
@@ -1901,6 +1951,10 @@ where
 
     pub fn tool_outputs(&self) -> &HashMap<String, Arc<T>> {
         &self.tool_outputs
+    }
+
+    pub fn tool_data(&self) -> &HashMap<String, Arc<D>> {
+        &self.tool_data
     }
 
     pub fn frame(&self) -> Option<&Arc<StoredFrame>> {
@@ -1975,6 +2029,7 @@ where
     /// over the other's.
     pub fn fork(mut self, id: MakiId, cwd: &str, storage: &StateDir) -> Result<Self, StorageError> {
         self.meta.queued_messages.clear();
+        self.meta.accepted_work.clear();
         if let Some(plan_path) = &mut self.meta.plan_path {
             let own_path = plans::new_plan_path(storage)?;
             // A plan mode session that has not written its plan yet has no file.
@@ -2034,6 +2089,7 @@ where
         M: Clone,
         U: PartialEq + Clone,
         T: Clone,
+        D: Clone,
     {
         let history = history.filter(|h| {
             !Arc::ptr_eq(&this.messages, &h.messages)
@@ -2054,8 +2110,13 @@ where
     }
 
     /// A change under an existing id is not expressible as an append, so it
-    /// voids the cursors; a new id is a pure append.
-    pub fn insert_tool_output(&mut self, id: String, output: Arc<T>) {
+    /// voids the cursors; a new id is a pure append. The data replaces
+    /// whatever the id held, so an output never keeps another call's data.
+    pub fn insert_tool_output(&mut self, id: String, output: Arc<T>, data: Option<Arc<D>>) {
+        match data {
+            Some(data) => self.tool_data.insert(id.clone(), data),
+            None => self.tool_data.remove(&id),
+        };
         if self.tool_outputs.insert(id, output).is_some() {
             self.rewrite();
         } else {
@@ -2125,6 +2186,7 @@ where
             let stale: HashSet<String> = msgs.iter().flat_map(&tool_ids).collect();
             self.tool_outputs
                 .retain(|tool_id, _| !stale.contains(tool_id));
+            self.tool_data.retain(|tool_id, _| !stale.contains(tool_id));
         }
         let len = self.subagents.len();
         self.subagents.retain(|sa| sa.tool_use_id != id);
@@ -2188,20 +2250,34 @@ where
         kept.extend(
             self.subagents
                 .iter()
-                .filter(|sa| sa.plugin.is_some())
-                .map(|sa| sa.tool_use_id.clone()),
+                .filter(|task| task.plugin.is_some() && task.parent_call.is_none())
+                .map(|task| task.tool_use_id.clone()),
         );
+        loop {
+            let before = kept.len();
+            for task in &self.subagents {
+                if task
+                    .parent_call
+                    .as_ref()
+                    .is_some_and(|parent| kept.contains(parent))
+                {
+                    kept.insert(task.tool_use_id.clone());
+                }
+            }
+            for (id, messages) in &self.subagent_messages {
+                if kept.contains(id) {
+                    kept.extend(messages.iter().flat_map(&tool_ids));
+                }
+            }
+            if kept.len() == before {
+                break;
+            }
+        }
         self.subagent_messages.retain(|id, _| kept.contains(id));
-        self.subagents.retain(|sa| kept.contains(&sa.tool_use_id));
-
-        let live: HashSet<String> = self
-            .subagent_messages
-            .values()
-            .flat_map(|msgs| msgs.iter())
-            .flat_map(&tool_ids)
-            .chain(kept)
-            .collect();
-        self.tool_outputs.retain(|id, _| live.contains(id));
+        self.subagents
+            .retain(|task| kept.contains(&task.tool_use_id));
+        self.tool_outputs.retain(|id, _| kept.contains(id));
+        self.tool_data.retain(|id, _| kept.contains(id));
         self.rewrite();
     }
 
@@ -2270,7 +2346,7 @@ where
         let Some(path) = locate_session_file(dir, id) else {
             return Err(StorageError::NotFound(id.to_string()).into());
         };
-        let session = load_session_at::<M, U, T>(&path)?;
+        let session = load_session_at::<M, U, T, D>(&path)?;
         if path != jsonl_path(dir, id) {
             migrate_legacy(dir, &session, claim);
         }
@@ -2401,6 +2477,7 @@ mod tests {
     use crate::frame::PromptFacts;
     use crate::id::MakiId;
     use crate::paths::session_task_logs_dir;
+    use serde::Deserialize;
     use serde_json::{Value, json};
     use std::collections::{BTreeMap, HashMap};
     use std::fs::{self, OpenOptions};
@@ -2410,7 +2487,7 @@ mod tests {
     use tempfile::TempDir;
     use test_case::test_case;
 
-    type TestSession = Session<Value, Value, Value>;
+    type TestSession = Session<Value, Value, Value, Value>;
 
     const LEGACY_HEX_ID: &str = "550e8400-e29b-41d4-a716-446655440000";
     const SONNET_COST: f64 = 0.42;
@@ -2432,6 +2509,13 @@ mod tests {
     const FRAME_SYSTEM: &str = "system";
     const NEXT_FRAME_SYSTEM: &str = "system after compaction";
     const LATE_MCP_TOOLS: [&str; 3] = ["github__search", "linear__issue", "sentry__events"];
+    const OUT_TAG: &str = r#""t":"out""#;
+    const DATA_TOOL_ID: &str = "tool-with-data";
+    const TOOL_OUTPUT: &str = "out";
+    const KEPT_TOOL_ID: &str = "kept";
+    const SUB_TASK_ID: &str = "sub";
+    const SUB_TOOL_ID: &str = "sub-tool";
+    const ORPHAN_TOOL_ID: &str = "orphan";
 
     impl TitleSource for Value {
         fn first_user_text(&self) -> Option<&str> {
@@ -2496,6 +2580,7 @@ mod tests {
         fn subagent(id: &str, plugin: Option<&str>) -> StoredSubagent {
             StoredSubagent {
                 tool_use_id: id.into(),
+                parent_call: None,
                 name: "sub".into(),
                 model: None,
                 thinking: None,
@@ -2511,6 +2596,8 @@ mod tests {
             ("task-live", "sub-tool"),
             ("task-stale", "stale-sub-tool"),
             ("session-monitor", "monitor-tool"),
+            ("nested-live", "nested-tool"),
+            ("moved-stale", "moved-stale-tool"),
         ] {
             session
                 .subagent_messages
@@ -2520,31 +2607,47 @@ mod tests {
             subagent("task-live", None),
             subagent("task-stale", None),
             subagent("session-monitor", Some("ci")),
+            StoredSubagent {
+                parent_call: Some("task-live".into()),
+                ..subagent("nested-live", None)
+            },
+            StoredSubagent {
+                parent_call: Some("task-stale".into()),
+                ..subagent("moved-stale", Some("bash"))
+            },
         ]);
         for id in [
             "task-live",
             "sub-tool",
             "stale-sub-tool",
             "monitor-tool",
+            "nested-tool",
+            "moved-stale-tool",
             "orphan",
         ] {
-            session.insert_tool_output(id.into(), Arc::new(Value::Null));
+            session.insert_tool_output(id.into(), Arc::new(Value::Null), None);
         }
 
         session.prune_orphans(ids);
 
         let mut transcripts: Vec<_> = session.subagent_messages().keys().collect();
         transcripts.sort();
-        assert_eq!(transcripts, ["session-monitor", "task-live"]);
+        assert_eq!(transcripts, ["nested-live", "session-monitor", "task-live"]);
         let subagent_ids: Vec<_> = session
             .subagents()
             .iter()
             .map(|sa| sa.tool_use_id.as_str())
             .collect();
-        assert_eq!(subagent_ids, ["task-live", "session-monitor"]);
+        assert_eq!(
+            subagent_ids,
+            ["task-live", "session-monitor", "nested-live"]
+        );
         let mut outputs: Vec<_> = session.tool_outputs().keys().cloned().collect();
         outputs.sort();
-        assert_eq!(outputs, ["monitor-tool", "sub-tool", "task-live"]);
+        assert_eq!(
+            outputs,
+            ["monitor-tool", "nested-tool", "sub-tool", "task-live"]
+        );
     }
 
     #[test]
@@ -2748,7 +2851,7 @@ mod tests {
         const TOOL_ID: &str = "tool-1";
         let mut session: TestSession = Session::new("m", "/project");
         session.push_message(user_message("first"));
-        session.insert_tool_output(TOOL_ID.into(), Arc::new(Value::from("out")));
+        insert_with_data(&mut session, TOOL_ID);
         session.token_usage = Value::from(1_000);
         session.add_model_usage("m", usage(1_000, Some(SONNET_COST)));
         let id = MakiId::generate();
@@ -2762,8 +2865,142 @@ mod tests {
         assert_eq!(forked.cwd, FORK_CWD);
         assert_eq!(forked.messages().len(), 1);
         assert!(forked.tool_outputs().contains_key(TOOL_ID));
+        assert_eq!(forked.tool_data()[TOOL_ID], data_of(TOOL_ID).into());
         assert_eq!(forked.token_usage, Value::default());
         assert!(forked.usage_by_model().is_empty());
+    }
+
+    fn data_of(id: &str) -> Value {
+        json!({ "summary": id })
+    }
+
+    fn insert_with_data(session: &mut TestSession, id: &str) {
+        session.insert_tool_output(
+            id.into(),
+            Arc::new(Value::from(TOOL_OUTPUT)),
+            Some(Arc::new(data_of(id))),
+        );
+    }
+
+    /// An output with no data writes the record an older build wrote, and a
+    /// record like that loads with no data.
+    #[test]
+    fn an_output_without_data_writes_and_loads_as_before() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut session: TestSession = Session::new("m", "/project");
+        session.push_message(user_message("first"));
+        session.insert_tool_output(
+            DATA_TOOL_ID.into(),
+            Arc::new(Value::from(TOOL_OUTPUT)),
+            None,
+        );
+        session.save_to(&claim_for(dir, &session), dir).unwrap();
+
+        let log = fs::read_to_string(jsonl_path(dir, session.id)).unwrap();
+        let out = log.lines().find(|line| line.contains(OUT_TAG)).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(out).unwrap(),
+            json!({ "t": "out", "id": DATA_TOOL_ID, "d": TOOL_OUTPUT }),
+        );
+        let loaded = TestSession::load_from(session.id, dir).unwrap();
+        assert!(loaded.tool_outputs().contains_key(DATA_TOOL_ID));
+        assert!(loaded.tool_data().is_empty());
+    }
+
+    /// The `out` record as a build from before tool data reads it.
+    #[derive(Deserialize)]
+    #[serde(tag = "t")]
+    enum OlderRecord {
+        #[serde(rename = "out")]
+        Out { id: String, d: Value },
+        #[serde(other)]
+        Other,
+    }
+
+    #[test]
+    fn an_older_reader_takes_the_output_of_a_record_with_data() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut session: TestSession = Session::new("m", "/project");
+        session.push_message(user_message("first"));
+        insert_with_data(&mut session, DATA_TOOL_ID);
+        session.save_to(&claim_for(dir, &session), dir).unwrap();
+
+        let log = fs::read_to_string(jsonl_path(dir, session.id)).unwrap();
+        let outputs: Vec<(String, Value)> = log
+            .lines()
+            .filter_map(|line| match serde_json::from_str(line).unwrap() {
+                OlderRecord::Out { id, d } => Some((id, d)),
+                OlderRecord::Other => None,
+            })
+            .collect();
+        assert_eq!(
+            outputs,
+            [(DATA_TOOL_ID.to_owned(), Value::from(TOOL_OUTPUT))]
+        );
+    }
+
+    enum DataWrite {
+        Append,
+        Rewrite,
+        ResumeThenSave,
+    }
+
+    #[test_case(DataWrite::Append ; "append")]
+    #[test_case(DataWrite::Rewrite ; "rewrite")]
+    #[test_case(DataWrite::ResumeThenSave ; "resume_then_save")]
+    fn data_reloads_with_its_output(write: DataWrite) {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut session: TestSession = Session::new("m", "/project");
+        session.push_message(user_message("first"));
+        let mut log = SessionLog::rewrite(dir, &claim_for(dir, &session), &session).unwrap();
+        insert_with_data(&mut session, DATA_TOOL_ID);
+        match write {
+            DataWrite::Append => log.append(&claim_for(dir, &session), &session).unwrap(),
+            DataWrite::Rewrite => session.save_to(&claim_for(dir, &session), dir).unwrap(),
+            DataWrite::ResumeThenSave => {
+                session.save_to(&claim_for(dir, &session), dir).unwrap();
+                session = TestSession::load_from(session.id, dir).unwrap();
+                session.push_message(user_message("second"));
+                session.save_to(&claim_for(dir, &session), dir).unwrap();
+            }
+        }
+
+        let loaded = TestSession::load_from(session.id, dir).unwrap();
+        assert_eq!(
+            loaded.tool_data()[DATA_TOOL_ID],
+            data_of(DATA_TOOL_ID).into()
+        );
+        assert_same_session(&loaded, &session);
+    }
+
+    #[test_case(true,  &[KEPT_TOOL_ID]                 ; "prune_orphans")]
+    #[test_case(false, &[KEPT_TOOL_ID, ORPHAN_TOOL_ID] ; "remove_subagent")]
+    fn a_prune_drops_data_with_its_output(orphans: bool, expected: &[&str]) {
+        fn ids(m: &Value) -> Vec<String> {
+            vec![m.as_str().unwrap().to_owned()]
+        }
+        let mut session: TestSession = Session::new("model", "/p");
+        session.push_message(KEPT_TOOL_ID.into());
+        session.set_subagent_messages(SUB_TASK_ID.into(), vec![SUB_TOOL_ID.into()]);
+        for id in [KEPT_TOOL_ID, SUB_TOOL_ID, ORPHAN_TOOL_ID] {
+            insert_with_data(&mut session, id);
+        }
+
+        if orphans {
+            session.prune_orphans(ids);
+        } else {
+            session.remove_subagent(SUB_TASK_ID, ids);
+        }
+
+        let mut kept: Vec<_> = session.tool_data().keys().cloned().collect();
+        kept.sort();
+        assert_eq!(kept, expected);
+        let mut outputs: Vec<_> = session.tool_outputs().keys().cloned().collect();
+        outputs.sort();
+        assert_eq!(outputs, kept);
     }
 
     /// A fork runs beside the original, so it leaves the queue to the original
@@ -4428,6 +4665,7 @@ mod tests {
     fn assert_same_session(loaded: &TestSession, expected: &TestSession) {
         assert_eq!(loaded.messages(), expected.messages(), "messages");
         assert_eq!(loaded.tool_outputs(), expected.tool_outputs(), "outputs");
+        assert_eq!(loaded.tool_data(), expected.tool_data(), "data");
         assert_eq!(
             loaded.subagent_messages(),
             expected.subagent_messages(),
@@ -4447,7 +4685,16 @@ mod tests {
                 session.push_message(tool_message(&slot));
                 session.push_message(assistant_message("reply"));
             }
-            2 => session.insert_tool_output(slot, Arc::new(Value::from(format!("out-{step}")))),
+            2 => {
+                let data = step
+                    .is_multiple_of(2)
+                    .then(|| Arc::new(Value::from(format!("data-{step}"))));
+                session.insert_tool_output(
+                    slot,
+                    Arc::new(Value::from(format!("out-{step}"))),
+                    data,
+                );
+            }
             3 => {
                 let len = rng.below(4) as usize;
                 let msgs = (0..len)
@@ -4667,7 +4914,7 @@ mod tests {
         let held = Arc::clone(&session);
         let live = Arc::make_mut(&mut session);
         live.push_message(assistant_message("b"));
-        live.insert_tool_output("t1".into(), Arc::new(Value::from("out")));
+        live.insert_tool_output("t1".into(), Arc::new(Value::from("out")), None);
         live.set_subagent_messages("s1".into(), vec![user_message("sub")]);
 
         log.append(&claim_for(dir, &session), &session).unwrap();

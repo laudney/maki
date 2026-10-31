@@ -2640,7 +2640,7 @@ impl App {
             }
             self.state
                 .session_mut()
-                .insert_tool_output(e.id.clone(), e.output.clone());
+                .insert_tool_output(e.id.clone(), e.output.clone(), None);
             // A receipt does not end the subagent behind it: the call goes
             // on, and adopting its chat takes it off the turn first.
             if e.backgrounded {

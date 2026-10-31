@@ -5008,6 +5008,7 @@ fn seed_rewind_session(session: &mut AppSession) {
     session.insert_tool_output(
         "tool-1".into(),
         Arc::new(ToolOutput::Plain("output".into())),
+        None,
     );
 }
 
@@ -11558,6 +11559,7 @@ fn a_restored_receipt_nobody_answered_reads_lost() {
     let session = app.state.session_mut();
     session.meta.pending_background = vec![RECEIPT_TURN_ID.into()];
     session.set_subagents(vec![StoredSubagent {
+        parent_call: None,
         tool_use_id: RECEIPT_TURN_ID.into(),
         name: RESEARCH_NAME.into(),
         model: None,

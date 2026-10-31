@@ -675,7 +675,7 @@ mod tests {
 
     fn record_session(dir: &tempfile::TempDir, cwd: &Path) {
         let state = StateDir::from_path(dir.path().to_path_buf());
-        let mut session: Session<StoredMessage, u32, ()> =
+        let mut session: Session<StoredMessage, u32, (), ()> =
             Session::new(SESSION_MODEL, cwd.to_str().unwrap());
         let claim = SessionClaim::acquire(session.id, &state).unwrap();
         session.save(&claim, &state).unwrap();

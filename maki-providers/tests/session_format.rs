@@ -10,7 +10,7 @@ use maki_storage::sessions::Session;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
-type FixtureSession = Session<Message, TokenUsage, Value>;
+type FixtureSession = Session<Message, TokenUsage, Value, Value>;
 
 const FIXTURE: &str = include_str!("fixtures/session_v2.jsonl");
 const FIXTURE_ID: &str = "01965087-4c71-7f00-8000-000000000000";

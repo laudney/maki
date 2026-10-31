@@ -221,6 +221,7 @@ impl App {
         let (draft, writers) = self.main_draft();
         let has_draft = !draft.is_empty();
         SessionMeta {
+            accepted_work: state.session.meta.accepted_work.clone(),
             mode: Some(state.mode.into()),
             plan_path: state.plan.path().map(|p| p.to_string_lossy().into_owned()),
             plan_written: state.plan.is_ready(),
@@ -255,6 +256,7 @@ impl App {
             .filter(|chat| chat.part_of().is_none())
             .filter_map(|chat| {
                 Some(StoredSubagent {
+                    parent_call: None,
                     tool_use_id: chat.task_id()?.to_string(),
                     name: chat.name.clone(),
                     model: chat.model_id.clone(),
@@ -521,6 +523,7 @@ impl App {
             &self.storage,
         );
         open.session.meta = SessionMeta {
+            accepted_work: Vec::new(),
             mode: Some(self.state.mode.into()),
             thinking: Some(self.state.thinking_intent().into()),
             fast: self.state.fast_intent(),

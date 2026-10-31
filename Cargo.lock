@@ -3195,6 +3195,7 @@ dependencies = [
  "maki-otel",
  "maki-providers",
  "maki-storage",
+ "maki-types",
  "oauth2",
  "open",
  "rcgen",

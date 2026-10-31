@@ -25,7 +25,7 @@ pub const NOTHING_TO_STORE: &str = "session has no messages, nothing to store";
 
 /// The one spelling of a persisted maki session. It cannot live in
 /// maki-storage: [`ToolOutput`] is ours, and maki-storage must not depend on us.
-pub type StoredSession = Session<Message, TokenUsage, ToolOutput>;
+pub type StoredSession = Session<Message, TokenUsage, ToolOutput, maki_types::tool::ToolData>;
 
 #[derive(Debug, Error)]
 pub enum StoreError {

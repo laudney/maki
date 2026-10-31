@@ -762,7 +762,7 @@ mod tests {
     }
 
     fn record_session(storage: &StateDir, cwd: &Path) {
-        let mut session: Session<StoredMessage, u32, ()> =
+        let mut session: Session<StoredMessage, u32, (), ()> =
             Session::new(MODEL, cwd.to_str().unwrap());
         let claim = SessionClaim::acquire(session.id, storage).unwrap();
         session.save(&claim, storage).unwrap();
