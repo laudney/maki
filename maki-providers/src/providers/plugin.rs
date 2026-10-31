@@ -1655,7 +1655,7 @@ mod tests {
     use crate::retry::RetryKind;
     use crate::test_support::{Canned, isolated_home, serve};
     use crate::types::dialect;
-    use crate::{Effort, ThinkingConfig};
+    use crate::{Effort, ModelRequestOptions, ModelThinking, ThinkingConfig};
 
     const AUTH_HEADER: &str = "authorization";
     const CONSTANT_TOKEN: &str = "Bearer constant";

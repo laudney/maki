@@ -15,8 +15,8 @@ use crate::providers::openai_compat::tool_parameters;
 use crate::providers::{ResolvedAuth, sse_error_status};
 use crate::types::EffortDialect;
 use crate::{
-    AgentError, ContentBlock, Message, ProviderEvent, Role, StopReason, StreamResponse,
-    ThinkingConfig, TokenUsage, dialect,
+    AgentError, ContentBlock, Message, ModelThinking, ProviderEvent, Role, StopReason,
+    StreamResponse, ThinkingConfig, TokenUsage, dialect,
 };
 
 const RESPONSES_PATH: &str = "/responses";

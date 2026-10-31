@@ -16,15 +16,15 @@ use crate::spec::{
     ApertureRoute, AuthDoc, Build, CatalogDoc, GeneratedDocs, LoginConfig, Native, ProviderSpec,
 };
 use crate::{
-    AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse, UsageLimit,
-    dialect,
+    AgentError, Message, ModelThinking, ProviderEvent, ProviderUsage, RequestOptions,
+    StreamResponse, UsageLimit, dialect,
 };
 
 use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth, Timeouts};
 
 const SLUG: &str = "zai";
 const DISPLAY_NAME: &str = "Z.AI";
-const ENV_VAR: &str = "ZHIPU_API_KEY";
+use maki_config::child_env::ZAI_KEY_ENV as ENV_VAR;
 const BASE_URL: &str = "https://api.z.ai/api/paas/v4";
 const CODING_BASE_URL: &str = "https://api.z.ai/api/coding/paas/v4";
 const DEFAULT_MODEL: &str = "zai/glm-5.1";

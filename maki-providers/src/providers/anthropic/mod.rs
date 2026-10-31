@@ -46,7 +46,7 @@ const LABEL_WEEK_ALL: &str = "Current week (all models)";
 
 pub(crate) const SLUG: &str = "anthropic";
 pub(crate) const DISPLAY_NAME: &str = "Anthropic";
-const ENV_VAR: &str = "ANTHROPIC_API_KEY";
+use maki_config::child_env::ANTHROPIC_KEY_ENV as ENV_VAR;
 pub(crate) const API_KEY_HEADER: &str = "x-api-key";
 const DEFAULT_MODEL: &str = "anthropic/claude-sonnet-4-6";
 const LOGIN_URL: &str = "https://console.anthropic.com/settings/keys";

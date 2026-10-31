@@ -4,6 +4,8 @@
 //! places, one per transition: `start_run`, `handle_cancel`, and
 //! `AgentHandles::respawn`. Everything else only reads it.
 
+use maki_providers::ModelThinking;
+
 mod btw;
 mod image_paste;
 pub(crate) mod mode;

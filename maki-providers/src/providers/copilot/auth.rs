@@ -17,7 +17,7 @@ use tracing::{debug, warn};
 
 use crate::AgentError;
 
-pub(crate) const TOKEN_ENV_VARS: &[&str] = &["GH_COPILOT_TOKEN", "COPILOT_GITHUB_TOKEN"];
+pub(crate) use maki_config::child_env::COPILOT_TOKEN_ENV_VARS as TOKEN_ENV_VARS;
 const DEFAULT_HOST: &str = "github.com";
 const PROVIDER: &str = "copilot";
 const KEYRING_SERVICE_PREFIX: &str = "gh:";

@@ -27,7 +27,7 @@ pub mod auth;
 
 const SLUG: &str = "copilot";
 const DISPLAY_NAME: &str = "Copilot";
-const ENV_VAR: &str = "GH_COPILOT_TOKEN";
+use maki_config::child_env::COPILOT_KEY_ENV as ENV_VAR;
 const DEFAULT_API_ENDPOINT: &str = "https://api.githubcopilot.com";
 const DEFAULT_MODEL: &str = "copilot/gpt-5.6-terra";
 const LOGIN_URL: &str = "https://github.com/settings/copilot";

@@ -29,7 +29,7 @@ const MS_THRESHOLD: f64 = 10_000_000_000.0;
 
 pub(crate) const PROVIDER: &str = super::SLUG;
 const DISPLAY_NAME: &str = "xAI";
-pub(crate) const API_KEY_ENV: &str = "XAI_API_KEY";
+pub(crate) use maki_config::child_env::XAI_KEY_ENV as API_KEY_ENV;
 pub(crate) const TOKEN_AUTH: &str = "xai-grok-cli";
 pub(crate) const AUTHENTICATE_RESPONSE: &str = "authenticate-response";
 pub(crate) const CLIENT_IDENTIFIER: &str = "maki";

@@ -17,8 +17,8 @@ use crate::model_registry;
 use crate::provider::{BoxFuture, Provider};
 use crate::types::{EffortDialect, ThinkingFallback};
 use crate::{
-    AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse, UsageLimit,
-    dialect,
+    AgentError, Message, ModelThinking, ProviderEvent, ProviderUsage, RequestOptions,
+    StreamResponse, UsageLimit, dialect,
 };
 
 use super::auth;
@@ -721,7 +721,7 @@ mod tests {
 
     use super::super::responses;
     use super::*;
-    use crate::ThinkingConfig;
+    use crate::{ModelRequestOptions, ThinkingConfig};
 
     #[test_case("gpt-5.6-luna")]
     #[test_case("gpt-5.6-terra")]

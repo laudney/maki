@@ -64,6 +64,7 @@ members = [
   "maki-pack",
   "maki-providers",
   "maki-storage",
+  "maki-types",
   "maki-ui",
 ]
 resolver = "3"
@@ -85,6 +86,7 @@ maki-config = { path = "maki-config" }
 maki-interpreter = { path = "maki-interpreter" }
 maki-providers = { path = "maki-providers" }
 maki-storage = { path = "maki-storage" }
+maki-types = { path = "maki-types" }
 maki-ui = { path = "maki-ui" }
 maki-lua = { path = "maki-lua" }
 maki-config-macro = { path = "maki-config-macro" }
@@ -142,6 +144,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"
 arc-swap = "1"
 bitflags = "2"
 event-listener = "5"
+futures-lite = "2"
 futures = "0.3"
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 rmcp = { version = "3", default-features = false, features = ["client", "auth", "reqwest", "transport-async-rw", "transport-streamable-http-client-reqwest"] }

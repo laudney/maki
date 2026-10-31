@@ -38,8 +38,8 @@ use crate::providers::{
 };
 use crate::spec::ProviderRegistry;
 use crate::{
-    AgentError, EffortDialect, Message, ProviderEvent, RequestOptions, StreamResponse,
-    ThinkingConfig, dialect,
+    AgentError, EffortDialect, Message, ModelThinking, ProviderEvent, RequestOptions,
+    StreamResponse, ThinkingConfig, dialect,
 };
 
 const MESSAGES_PATH: &str = "/messages";
@@ -955,12 +955,12 @@ impl Provider for CatalogProvider {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn seed_catalog_for_tests(index: schema::CatalogIndex, state_dir: StateDir) {
     let _ = SHARED_CATALOG.set(Mutex::new(CatalogData::from_index(index, &state_dir)));
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn warm_empty_catalog_for_tests(state_dir: StateDir) {
     seed_catalog_for_tests(HashMap::new(), state_dir);
 }

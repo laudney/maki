@@ -374,6 +374,7 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
+    use crate::ModelThinking;
     use crate::test_support::{Canned, Requests, serve};
     use crate::types::{ThinkingConfig, ThinkingFallback};
     use crate::{Message, RequestOptions, StreamResponse};

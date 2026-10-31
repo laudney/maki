@@ -17,7 +17,8 @@ use crate::providers::openai_compat::{
 };
 use crate::providers::{ResolvedAuth, UNAUTHORIZED_STATUS, needs_refresh, refreshed_tokens};
 use crate::{
-    AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse, dialect,
+    AgentError, Message, ModelThinking, ProviderEvent, ProviderUsage, RequestOptions,
+    StreamResponse, dialect,
 };
 
 use super::{auth, catalog};

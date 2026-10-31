@@ -11,8 +11,8 @@ use crate::model::Model;
 use crate::providers::copilot::copilot_usd;
 use crate::types::{is_deferred_tool, rejects_sampling};
 use crate::{
-    AgentError, ContentBlock, EMPTY_RESPONSE_MARKER, InputTransformation, Message, ProviderEvent,
-    Role, StopReason, StreamResponse, ThinkingConfig, TokenUsage,
+    AgentError, ContentBlock, EMPTY_RESPONSE_MARKER, InputTransformation, Message, ModelThinking,
+    ProviderEvent, Role, StopReason, StreamResponse, ThinkingConfig, TokenUsage,
 };
 
 pub(super) const BETA_TOOL_EXAMPLES_BEDROCK: &str = "tool-examples-2025-10-29";

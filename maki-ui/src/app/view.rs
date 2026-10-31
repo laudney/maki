@@ -1,3 +1,4 @@
+use maki_providers::ModelThinking;
 use std::sync::atomic::Ordering;
 
 use crate::components::Overlay;

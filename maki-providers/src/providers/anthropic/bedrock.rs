@@ -21,7 +21,7 @@ use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse};
 
 use super::shared;
 
-pub(crate) const BEARER_TOKEN_ENV: &str = "AWS_BEARER_TOKEN_BEDROCK";
+pub(crate) use maki_config::child_env::BEDROCK_BEARER_TOKEN_ENV as BEARER_TOKEN_ENV;
 const CONTAINER_CREDENTIALS_URI_ENV: &str = "AWS_CONTAINER_CREDENTIALS_FULL_URI";
 const BEDROCK_API_VERSION: &str = "bedrock-2023-05-31";
 const MIN_EVENTSTREAM_FRAME: usize = 16;

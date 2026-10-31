@@ -1,3 +1,4 @@
+use maki_providers::{ModelRequestOptions, ModelThinking};
 use std::time::{Duration, Instant};
 
 use maki_providers::provider::Provider;

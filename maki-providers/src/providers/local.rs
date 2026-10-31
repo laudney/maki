@@ -8,6 +8,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::{debug, warn};
 
+use maki_config::child_env::{LLAMACPP_KEY_ENV, OLLAMA_KEY_ENV};
 use maki_config::providers::{Protocol, ProvidersConfig};
 
 use crate::model::{Model, ModelEffort, ModelInfo, ModelPricing};
@@ -15,7 +16,8 @@ use crate::model_registry;
 use crate::provider::{BoxFuture, Provider};
 use crate::types::ThinkingFallback;
 use crate::{
-    AgentError, Effort, Message, ProviderEvent, RequestOptions, StreamResponse, ThinkingConfig,
+    AgentError, Effort, Message, ModelThinking, ProviderEvent, RequestOptions, StreamResponse,
+    ThinkingConfig,
 };
 
 use super::openai::responses;
@@ -689,7 +691,7 @@ pub(crate) const OLLAMA: LocalEndpointConfig = LocalEndpointConfig {
     slug: OLLAMA_SLUG,
     display_name: "Ollama",
     host_env: "OLLAMA_HOST",
-    api_key_env: "OLLAMA_API_KEY",
+    api_key_env: OLLAMA_KEY_ENV,
     default_host: "http://localhost:11434",
     default_model: "ollama/qwen3",
     cloud_fallback_url: Some("https://ollama.com/v1"),
@@ -710,7 +712,7 @@ pub(crate) const LLAMACPP: LocalEndpointConfig = LocalEndpointConfig {
     slug: LLAMACPP_SLUG,
     display_name: "LlamaCpp",
     host_env: "LLAMA_CPP_HOST",
-    api_key_env: "LLAMA_CPP_API_KEY",
+    api_key_env: LLAMACPP_KEY_ENV,
     default_host: "http://localhost:8080",
     default_model: "llama-cpp/default",
     cloud_fallback_url: None,

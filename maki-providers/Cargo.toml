@@ -14,9 +14,9 @@ serde_json = { workspace = true }
 serde-saphyr = { workspace = true, features = ["deserialize"] }
 indexmap = { workspace = true }
 maki-storage = { workspace = true }
+maki-types = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-strum = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 flume = { workspace = true }

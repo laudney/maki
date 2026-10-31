@@ -16,7 +16,7 @@ use crate::spec::{AuthDoc, Build, CatalogDoc, GeneratedDocs, LoginConfig, Native
 
 pub(crate) const SLUG: &str = "openai";
 const DISPLAY_NAME: &str = "OpenAI";
-const ENV_VAR: &str = "OPENAI_API_KEY";
+use maki_config::child_env::OPENAI_KEY_ENV as ENV_VAR;
 const BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_MODEL: &str = "openai/gpt-5.5";
 const LOGIN_URL: &str = "https://platform.openai.com/api-keys";

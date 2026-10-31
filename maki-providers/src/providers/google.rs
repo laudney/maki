@@ -20,8 +20,8 @@ use crate::spec::{
     sends_as_chosen,
 };
 use crate::{
-    AgentError, ContentBlock, Message, ProviderEvent, RequestOptions, Role, StopReason,
-    StreamResponse, ThinkingConfig, TokenUsage,
+    AgentError, ContentBlock, Message, ModelThinking, ProviderEvent, RequestOptions, Role,
+    StopReason, StreamResponse, ThinkingConfig, TokenUsage,
 };
 
 use super::{
@@ -32,7 +32,7 @@ use super::{
 pub(crate) const SLUG: &str = "google";
 const DISPLAY_NAME: &str = "Google";
 const BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
-const ENV_VAR: &str = "GEMINI_API_KEY";
+use maki_config::child_env::GOOGLE_KEY_ENV as ENV_VAR;
 const DEFAULT_MODEL: &str = "google/gemini-2.5-pro";
 const LOGIN_URL: &str = "https://aistudio.google.com/apikey";
 const FEATURES: &str = "Native Gemini API with thinking support";

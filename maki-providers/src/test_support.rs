@@ -98,6 +98,12 @@ impl Canned {
 
 /// Whether `script` routes by path. [`serve`] has already rejected a mix, so
 /// the first entry speaks for all of them.
+/// An empty, already loaded catalog, so an unknown provider slug fails at
+/// once instead of waiting on a models.dev download.
+pub fn warm_empty_catalog(state_dir: maki_storage::StateDir) {
+    crate::providers::catalog::warm_empty_catalog_for_tests(state_dir);
+}
+
 pub fn is_routed(script: &[Canned]) -> bool {
     script.first().is_some_and(|canned| canned.path.is_some())
 }

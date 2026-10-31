@@ -26,7 +26,7 @@ pub(crate) const SLUGS: &[&str] = &[ZEN_SLUG, GO_SLUG];
 
 const ZEN_DISPLAY_NAME: &str = "Opencode Zen";
 const GO_DISPLAY_NAME: &str = "Opencode Go";
-const ENV_VAR: &str = "OPENCODE_API_KEY";
+use maki_config::child_env::OPENCODE_KEY_ENV as ENV_VAR;
 const ZEN_API_URL: &str = "https://opencode.ai/zen/v1";
 const GO_API_URL: &str = "https://opencode.ai/zen/go/v1";
 const ZEN_FEATURES: &str = "Dynamically discovered models via [models.dev](https://models.dev/) + all the models provided by Opencode Zen API";

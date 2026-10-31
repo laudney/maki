@@ -7,6 +7,7 @@
 
 use std::{io, time::Duration};
 
+use maki_types::event::{AgentEvent, ChannelClosed};
 use reqwest::Response;
 use serde_json::Value;
 use tokio::task::JoinError;
@@ -460,6 +461,22 @@ impl AgentError {
 impl<T> From<flume::SendError<T>> for AgentError {
     fn from(_: flume::SendError<T>) -> Self {
         Self::Channel
+    }
+}
+
+impl From<ChannelClosed> for AgentError {
+    fn from(_: ChannelClosed) -> Self {
+        Self::Channel
+    }
+}
+
+impl From<&AgentError> for AgentEvent {
+    fn from(error: &AgentError) -> Self {
+        Self::Error {
+            message: error.user_message(),
+            auth: error.is_auth_error(),
+            totals: Default::default(),
+        }
     }
 }
 

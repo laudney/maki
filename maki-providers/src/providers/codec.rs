@@ -24,8 +24,8 @@ use crate::provider::{BoxFuture, Provider};
 use crate::spec::ProviderSpec;
 use crate::types::{EffortDialect, ThinkingFallback, dialect, merge_body};
 use crate::{
-    AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse,
-    ThinkingConfig,
+    AgentError, Message, ModelThinking, ProviderEvent, ProviderUsage, RequestOptions,
+    StreamResponse, ThinkingConfig,
 };
 
 /// Where effort goes when a declaration names a dialect and no field: the

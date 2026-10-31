@@ -1,0 +1,27 @@
+[package]
+name = "maki-types"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+arc-swap = { workspace = true }
+event-listener = { workspace = true }
+flume = { workspace = true }
+futures-lite = { workspace = true }
+tokio = { workspace = true }
+jiff = { workspace = true }
+maki-config = { workspace = true }
+maki-storage = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+similar = { workspace = true }
+strum = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+test-case = { workspace = true }
+
+[lints]
+workspace = true

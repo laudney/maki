@@ -1,6 +1,10 @@
 //! `maki.agent` exposes subagent primitives to Lua plugins. Policy (retries,
 //! validation, concurrency) lives in the task plugin, not here.
 
+use maki_providers::ModelRequestOptions;
+#[cfg(test)]
+use maki_providers::ModelThinking;
+
 use std::collections::HashMap;
 use std::pin::pin;
 use std::sync::{Arc, OnceLock};

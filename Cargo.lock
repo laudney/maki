@@ -3451,13 +3451,13 @@ dependencies = [
  "maki-config",
  "maki-providers",
  "maki-storage",
+ "maki-types",
  "open",
  "reqwest",
  "serde",
  "serde-saphyr",
  "serde_json",
  "sha2 0.11.1",
- "strum 0.28.0",
  "tempfile",
  "test-case",
  "thiserror 2.0.21",
@@ -3493,6 +3493,28 @@ dependencies = [
  "tracing-subscriber",
  "unicode-segmentation",
  "uuid",
+]
+
+[[package]]
+name = "maki-types"
+version = "0.7.0"
+dependencies = [
+ "arc-swap",
+ "event-listener",
+ "flume",
+ "futures-lite",
+ "jiff",
+ "maki-config",
+ "maki-storage",
+ "serde",
+ "serde_json",
+ "similar",
+ "strum 0.28.0",
+ "tempfile",
+ "test-case",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

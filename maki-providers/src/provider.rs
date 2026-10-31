@@ -121,6 +121,12 @@ pub fn from_model_fallback(model: &mut Model, timeouts: Timeouts) -> Box<dyn Pro
     }
 }
 
+/// For a model that is only drawn, such as a remote agent's: it reads no
+/// configuration and every request fails.
+pub fn unconfigured() -> Box<dyn Provider> {
+    Box::new(UnconfiguredProvider)
+}
+
 struct UnconfiguredProvider;
 
 const NOT_CONFIGURED: &str = "no provider configured: run /login or `maki auth login`";

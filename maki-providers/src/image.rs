@@ -13,6 +13,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use image::imageops::{self, FilterType};
 use image::{DynamicImage, ImageFormat, ImageReader, RgbImage, Rgba, RgbaImage};
+use maki_types::message::WireVerdict;
 use tokio::task::spawn_blocking;
 use tracing::warn;
 
@@ -46,15 +47,6 @@ const HEADER_PREFIX: usize = 192 * 1024;
 const BASE64_GROUP: usize = 4;
 /// How often the long edge may halve before an image is given up on.
 const LOSSY_ATTEMPTS: u32 = 4;
-
-#[derive(Clone)]
-pub(crate) enum Fix {
-    /// Already wire-safe.
-    Keep,
-    Replace(ImageSource),
-    /// Undecodable here, so no provider will take it either.
-    Drop,
-}
 
 /// The formats a provider will take. Anything else has to be transcoded,
 /// however well it decodes here.
@@ -152,7 +144,7 @@ fn encode(img: &DynamicImage, media: ImageMediaType) -> Result<Vec<u8>, String> 
 
 /// Decode, judge, and if need be shrink and re-encode. Runs off the async
 /// executor, so it may take its time.
-fn decide(data: Arc<str>, declared: ImageMediaType) -> Result<Fix, String> {
+fn decide(data: Arc<str>, declared: ImageMediaType) -> Result<WireVerdict, String> {
     let mut decoded = None;
     let (format, width, height) = match probe_prefix(&data) {
         Some(probed) => probed,
@@ -171,14 +163,14 @@ fn decide(data: Arc<str>, declared: ImageMediaType) -> Result<Fix, String> {
         // that is really a JPEG only needs its label corrected, which costs no
         // pixels at all.
         if detected == declared {
-            return Ok(Fix::Keep);
+            return Ok(WireVerdict::Keep);
         }
         warn!(
             declared = declared.mime(),
             detected = detected.mime(),
             "relabelled an image whose bytes disagree with its media type"
         );
-        return Ok(Fix::Replace(ImageSource::new(detected, data)));
+        return Ok(WireVerdict::Replace(ImageSource::new(detected, data)));
     }
     if u64::from(width) * u64::from(height) > MAX_PIXELS {
         return Err(format!("image too large to decode ({width}x{height})"));
@@ -215,7 +207,7 @@ fn decide(data: Arc<str>, declared: ImageMediaType) -> Result<Fix, String> {
                 height = img.height(),
                 "rewrote an image that no provider would accept"
             );
-            return Ok(Fix::Replace(ImageSource::new(
+            return Ok(WireVerdict::Replace(ImageSource::new(
                 media,
                 Arc::from(STANDARD.encode(&encoded)),
             )));
@@ -230,8 +222,8 @@ fn decide(data: Arc<str>, declared: ImageMediaType) -> Result<Fix, String> {
 /// rides on the image itself, so every clone shares it and history hands it
 /// back for free on every later request of this process. It is not persisted
 /// with the pixels, so a session reloaded from disk decides once more.
-pub(crate) async fn fix_for_wire(source: &ImageSource) -> Fix {
-    if let Some(fix) = source.verdict.get() {
+pub(crate) async fn fix_for_wire(source: &ImageSource) -> WireVerdict {
+    if let Some(fix) = source.wire_verdict().get() {
         return fix.clone();
     }
     let declared = source.media_type;
@@ -245,11 +237,11 @@ pub(crate) async fn fix_for_wire(source: &ImageSource) -> Fix {
                 media_type = declared.mime(),
                 "dropping an unusable image so the request can still go through"
             );
-            Fix::Drop
+            WireVerdict::Drop
         });
     // A concurrent request may have settled it first. Either verdict is sound,
     // and taking the winner keeps what a request sends stable across turns.
-    source.verdict.get_or_init(|| fix).clone()
+    source.wire_verdict().get_or_init(|| fix).clone()
 }
 
 /// Shared with the [`crate::adapt_images_for_model`] tests next door.
@@ -309,7 +301,7 @@ mod tests {
     }
 
     async fn rewrite(source: &ImageSource) -> ImageSource {
-        let Fix::Replace(fixed) = fix_for_wire(source).await else {
+        let WireVerdict::Replace(fixed) = fix_for_wire(source).await else {
             panic!("expected a rewrite");
         };
         fixed
@@ -337,7 +329,7 @@ mod tests {
     #[tokio::test]
     async fn images_within_the_limits_are_left_alone() {
         let source = png(MAX_EDGE, 10);
-        assert!(matches!(fix_for_wire(&source).await, Fix::Keep));
+        assert!(matches!(fix_for_wire(&source).await, WireVerdict::Keep));
     }
 
     /// Extensions lie (a JPEG saved as `.png`), and ACP hands us whatever mime
@@ -359,7 +351,7 @@ mod tests {
     #[tokio::test]
     async fn undecodable_payloads_are_dropped(data: &str) {
         let source = ImageSource::new(ImageMediaType::Png, Arc::from(data));
-        assert!(matches!(fix_for_wire(&source).await, Fix::Drop));
+        assert!(matches!(fix_for_wire(&source).await, WireVerdict::Drop));
     }
 
     /// Every request walks the whole history, and the copy it carries is a
